@@ -8,7 +8,9 @@ moeda de cotacao e converte o preco para USDT por 1 unidade do ativo.
 Funcoes puras: nao acessam a rede nem o disco.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+from scanner.modelos import Livro
 
 # Prefixo -> multiplicador. Os mais longos vem primeiro, por clareza na leitura.
 MULTIPLICADORES = (
@@ -28,8 +30,11 @@ class ParNormalizado:
     cotacao: moeda em que o preco e cotado, ex.: "USDT", "USDC", "USDG".
     multiplicador: quantas vezes o preco da corretora e maior que o de 1 unidade
         do ativo (1000 para "1000PEPE"). O preco por unidade divide por ele.
-    tamanho_contrato: quantas unidades do ativo valem 1 contrato (contractSize
-        do ccxt; 1 no spot). Nao muda o preco, muda as quantidades (Task 4).
+    tamanho_contrato: contractSize do ccxt (1 no spot): quantas unidades do
+        "ativo da corretora" (ex.: "1000PEPE") valem 1 contrato. Nao muda o
+        preco, so a quantidade. As quantidades do livro (em contratos) viram
+        unidades do ativo assim (veja converter_livro):
+            unidades_do_ativo = quantidade_ccxt x tamanho_contrato x multiplicador
     """
 
     ativo: str
@@ -86,3 +91,25 @@ def preco_unitario_usdt(
     if par.cotacao in cotacoes:
         return preco_unitario * cotacoes[par.cotacao], False
     return preco_unitario, True
+
+
+def converter_livro(livro: Livro, par: ParNormalizado) -> Livro:
+    """Devolve uma copia do livro com os niveis em "preco de 1 unidade do ativo" e "unidades do ativo".
+
+    Para cada nivel (preco, quantidade) que a corretora entrega:
+        preco por unidade   = preco / multiplicador
+        quantidade (unid.)  = quantidade x tamanho_contrato x multiplicador
+    O valor do nivel (preco x quantidade) fica igual ao da corretora multiplicado
+    pelo tamanho do contrato, que e o dinheiro de verdade que o nivel negocia.
+
+    O preco continua na moeda de cotacao do par (USDT, USDC...). Trocar para USDT
+    com a cotacao do momento e trabalho do motor (preco_unitario_usdt).
+    O livro original nao e alterado.
+    """
+    fator_quantidade = par.tamanho_contrato * par.multiplicador
+
+    def converter(niveis: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        return [(preco / par.multiplicador, quantidade * fator_quantidade) for preco, quantidade in niveis]
+
+    # Dividir todos os precos pelo mesmo numero positivo mantem a ordem melhor -> pior.
+    return replace(livro, bids=converter(livro.bids), asks=converter(livro.asks))

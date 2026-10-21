@@ -1,15 +1,28 @@
-"""Coletor que usa o ccxt (versao "pro", com WebSocket) para ler os livros de ofertas."""
+"""Coletor que usa o ccxt (versao "pro", com WebSocket) para ler tickers e livros de ofertas.
+
+Duas etapas na mesma corretora:
+  1. `iniciar_tickers`: melhor bid/ask de TODOS os pares, por um stream leve. Alem de
+     achar os pares interessantes, o stream de tickers e o "heartbeat" da conexao.
+  2. `assinar_livros`: livro completo so dos pares que a etapa 1 apontou. Quem sai da
+     lista tem o livro cancelado.
+Passando um `EstadoMercados`, o coletor guarda os dados la (ja normalizados) e avisa a
+cada mensagem recebida que a conexao esta viva.
+"""
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import Callable
 from typing import Literal
 
 import ccxt.pro as ccxtpro
+from ccxt.base.errors import NotSupported
 
 from scanner.coletores.base import Coletor
-from scanner.modelos import Livro
+from scanner.estado.mercados import EstadoMercados
+from scanner.modelos import Livro, Ticker
+from scanner.normalizador import ParNormalizado, converter_livro, normalizar
 
 registro = logging.getLogger("scanner.coletores")
 
@@ -55,6 +68,41 @@ def livro_de_ccxt(
     )
 
 
+def _numero_ou_none(valor) -> float | None:
+    """Numero real (nao NaN, nao infinito) ou None."""
+    if isinstance(valor, (int, float)) and not isinstance(valor, bool) and math.isfinite(valor):
+        return float(valor)
+    return None
+
+
+def ticker_de_ccxt(
+    corretora: str,
+    mercado: Literal["spot", "futuro"],
+    simbolo: str,
+    dados: dict,
+    agora: float,
+) -> Ticker | None:
+    """Transforma o ticker entregue pelo ccxt em um Ticker.
+
+    Devolve None (ticker descartado) se faltar bid ou ask, se algum for zero ou
+    negativo, ou se o bid for maior ou igual ao ask.
+    """
+    bid = _numero_ou_none(dados.get("bid"))
+    ask = _numero_ou_none(dados.get("ask"))
+    if bid is None or ask is None or bid <= 0 or ask <= 0 or bid >= ask:
+        return None
+    return Ticker(
+        corretora=corretora,
+        mercado=mercado,
+        simbolo_original=simbolo,
+        bid=bid,
+        ask=ask,
+        recebido_em=agora,
+        volume_24h_usd=_numero_ou_none(dados.get("quoteVolume")),  # na moeda de cotacao (USDT ~ USD)
+        variacao_24h_pct=_numero_ou_none(dados.get("percentage")),  # o ccxt ja entrega em %
+    )
+
+
 def criar_exchange_ccxt(nome: str):
     """Monta o objeto da corretora no ccxt pro (ex.: "bitget"). Nao acessa a rede."""
     if nome not in ccxtpro.exchanges:
@@ -62,39 +110,243 @@ def criar_exchange_ccxt(nome: str):
     return getattr(ccxtpro, nome)({"enableRateLimit": True})
 
 
-class ColetorCcxt(Coletor):
-    """Acompanha os livros de uma corretora pelo `watch_order_book` do ccxt.
+# Metodos de ticker do ccxt, do preferido ao ultimo recurso: (metodo, chave em exchange.has).
+# watch_tickers traz tambem volume e variacao; watch_bids_asks so o melhor bid/ask;
+# watch_ticker pede um par por vez (uma assinatura por par).
+METODOS_DE_TICKER = (
+    ("watch_tickers", "watchTickers"),
+    ("watch_bids_asks", "watchBidsAsks"),
+    ("watch_ticker", "watchTicker"),
+)
 
-    `exchange` e o objeto da corretora do ccxt (veja criar_exchange_ccxt). Ele e
-    passado de fora para os testes poderem usar um objeto falso, sem internet.
+
+class ColetorCcxt(Coletor):
+    """Acompanha uma corretora pelo ccxt: tickers (etapa 1) e livros de ofertas (etapa 2).
+
+    exchange: o objeto da corretora do ccxt (veja criar_exchange_ccxt). Vem de fora
+        para os testes usarem um objeto falso, sem internet.
+    estado: EstadoMercados opcional. Com ele, cada mensagem recebida registra a conexao
+        como viva e cada ticker/livro valido e guardado la, ja com o ativo normalizado e
+        os precos por 1 unidade do ativo (mercados lidos de `exchange.markets`).
+    relogio: devolve a hora atual em segundos; os testes trocam por um relogio falso.
+
+    Os callbacks (`ao_atualizar`, `ao_ticker`) recebem os dados CRUS, como a corretora
+    entrega (ex.: preco de "1000PEPE" sem dividir por 1000); sao opcionais com `estado`.
     """
 
-    def __init__(self, nome: str, exchange):
+    def __init__(
+        self,
+        nome: str,
+        exchange,
+        estado: EstadoMercados | None = None,
+        relogio: Callable[[], float] = time.time,
+    ):
         super().__init__(nome)
         self._exchange = exchange
+        self._estado = estado
+        self._relogio = relogio
+        self._ao_atualizar: Callable[[Livro], None] | None = None  # guardado para as tarefas de livro
+        self._ao_ticker: Callable[[Ticker], None] | None = None
+        self._tarefas_livro: dict[str, asyncio.Task] = {}  # simbolo -> tarefa do livro (etapa 2)
+        self._pares: dict[str, ParNormalizado] = {}  # simbolo -> par normalizado (so os ja resolvidos)
+        self._sem_mercado_avisados: set[str] = set()  # para avisar no log uma vez so por simbolo
 
-    async def iniciar(self, simbolos: list[str], ao_atualizar: Callable[[Livro], None]) -> None:
-        """Acompanha todos os simbolos ao mesmo tempo, cada um na sua tarefa.
+    # --- etapa 1: tickers ----------------------------------------------------
 
-        Se um simbolo der erro, os outros sao cancelados e o erro sobe para quem
-        chamou. Ao terminar (erro ou cancelamento), a corretora e sempre fechada.
+    async def iniciar_tickers(
+        self, simbolos: list[str], ao_ticker: Callable[[Ticker], None] | None = None
+    ) -> None:
+        """Acompanha o melhor bid/ask de todos os simbolos ate ser cancelado (ou dar erro).
+
+        Spot e futuro vao em pedidos separados, porque o ccxt escolhe o tipo de mercado
+        pelo primeiro simbolo da lista. Toda mensagem registra a conexao no estado.
+        Nao fecha a corretora: os livros da etapa 2 usam a mesma (veja `fechar`).
         """
-        tarefas = [asyncio.create_task(self._acompanhar_livro(s, ao_atualizar)) for s in simbolos]
+        if ao_ticker is not None:
+            self._ao_ticker = ao_ticker
+        grupos: dict[str, list[str]] = {"spot": [], "futuro": []}
+        for simbolo in simbolos:
+            grupos[mercado_do_simbolo(simbolo)].append(simbolo)
+        tarefas = [asyncio.create_task(self._acompanhar_tickers(g)) for g in grupos.values() if g]
         try:
             await asyncio.gather(*tarefas)
         finally:
-            for tarefa in tarefas:
-                tarefa.cancel()
-            await asyncio.gather(*tarefas, return_exceptions=True)
-            await self._exchange.close()
+            await self._cancelar(tarefas)
 
-    async def _acompanhar_livro(self, simbolo: str, ao_atualizar: Callable[[Livro], None]) -> None:
+    async def _acompanhar_tickers(self, simbolos: list[str]) -> None:
+        """Tenta os metodos de ticker em ordem; se um nao for suportado nesse mercado, passa ao proximo.
+
+        Ex.: na MEXC o watch_tickers so existe no futuro e o watch_bids_asks so no spot.
+        """
+        tem = getattr(self._exchange, "has", None) or {}
+        ultimo_erro: Exception | None = None
+        for metodo, chave in METODOS_DE_TICKER:
+            if not tem.get(chave):
+                continue
+            try:
+                if metodo == "watch_ticker":
+                    await self._tickers_um_a_um(simbolos)
+                else:
+                    await self._tickers_em_lote(metodo, simbolos)
+            except NotSupported as erro:
+                registro.warning("%s: %s nao serve para %s (%s); tentando o proximo metodo",
+                                 self.nome, metodo, mercado_do_simbolo(simbolos[0]), erro)
+                ultimo_erro = erro
+        raise ultimo_erro or NotSupported(f"{self.nome}: a corretora nao tem nenhum metodo de ticker no ccxt")
+
+    async def _tickers_em_lote(self, metodo: str, simbolos: list[str]) -> None:
+        """Repete para sempre: espera a proxima mensagem de tickers (varios pares por vez) e trata."""
+        pedir = getattr(self._exchange, metodo)
+        while True:
+            self._tratar_tickers(await pedir(simbolos))
+
+    async def _tickers_um_a_um(self, simbolos: list[str]) -> None:
+        """Ultimo recurso: uma assinatura de ticker por simbolo."""
+
+        async def acompanhar(simbolo: str) -> None:
+            while True:
+                self._tratar_tickers({simbolo: await self._exchange.watch_ticker(simbolo)})
+
+        tarefas = [asyncio.create_task(acompanhar(s)) for s in simbolos]
+        try:
+            await asyncio.gather(*tarefas)
+        finally:
+            await self._cancelar(tarefas)
+
+    def _tratar_tickers(self, tickers: dict | None) -> None:
+        """Uma mensagem de tickers chegou: registra a conexao e entrega cada ticker valido."""
+        agora = self._relogio()
+        self._registrar_mensagem(agora)
+        for simbolo, dados in (tickers or {}).items():
+            ticker = ticker_de_ccxt(self.nome, mercado_do_simbolo(simbolo), simbolo, dados, agora)
+            if ticker is None:
+                registro.debug("%s %s: ticker descartado (sem bid/ask, preco invalido ou cruzado)", self.nome, simbolo)
+                continue
+            self._entregar_ticker(ticker)
+
+    def _entregar_ticker(self, ticker: Ticker) -> None:
+        if self._estado is not None:
+            par = self._par_do_simbolo(ticker.simbolo_original)
+            if par is not None:  # preco de 1 unidade do ativo: "1000PEPE" divide por 1000
+                self._estado.atualizar_ticker(
+                    self.nome, ticker.mercado, par.ativo,
+                    ticker.bid / par.multiplicador, ticker.ask / par.multiplicador,
+                    ticker.recebido_em, ticker.volume_24h_usd, ticker.variacao_24h_pct,
+                )
+        if self._ao_ticker is not None:
+            self._ao_ticker(ticker)
+
+    # --- livros --------------------------------------------------------------
+
+    async def iniciar(self, simbolos: list[str], ao_atualizar: Callable[[Livro], None]) -> None:
+        """Acompanha o livro de todos os simbolos ao mesmo tempo, cada um na sua tarefa.
+
+        Modo simples (usado pelo imprimir_precos): se um simbolo der erro, os outros sao
+        cancelados e o erro sobe para quem chamou. Ao terminar (erro ou cancelamento),
+        a corretora e sempre fechada. Para o servico de longa duracao, que escolhe os
+        livros aos poucos e nao pode cair por causa de um par, use `assinar_livros`.
+        """
+        self._ao_atualizar = ao_atualizar
+        tarefas = [asyncio.create_task(self._acompanhar_livro(s)) for s in simbolos]
+        try:
+            await asyncio.gather(*tarefas)
+        finally:
+            await self._cancelar(tarefas)
+            await self.fechar()
+
+    async def assinar_livros(
+        self, simbolos: set[str], ao_atualizar: Callable[[Livro], None] | None = None
+    ) -> None:
+        """Etapa 2: deixa o livro completo aberto exatamente para `simbolos`.
+
+        Comeca os que ainda nao estao abertos e cancela os que sairam da lista; os que
+        continuam nao sao reiniciados. Pode ser chamada de novo a cada ciclo. Um simbolo
+        que der erro sai sozinho (fica no log) sem atrapalhar os outros; se continuar na
+        lista, volta na proxima chamada.
+
+        ao_atualizar: recebe o Livro cru. Fica guardado, entao so precisa ser passado na
+        primeira vez. Sem ele, o coletor precisa ter um `estado` para guardar os livros.
+        """
+        if ao_atualizar is not None:
+            self._ao_atualizar = ao_atualizar
+        if self._ao_atualizar is None and self._estado is None:
+            raise ValueError("assinar_livros precisa de um ao_atualizar ou de um estado para guardar os livros")
+
+        desejados = set(simbolos)
+        saindo = [self._tarefas_livro.pop(s) for s in list(self._tarefas_livro) if s not in desejados]
+        await self._cancelar(saindo)
+        for simbolo in desejados:
+            if simbolo not in self._tarefas_livro:
+                self._tarefas_livro[simbolo] = asyncio.create_task(
+                    self._acompanhar_livro_isolado(simbolo), name=f"livro {self.nome} {simbolo}"
+                )
+
+    async def fechar(self) -> None:
+        """Cancela os livros abertos e fecha a corretora no ccxt (libera as conexoes)."""
+        tarefas = list(self._tarefas_livro.values())
+        self._tarefas_livro.clear()
+        await self._cancelar(tarefas)
+        await self._exchange.close()
+
+    async def _acompanhar_livro_isolado(self, simbolo: str) -> None:
+        """Como _acompanhar_livro, mas um erro aqui so tira este simbolo (log) e nao derruba os outros."""
+        try:
+            await self._acompanhar_livro(simbolo)
+        except Exception as erro:  # cancelamento nao entra aqui (nao e Exception)
+            registro.warning("%s %s: livro parou (%s: %s); volta na proxima assinatura se o par continuar na lista",
+                             self.nome, simbolo, type(erro).__name__, erro, exc_info=True)
+        finally:
+            if self._tarefas_livro.get(simbolo) is asyncio.current_task():
+                del self._tarefas_livro[simbolo]
+
+    async def _acompanhar_livro(self, simbolo: str) -> None:
         """Repete para sempre: espera o livro mudar e entrega o livro novo, se for valido."""
         mercado = mercado_do_simbolo(simbolo)
         while True:
             ob = await self._exchange.watch_order_book(simbolo)
-            livro = livro_de_ccxt(self.nome, mercado, simbolo, ob, time.time())
+            agora = self._relogio()
+            self._registrar_mensagem(agora)  # vale ate para livro que sera descartado: a conexao esta viva
+            livro = livro_de_ccxt(self.nome, mercado, simbolo, ob, agora)
             if livro is None:
                 registro.debug("%s %s: livro descartado (vazio, preco invalido ou cruzado)", self.nome, simbolo)
                 continue
-            ao_atualizar(livro)
+            self._entregar_livro(livro)
+
+    def _entregar_livro(self, livro: Livro) -> None:
+        if self._estado is not None:
+            par = self._par_do_simbolo(livro.simbolo_original)
+            if par is not None:
+                self._estado.atualizar_livro(converter_livro(livro, par), ativo=par.ativo)
+        if self._ao_atualizar is not None:
+            self._ao_atualizar(livro)
+
+    # --- apoio ---------------------------------------------------------------
+
+    def _registrar_mensagem(self, agora: float) -> None:
+        if self._estado is not None:
+            self._estado.registrar_mensagem(self.nome, agora)
+
+    def _par_do_simbolo(self, simbolo: str) -> ParNormalizado | None:
+        """O par normalizado do simbolo, lido de `exchange.markets` (o ccxt carrega ao assinar).
+
+        Devolve None, com um aviso no log (uma vez so), se o mercado nao existir ou vier
+        sem base/cotacao: sem ele nao da para converter o preco, entao o dado nao vai ao estado.
+        """
+        if simbolo in self._pares:
+            return self._pares[simbolo]
+        market = (getattr(self._exchange, "markets", None) or {}).get(simbolo)
+        if market and market.get("base") and market.get("quote"):
+            self._pares[simbolo] = normalizar(self.nome, market)
+            return self._pares[simbolo]
+        if simbolo not in self._sem_mercado_avisados:
+            self._sem_mercado_avisados.add(simbolo)
+            registro.warning("%s %s: mercado nao encontrado (ou sem base/cotacao) nos markets do ccxt; "
+                             "os dados deste par nao vao para o estado", self.nome, simbolo)
+        return None
+
+    @staticmethod
+    async def _cancelar(tarefas: list[asyncio.Task]) -> None:
+        """Cancela as tarefas e espera cada uma terminar de verdade."""
+        for tarefa in tarefas:
+            tarefa.cancel()
+        await asyncio.gather(*tarefas, return_exceptions=True)

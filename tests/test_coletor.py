@@ -365,7 +365,7 @@ def test_imprimir_precos_escreve_o_ultimo_preco_de_cada_simbolo():
 
     async def cenario():
         tarefa = asyncio.create_task(
-            imprimir_precos(coletor, ["BTC/USDT", "ETH/USDT"], intervalo_s=0.02, escrever=linhas.append)
+            imprimir_precos([coletor], ["BTC/USDT", "ETH/USDT"], intervalo_s=0.02, escrever=linhas.append)
         )
         await asyncio.sleep(0.1)
         tarefa.cancel()
@@ -382,10 +382,83 @@ def test_imprimir_precos_escreve_o_ultimo_preco_de_cada_simbolo():
 def test_imprimir_precos_mostra_o_erro_do_coletor():
     coletor = ColetorFalso([], erro_no_fim=ErroDaCorretora("caiu"))
     with pytest.raises(ErroDaCorretora):
-        asyncio.run(imprimir_precos(coletor, ["BTC/USDT"], intervalo_s=1, escrever=lambda t: None))
+        asyncio.run(imprimir_precos([coletor], ["BTC/USDT"], intervalo_s=1, escrever=lambda t: None))
     assert coletor.encerrado
 
 
 def test_main_com_corretora_inexistente_avisa_e_devolve_1(capsys):
     assert main(["corretora_que_nao_existe"]) == 1
+    assert "corretora_que_nao_existe" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# imprimir_precos com varias corretoras ao mesmo tempo (marco da Task 4)
+# ---------------------------------------------------------------------------
+
+class ColetorFalsoNomeado(ColetorFalso):
+    """ColetorFalso com o nome da corretora escolhido pelo teste."""
+
+    def __init__(self, nome, livros, erro_no_fim=None):
+        super().__init__(livros, erro_no_fim)
+        self.nome = nome
+
+
+def rodar_imprimir(coletores, simbolos, espera_s=0.1, intervalo_s=0.02):
+    """Roda imprimir_precos por `espera_s`, cancela e devolve as linhas escritas."""
+    linhas = []
+
+    async def cenario():
+        tarefa = asyncio.create_task(imprimir_precos(coletores, simbolos, intervalo_s, escrever=linhas.append))
+        await asyncio.sleep(espera_s)
+        tarefa.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tarefa
+
+    asyncio.run(cenario())
+    return linhas
+
+
+def test_imprimir_precos_mostra_cada_corretora_com_o_seu_preco():
+    mexc = ColetorFalsoNomeado("mexc", [livro_de_teste("BTC/USDT", "spot", bid=100.0, ask=100.1, corretora="mexc")])
+    gate = ColetorFalsoNomeado("gate", [livro_de_teste("BTC/USDT", "spot", bid=200.0, ask=200.1, corretora="gate")])
+    linhas = rodar_imprimir([mexc, gate], ["BTC/USDT"])
+    assert any(l.startswith("mexc") and "bid 100.0" in l for l in linhas)
+    assert any(l.startswith("gate") and "bid 200.0" in l for l in linhas)
+    assert not any(l.startswith("mexc") and "bid 200.0" in l for l in linhas)  # precos nao se misturam
+    assert mexc.encerrado and gate.encerrado
+
+
+def test_imprimir_precos_corretora_sem_dado_aparece_como_sem_dados():
+    mexc = ColetorFalsoNomeado("mexc", [livro_de_teste("BTC/USDT", "spot", corretora="mexc")])
+    gate = ColetorFalsoNomeado("gate", [])
+    linhas = rodar_imprimir([mexc, gate], ["BTC/USDT"])
+    assert any(l.startswith("gate") and "sem dados" in l for l in linhas)
+
+
+def test_imprimir_precos_corretora_que_caiu_nao_esconde_as_outras():
+    mexc = ColetorFalsoNomeado("mexc", [livro_de_teste("BTC/USDT", "spot", bid=100.0, corretora="mexc")])
+    gate = ColetorFalsoNomeado("gate", [], erro_no_fim=ErroDaCorretora("gate caiu"))
+    linhas = rodar_imprimir([mexc, gate], ["BTC/USDT"], espera_s=0.2)
+    assert any(l.startswith("mexc") and "bid 100.0" in l for l in linhas)  # mexc segue sendo mostrada
+    assert any(l.startswith("gate") and "parou" in l and "gate caiu" in l for l in linhas)
+
+
+def test_imprimir_precos_levanta_o_erro_quando_todas_as_corretoras_caem():
+    mexc = ColetorFalsoNomeado("mexc", [], erro_no_fim=ErroDaCorretora("mexc caiu"))
+    gate = ColetorFalsoNomeado("gate", [], erro_no_fim=ErroDaCorretora("gate caiu"))
+    with pytest.raises(ErroDaCorretora):
+        asyncio.run(imprimir_precos([mexc, gate], ["BTC/USDT"], intervalo_s=1, escrever=lambda t: None))
+    assert mexc.encerrado and gate.encerrado
+
+
+def test_imprimir_precos_termina_quando_todos_os_coletores_terminam_sem_erro():
+    class ColetorQueAcaba(ColetorFalso):
+        async def iniciar(self, simbolos, ao_atualizar):
+            self.encerrado = True
+
+    asyncio.run(imprimir_precos([ColetorQueAcaba([])], ["BTC/USDT"], intervalo_s=1, escrever=lambda t: None))
+
+
+def test_main_com_uma_corretora_inexistente_entre_varias_avisa_e_devolve_1(capsys):
+    assert main(["bitget", "corretora_que_nao_existe", "gate"]) == 1
     assert "corretora_que_nao_existe" in capsys.readouterr().err

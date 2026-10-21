@@ -3,16 +3,18 @@
 Como usar (no terminal, na pasta do projeto):
 
     python -m scanner.ferramentas.imprimir_precos bitget
+    python -m scanner.ferramentas.imprimir_precos mexc gate bitget
 
-Ela conecta na corretora e, a cada 5 segundos, escreve o bid (melhor preco de
+Ela conecta na(s) corretora(s) e, a cada 5 segundos, escreve o bid (melhor preco de
 compra) e o ask (melhor preco de venda) de BTC, ETH e SOL, no spot e no futuro.
-Compare com o site da corretora: os precos tem que bater. Ctrl+C para parar.
+Compare com o site da corretora: os precos tem que bater. Com varias corretoras, uma
+que cair aparece como "parou" e as outras continuam. Ctrl+C para parar.
 """
 
 import argparse
 import asyncio
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -47,43 +49,67 @@ def _linha_sem_dados(corretora: str, simbolo: str) -> str:
 
 
 async def imprimir_precos(
-    coletor: Coletor,
+    coletores: Sequence[Coletor],
     simbolos: list[str],
     intervalo_s: float,
     escrever: Callable[[str], None] = print,
 ) -> None:
-    """Liga o coletor e, a cada `intervalo_s`, escreve o ultimo preco de cada simbolo.
+    """Liga os coletores e, a cada `intervalo_s`, escreve o ultimo preco de cada simbolo de cada corretora.
 
-    So termina se o coletor terminar (erro sobe para quem chamou) ou for cancelado.
+    Se um coletor cair, ele aparece como "parou" e os outros continuam. Termina quando
+    todos terminarem (se algum caiu com erro, o ultimo erro sobe para quem chamou) ou
+    quando for cancelada.
     """
-    ultimos: dict[str, Livro] = {}  # simbolo -> livro mais recente
+    ultimos: dict[tuple[str, str], Livro] = {}  # (corretora, simbolo) -> livro mais recente
 
-    def guardar(livro: Livro) -> None:
-        ultimos[livro.simbolo_original] = livro
+    def guardador(nome: str) -> Callable[[Livro], None]:
+        def guardar(livro: Livro) -> None:
+            ultimos[(nome, livro.simbolo_original)] = livro
+        return guardar
 
-    coleta = asyncio.create_task(coletor.iniciar(simbolos, guardar))
+    coletas = {asyncio.create_task(c.iniciar(simbolos, guardador(c.nome))): c for c in coletores}
+    vivas = set(coletas)
+    paradas: dict[str, str] = {}  # corretora -> motivo de ter parado
+    ultimo_erro: BaseException | None = None
+    relogio = asyncio.get_running_loop().time
+    proxima_impressao = relogio() + intervalo_s
     try:
-        while True:
-            # Espera o intervalo; se o coletor terminar antes, acorda na hora.
-            terminou, _ = await asyncio.wait({coleta}, timeout=intervalo_s)
-            if terminou:
-                coleta.result()  # se o coletor caiu com erro, o erro sobe aqui
-                return
-            escrever(f"--- {datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ} ---")
-            for simbolo in simbolos:
-                livro = ultimos.get(simbolo)
-                escrever(formatar_linha(livro) if livro else _linha_sem_dados(coletor.nome, simbolo))
+        while vivas:
+            # Espera ate a hora de imprimir; se um coletor terminar antes, acorda na hora para registrar.
+            terminadas, vivas = await asyncio.wait(
+                vivas, timeout=max(0.0, proxima_impressao - relogio()), return_when=asyncio.FIRST_COMPLETED
+            )
+            for coleta in terminadas:
+                erro = None if coleta.cancelled() else coleta.exception()
+                if erro is not None:
+                    ultimo_erro = erro
+                paradas[coletas[coleta].nome] = f"{type(erro).__name__}: {erro}" if erro else "terminou sem erro"
+            if not vivas:
+                break
+            if relogio() >= proxima_impressao:
+                proxima_impressao = relogio() + intervalo_s  # sem recuperar impressoes perdidas (ex.: PC suspenso)
+                escrever(f"--- {datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ} ---")
+                for coletor in coletores:
+                    if coletor.nome in paradas:
+                        escrever(f"{coletor.nome:<8} parou: {paradas[coletor.nome]}")
+                        continue
+                    for simbolo in simbolos:
+                        livro = ultimos.get((coletor.nome, simbolo))
+                        escrever(formatar_linha(livro) if livro else _linha_sem_dados(coletor.nome, simbolo))
+        if ultimo_erro is not None:
+            raise ultimo_erro  # todos pararam e pelo menos um foi por erro
     finally:
-        coleta.cancel()  # o coletor fecha a corretora ao ser cancelado
-        await asyncio.gather(coleta, return_exceptions=True)
+        for coleta in coletas:
+            coleta.cancel()  # cada coletor fecha a sua corretora ao ser cancelado
+        await asyncio.gather(*coletas, return_exceptions=True)
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m scanner.ferramentas.imprimir_precos",
-        description="Mostra os precos (bid/ask) de BTC, ETH e SOL, no spot e no futuro, de uma corretora.",
+        description="Mostra os precos (bid/ask) de BTC, ETH e SOL, no spot e no futuro, de uma ou mais corretoras.",
     )
-    parser.add_argument("corretora", help="nome da corretora no ccxt, ex.: bitget")
+    parser.add_argument("corretoras", nargs="+", metavar="corretora", help="nome(s) da(s) corretora(s) no ccxt, ex.: mexc gate bitget")
     parser.add_argument(
         "--intervalo",
         type=float,
@@ -95,8 +121,9 @@ def main(argv=None) -> int:
         parser.error("--intervalo precisa ser maior que zero")
 
     try:
-        coletor = ColetorCcxt(args.corretora, criar_exchange_ccxt(args.corretora))
-        asyncio.run(imprimir_precos(coletor, simbolos_padrao(), args.intervalo))
+        nomes = list(dict.fromkeys(args.corretoras))  # tira nomes repetidos, mantendo a ordem
+        coletores = [ColetorCcxt(nome, criar_exchange_ccxt(nome)) for nome in nomes]
+        asyncio.run(imprimir_precos(coletores, simbolos_padrao(), args.intervalo))
     except KeyboardInterrupt:
         print("\nEncerrado.")
     except Exception as erro:  # mostra o motivo em uma linha, sem o textao do traceback

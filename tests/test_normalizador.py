@@ -5,7 +5,8 @@ Funcoes puras: nenhum teste acessa a internet.
 
 import pytest
 
-from scanner.normalizador import normalizar, preco_unitario_usdt
+from scanner.normalizador import converter_livro, normalizar, preco_unitario_usdt
+from tests.fabricas import livro
 
 
 def test_prefixo_1000():
@@ -67,3 +68,81 @@ def test_contract_size_nao_muda_preco_unitario():
 def test_usdt_ignora_cotacoes_informadas():
     p = normalizar("gate", {"base": "BTC", "quote": "USDT", "contractSize": 1})
     assert preco_unitario_usdt(100000.0, p, {"USDT": 0.5}) == (100000.0, False)
+
+
+# converter_livro: niveis do livro em preco por 1 unidade do ativo e quantidade em unidades do ativo.
+# unidades = quantidade_ccxt x tamanho_contrato x multiplicador; preco = preco_ccxt / multiplicador.
+
+def notional(niveis):
+    """Soma preco x quantidade dos niveis (o valor negociavel, na moeda de cotacao)."""
+    return sum(preco * quantidade for preco, quantidade in niveis)
+
+
+def test_converter_livro_1000pepe_divide_o_preco_e_multiplica_a_quantidade():
+    par = normalizar("mexc", {"base": "1000PEPE", "quote": "USDT", "contractSize": 1})
+    original = livro("mexc", "futuro", "1000PEPE/USDT:USDT", 10.0,
+                     bids=[(0.0100, 5000.0), (0.0099, 2000.0)], asks=[(0.0101, 3000.0)])
+    convertido = converter_livro(original, par)
+    assert convertido.bids == [(pytest.approx(0.00001), pytest.approx(5_000_000.0)),
+                               (pytest.approx(0.0000099), pytest.approx(2_000_000.0))]
+    assert convertido.asks == [(pytest.approx(0.0000101), pytest.approx(3_000_000.0))]
+
+
+def test_converter_livro_contrato_diferente_de_1_so_muda_a_quantidade():
+    par = normalizar("gate", {"base": "BTC", "quote": "USDT", "contractSize": 0.001})
+    original = livro("gate", "futuro", "BTC/USDT:USDT", 10.0, bids=[(67000.0, 10.0)], asks=[(67001.0, 20.0)])
+    convertido = converter_livro(original, par)
+    assert convertido.bids == [(67000.0, pytest.approx(0.01))]   # 10 contratos x 0,001 BTC
+    assert convertido.asks == [(67001.0, pytest.approx(0.02))]
+
+
+def test_converter_livro_multiplicador_e_contrato_juntos():
+    par = normalizar("mexc", {"base": "1000PEPE", "quote": "USDT", "contractSize": 0.1})
+    original = livro("mexc", "futuro", "1000PEPE/USDT:USDT", 10.0, bids=[(0.0100, 500.0)], asks=[(0.0101, 400.0)])
+    convertido = converter_livro(original, par)
+    assert convertido.bids == [(pytest.approx(0.00001), pytest.approx(500 * 0.1 * 1000))]
+
+
+@pytest.mark.parametrize("base, tamanho", [("BTC", 1), ("1000PEPE", 1), ("BTC", 0.001), ("1000PEPE", 0.1), ("1MBABYDOGE", 10)])
+def test_converter_livro_preserva_o_valor_de_cada_nivel(base, tamanho):
+    # preco x quantidade (o dinheiro do nivel) tem que ser o mesmo antes e depois: preco_ccxt x qtd_ccxt x contrato.
+    par = normalizar("mexc", {"base": base, "quote": "USDT", "contractSize": tamanho})
+    original = livro("mexc", "futuro", "X", 10.0, bids=[(2.0, 7.0), (1.9, 3.0)], asks=[(2.1, 5.0), (2.2, 9.0)])
+    convertido = converter_livro(original, par)
+    for lado_original, lado_convertido in ((original.bids, convertido.bids), (original.asks, convertido.asks)):
+        for (preco, qtd), (preco_u, qtd_u) in zip(lado_original, lado_convertido):
+            assert preco_u * qtd_u == pytest.approx(preco * qtd * tamanho)
+    assert notional(convertido.bids) == pytest.approx(sum(p * q * tamanho for p, q in original.bids))
+
+
+def test_converter_livro_mantem_ordem_e_identificacao():
+    par = normalizar("mexc", {"base": "1000PEPE", "quote": "USDT", "contractSize": 1})
+    original = livro("mexc", "futuro", "1000PEPE/USDT:USDT", 10.5, ts_corretora=9.5,
+                     bids=[(0.0100, 1.0), (0.0099, 1.0)], asks=[(0.0101, 1.0), (0.0102, 1.0)])
+    c = converter_livro(original, par)
+    assert [p for p, _ in c.bids] == sorted((p for p, _ in c.bids), reverse=True)
+    assert [p for p, _ in c.asks] == sorted(p for p, _ in c.asks)
+    assert (c.corretora, c.mercado, c.simbolo_original) == ("mexc", "futuro", "1000PEPE/USDT:USDT")
+    assert (c.recebido_em, c.ts_corretora) == (10.5, 9.5)
+
+
+def test_converter_livro_nao_altera_o_original():
+    par = normalizar("mexc", {"base": "1000PEPE", "quote": "USDT", "contractSize": 1})
+    original = livro("mexc", "futuro", "X", 10.0, bids=[(0.0100, 5.0)], asks=[(0.0101, 5.0)])
+    convertido = converter_livro(original, par)
+    assert original.bids == [(0.0100, 5.0)] and original.asks == [(0.0101, 5.0)]
+    assert convertido is not original
+
+
+def test_converter_livro_de_ativo_simples_nao_muda_nada():
+    par = normalizar("gate", {"base": "BTC", "quote": "USDT"})  # spot: sem contractSize
+    original = livro("gate", "spot", "BTC/USDT", 10.0)
+    convertido = converter_livro(original, par)
+    assert convertido.bids == original.bids and convertido.asks == original.asks
+
+
+def test_converter_livro_nao_converte_a_moeda_de_cotacao():
+    # USDC -> USDT e trabalho do motor (Task 10): aqui o preco continua na moeda de cotacao.
+    par = normalizar("hyperliquid", {"base": "BTC", "quote": "USDC", "contractSize": 1})
+    original = livro("hyperliquid", "futuro", "BTC/USDC:USDC", 10.0, bids=[(100000.0, 1.0)], asks=[(100001.0, 1.0)])
+    assert converter_livro(original, par).bids == [(100000.0, 1.0)]
