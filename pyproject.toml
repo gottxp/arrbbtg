@@ -1,0 +1,10 @@
+[project]
+name = "scanner-arbitragem"
+version = "0.1.0"
+description = "Scanner de sinais de arbitragem cripto (somente leitura)"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+# Os testes ficam em tests/ e enxergam o pacote "scanner" a partir da raiz do projeto.
+testpaths = ["tests"]
+pythonpath = ["."]

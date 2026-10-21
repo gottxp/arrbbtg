@@ -1,0 +1,66 @@
+# Configuracao do scanner de arbitragem.
+# Todos os valores abaixo sao os padroes: se apagar uma linha, vale o padrao.
+# Percentuais estao em % (0.3 = 0,3%).
+# A explicacao completa de cada campo vem no README (ultima etapa do projeto).
+
+# Corretoras do modo normal (fase 1).
+corretoras: [mexc, gate, bitget]
+# Corretoras do modo Farm (custo de giro baixo, sem buscar lucro). Vazio = modo Farm desligado.
+corretoras_farm: []
+
+# Tamanho da ordem usada para calcular o preco de execucao no livro, em USDT.
+tamanho_referencia_usd: 100
+# Maximo de segundos sem nenhuma mensagem da corretora antes de ela ser tratada como atrasada.
+max_silencio_conexao_s: 2
+# Idade maxima do livro de ofertas, em segundos (livro parado vale ate aqui).
+max_idade_livro_s: 30
+# Spread minimo entre os livros para considerar o par, em %.
+spread_min_livro_pct: 0.3
+# Quanto tempo manter o livro de um par depois que ele deixa de ser interessante, em segundos.
+manter_livro_s: 60
+# Janela das metricas (F medio, F maior etc.), em horas.
+periodo_metricas_h: 4
+# RP liquido minimo para virar sinal, em %.
+rp_min_lucro_pct: 0.2
+# Custo maximo aceito no modo Farm, em % (negativo = aceita perder ate esse valor).
+custo_max_farm_pct: -0.1
+# Acima deste RP, em %, o sinal e marcado como suspeito (provavel dado errado ou token diferente).
+limite_suspeito_pct: 30
+# Depois de um sinal, espera estes segundos antes de repetir o mesmo sinal.
+anti_repeticao_s: 60
+# Intervalo do ciclo de calculo, em milissegundos.
+ciclo_ms: 500
+# Intervalo entre amostras gravadas no banco, em segundos.
+amostra_s: 5
+# Amostras mais antigas que isso, em dias, sao apagadas.
+retencao_dias: 7
+# Tempo estimado da operacao, em horas (usado para o funding esperado).
+tempo_operacao_h: 8
+# Margem extra de slippage descontada do RP, em %.
+margem_slippage_pct: 0.0
+# Metrica de spread usada no RP bruto: medio | maior | media_10_maiores
+metrica_spread: medio
+
+# Taxas taker da sua conta (nivel VIP, descontos), em %. Se nao preencher, vale a taxa da API.
+# Mercados aceitos: spot e futuro. Exemplo:
+#   taxas:
+#     mexc:
+#       futuro: 0.02
+taxas: {}
+
+# Intervalo para atualizar funding e taxas (REST), em segundos.
+intervalo_dados_lentos_s: 60
+# Intervalo para recarregar a lista de mercados, em segundos.
+recarregar_mercados_s: 3600
+
+# Painel web. Na VPS, preencha usuario e senha.
+painel:
+  host: 127.0.0.1
+  porta: 8000
+  usuario: null
+  senha: null
+
+# Arquivo do banco SQLite.
+banco: scanner.db
+# Nivel do log: normal | detalhado
+nivel_log: normal
