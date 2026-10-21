@@ -1,9 +1,10 @@
 """Testes da leitura e validacao do config.yaml."""
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scanner.__main__ import main
 from scanner.config.carregar import Config, ErroConfig, carregar_config
@@ -145,9 +146,14 @@ def test_yaml_quebrado_e_raiz_que_nao_e_mapa(tmp_path):
         carregar_config(escrever(tmp_path, "- a\n- b\n"))
 
 
-def test_config_yaml_do_projeto_bate_com_os_padroes():
-    # O exemplo entregue na raiz tem os padroes escritos; nao pode divergir do codigo.
-    assert carregar_config(str(RAIZ / "config.yaml")) == Config()
+def test_config_yaml_do_projeto_e_valido_e_so_tem_campos_conhecidos():
+    # Guarda contra divergencia entre o exemplo da raiz e o codigo. Nao compara valores
+    # (o dono pode editar o config.yaml); so exige que carregue e que cada chave exista na Config.
+    caminho = RAIZ / "config.yaml"
+    carregar_config(str(caminho))  # levanta ErroConfig se algum valor estiver invalido
+    chaves = yaml.safe_load(caminho.read_text(encoding="utf-8")) or {}
+    campos = {f.name for f in fields(Config)}
+    assert set(chaves) <= campos, f"chaves fora da Config: {set(chaves) - campos}"
 
 
 def test_main_imprime_config_ok(tmp_path, capsys):
