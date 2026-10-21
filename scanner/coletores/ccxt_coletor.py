@@ -22,7 +22,7 @@ from ccxt.base.errors import NotSupported
 from scanner.coletores.base import Coletor
 from scanner.estado.mercados import EstadoMercados
 from scanner.modelos import Livro, Ticker
-from scanner.normalizador import ParNormalizado, converter_livro, normalizar
+from scanner.normalizador import ParNormalizado, converter_livro, mercado_do_market, normalizar, prioridade_cotacao
 
 registro = logging.getLogger("scanner.coletores")
 
@@ -127,7 +127,10 @@ class ColetorCcxt(Coletor):
         para os testes usarem um objeto falso, sem internet.
     estado: EstadoMercados opcional. Com ele, cada mensagem recebida registra a conexao
         como viva e cada ticker/livro valido e guardado la, ja com o ativo normalizado e
-        os precos por 1 unidade do ativo (mercados lidos de `exchange.markets`).
+        os precos por 1 unidade do ativo (mercados lidos de `exchange.markets`). So entram
+        no estado o spot e o perpetuo linear (opcoes, futuros com vencimento e contratos
+        inversos ficam de fora) e, se um ativo tem mais de uma moeda de cotacao no mesmo
+        mercado, so a preferida (USDT, depois USDC, USDG): a chave do estado e unica.
     relogio: devolve a hora atual em segundos; os testes trocam por um relogio falso.
 
     Os callbacks (`ao_atualizar`, `ao_ticker`) recebem os dados CRUS, como a corretora
@@ -148,8 +151,11 @@ class ColetorCcxt(Coletor):
         self._ao_atualizar: Callable[[Livro], None] | None = None  # guardado para as tarefas de livro
         self._ao_ticker: Callable[[Ticker], None] | None = None
         self._tarefas_livro: dict[str, asyncio.Task] = {}  # simbolo -> tarefa do livro (etapa 2)
-        self._pares: dict[str, ParNormalizado] = {}  # simbolo -> par normalizado (so os ja resolvidos)
-        self._sem_mercado_avisados: set[str] = set()  # para avisar no log uma vez so por simbolo
+        self._markets_indexados = None  # o dict `exchange.markets` de onde saiu o indice abaixo
+        self._pares: dict[str, ParNormalizado] = {}  # simbolo -> par, so dos que vao ao estado (um por chave)
+        self._vencedor_da_chave: dict[tuple[str, str], str] = {}  # (mercado, ativo) -> simbolo que ocupa a chave
+        self._avisados: set[str] = set()  # simbolos ja avisados no log (um aviso so por simbolo)
+        self._sem_un_watch = False  # a corretora nao sabe cancelar assinatura de livro (avisado uma vez)
 
     # --- etapa 1: tickers ----------------------------------------------------
 
@@ -232,6 +238,7 @@ class ColetorCcxt(Coletor):
                     self.nome, ticker.mercado, par.ativo,
                     ticker.bid / par.multiplicador, ticker.ask / par.multiplicador,
                     ticker.recebido_em, ticker.volume_24h_usd, ticker.variacao_24h_pct,
+                    simbolo_original=ticker.simbolo_original, cotacao=par.cotacao,
                 )
         if self._ao_ticker is not None:
             self._ao_ticker(ticker)
@@ -273,16 +280,42 @@ class ColetorCcxt(Coletor):
             raise ValueError("assinar_livros precisa de um ao_atualizar ou de um estado para guardar os livros")
 
         desejados = set(simbolos)
-        saindo = [self._tarefas_livro.pop(s) for s in list(self._tarefas_livro) if s not in desejados]
-        await self._cancelar(saindo)
+        saindo = {s: self._tarefas_livro.pop(s) for s in list(self._tarefas_livro) if s not in desejados}
+        await self._cancelar(list(saindo.values()))
+        # Cancelar a tarefa nao basta: o ccxt guarda a assinatura ate o un_watch_order_book, e sem ele
+        # as assinaturas se acumulam ate o limite da conexao. Vai em paralelo para nao somar esperas.
+        await asyncio.gather(*(self._desassinar_livro(s) for s in saindo))
         for simbolo in desejados:
             if simbolo not in self._tarefas_livro:
                 self._tarefas_livro[simbolo] = asyncio.create_task(
                     self._acompanhar_livro_isolado(simbolo), name=f"livro {self.nome} {simbolo}"
                 )
 
+    async def _desassinar_livro(self, simbolo: str) -> None:
+        """Pede ao ccxt para largar a assinatura do livro do simbolo. Erro vai para o log, nunca sobe.
+
+        Verifica o metodo e nao `exchange.has`: a Bitget tem `un_watch_order_book` mas `has` diz None.
+        O ccxt base levanta NotSupported nas corretoras sem suporte; nesse caso avisa uma vez e para de tentar.
+        """
+        metodo = getattr(self._exchange, "un_watch_order_book", None)
+        if metodo is None or self._sem_un_watch:
+            return
+        try:
+            await metodo(simbolo)
+        except NotSupported:
+            if not self._sem_un_watch:
+                self._sem_un_watch = True
+                registro.warning("%s: a corretora nao suporta un_watch_order_book; as assinaturas de livro "
+                                 "dos pares que saem da lista continuam abertas ate fechar a conexao", self.nome)
+        except Exception as erro:  # rede, timeout...: o par ja saiu da lista, so registra
+            registro.warning("%s %s: nao consegui cancelar a assinatura do livro (un_watch_order_book: %s: %s)",
+                             self.nome, simbolo, type(erro).__name__, erro)
+
     async def fechar(self) -> None:
-        """Cancela os livros abertos e fecha a corretora no ccxt (libera as conexoes)."""
+        """Cancela os livros abertos e fecha a corretora no ccxt (libera as conexoes).
+
+        Nao chama un_watch_order_book: fechar a corretora derruba as conexoes e com elas as assinaturas.
+        """
         tarefas = list(self._tarefas_livro.values())
         self._tarefas_livro.clear()
         await self._cancelar(tarefas)
@@ -327,22 +360,58 @@ class ColetorCcxt(Coletor):
             self._estado.registrar_mensagem(self.nome, agora)
 
     def _par_do_simbolo(self, simbolo: str) -> ParNormalizado | None:
-        """O par normalizado do simbolo, lido de `exchange.markets` (o ccxt carrega ao assinar).
+        """O par normalizado do simbolo, se os dados dele podem ir para o estado; senao None.
 
-        Devolve None, com um aviso no log (uma vez so), se o mercado nao existir ou vier
-        sem base/cotacao: sem ele nao da para converter o preco, entao o dado nao vai ao estado.
+        Le `exchange.markets` (o ccxt carrega ao assinar). O dado NAO vai ao estado, com um aviso
+        no log (um por simbolo), quando o simbolo:
+          - nao existe nos markets, ou vem sem base/cotacao;
+          - nao e spot nem perpetuo linear (opcao, futuro com vencimento, contrato inverso);
+          - perde para outro simbolo do mesmo ativo e mercado por ter cotacao menos preferida.
         """
-        if simbolo in self._pares:
-            return self._pares[simbolo]
-        market = (getattr(self._exchange, "markets", None) or {}).get(simbolo)
-        if market and market.get("base") and market.get("quote"):
-            self._pares[simbolo] = normalizar(self.nome, market)
-            return self._pares[simbolo]
-        if simbolo not in self._sem_mercado_avisados:
-            self._sem_mercado_avisados.add(simbolo)
-            registro.warning("%s %s: mercado nao encontrado (ou sem base/cotacao) nos markets do ccxt; "
-                             "os dados deste par nao vao para o estado", self.nome, simbolo)
-        return None
+        markets = getattr(self._exchange, "markets", None)
+        if markets is not self._markets_indexados:  # primeira vez, ou a lista de mercados foi recarregada
+            self._indexar_markets(markets or {})
+            self._markets_indexados = markets
+        par = self._pares.get(simbolo)
+        if par is None and simbolo not in self._avisados:
+            self._avisados.add(simbolo)
+            registro.warning("%s %s: %s; os dados deste par nao vao para o estado",
+                             self.nome, simbolo, self._motivo_fora_do_estado(simbolo, (markets or {}).get(simbolo)))
+        return par
+
+    def _indexar_markets(self, markets: dict) -> None:
+        """Escolhe, para cada (mercado, ativo), o unico simbolo que alimenta o estado.
+
+        A escolha olha todos os markets da corretora, e nao so os simbolos pedidos, para nao mudar
+        conforme a lista de pares: vence a moeda preferida (USDT, USDC, USDG, as outras) e, se a
+        moeda for a mesma (ex.: "1000PEPE" e "PEPE"), o simbolo que vem primeiro em ordem alfabetica.
+        """
+        melhores: dict[tuple[str, str], tuple[tuple, str, ParNormalizado]] = {}
+        for simbolo, market in markets.items():
+            mercado = mercado_do_market(market)
+            if mercado is None or not market.get("base") or not market.get("quote"):
+                continue
+            par = normalizar(self.nome, market)
+            ordem = (*prioridade_cotacao(par.cotacao), simbolo)
+            chave = (mercado, par.ativo)
+            if chave not in melhores or ordem < melhores[chave][0]:
+                melhores[chave] = (ordem, simbolo, par)
+        self._vencedor_da_chave = {chave: simbolo for chave, (_, simbolo, _) in melhores.items()}
+        self._pares = {simbolo: par for _, simbolo, par in melhores.values()}
+
+    def _motivo_fora_do_estado(self, simbolo: str, market: dict | None) -> str:
+        """Texto para o log: por que os dados deste simbolo nao vao para o estado."""
+        if not market:
+            return "mercado nao encontrado nos markets do ccxt"
+        mercado = mercado_do_market(market)
+        if mercado is None:
+            return "mercado que o scanner nao usa (so spot e perpetuo linear; este e inverso, opcao ou com vencimento)"
+        if not market.get("base") or not market.get("quote"):
+            return "mercado sem base ou cotacao nos markets do ccxt"
+        par = normalizar(self.nome, market)
+        vencedor = self._vencedor_da_chave[(mercado, par.ativo)]
+        return (f"mercado descartado: {vencedor} ja ocupa o lugar de {par.ativo} no {mercado} "
+                f"(preferencia: cotacao USDT > USDC > USDG; mesma cotacao: ordem do simbolo)")
 
     @staticmethod
     async def _cancelar(tarefas: list[asyncio.Task]) -> None:

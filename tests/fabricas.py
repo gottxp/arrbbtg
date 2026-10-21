@@ -29,3 +29,36 @@ def livro(
         recebido_em=recebido_em,
         ts_corretora=ts_corretora,
     )
+
+
+def market_ccxt(
+    simbolo: str,
+    base: str,
+    quote: str = "USDT",
+    tipo: str | None = None,
+    tamanho: float = 1,
+    inverso: bool = False,
+    taker: float | None = 0.0006,
+) -> dict:
+    """Um market no formato do ccxt (so os campos que o scanner le), com os flags de tipo do ccxt.
+
+    tipo: "spot", "swap" (perpetuo), "future" (com vencimento) ou "option". Sem ele, vale
+    "swap" se o simbolo tem ":" e "spot" se nao. Como no ccxt, `linear` e `inverse` so
+    existem (True/False) nos derivativos; no spot ficam None.
+    """
+    if tipo is None:
+        tipo = "swap" if ":" in simbolo else "spot"
+    derivativo = tipo != "spot"
+    return {
+        "symbol": simbolo,
+        "base": base,
+        "quote": quote,
+        "contractSize": tamanho if derivativo else None,
+        "taker": taker,
+        "spot": tipo == "spot",
+        "swap": tipo == "swap",
+        "future": tipo == "future",
+        "option": tipo == "option",
+        "linear": (not inverso) if derivativo else None,
+        "inverse": inverso if derivativo else None,
+    }

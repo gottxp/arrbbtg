@@ -43,14 +43,22 @@ class EstadoMercados:
         recebido_em: float,
         volume_24h_usd: float | None = None,
         variacao_24h_pct: float | None = None,
+        simbolo_original: str | None = None,
+        cotacao: str | None = None,
     ) -> None:
-        """Etapa 1: guarda o melhor bid/ask do par (preco por 1 unidade do ativo)."""
+        """Etapa 1: guarda o melhor bid/ask do par (preco por 1 unidade do ativo, na moeda `cotacao`).
+
+        `simbolo_original` (ex.: "BTC/USDC:USDC") e `cotacao` (ex.: "USDC") dizem de qual par veio
+        o preco; o motor precisa da cotacao para converter o preco para USDT.
+        """
         self._tickers[(corretora, mercado, ativo)] = {
             "bid": bid,
             "ask": ask,
             "recebido_em": recebido_em,
             "volume_24h_usd": volume_24h_usd,
             "variacao_24h_pct": variacao_24h_pct,
+            "simbolo_original": simbolo_original,
+            "cotacao": cotacao,
         }
 
     def atualizar_livro(self, livro: Livro, ativo: str | None = None) -> None:
@@ -87,7 +95,7 @@ class EstadoMercados:
         return livro
 
     def obter_ticker(self, corretora: str, mercado: str, ativo: str, agora: float) -> dict | None:
-        """O ticker do par (bid, ask, recebido_em, volume_24h_usd, variacao_24h_pct), ou None.
+        """O ticker do par (bid, ask, recebido_em, volume_24h_usd, variacao_24h_pct, simbolo_original, cotacao), ou None.
 
         Vale a mesma regra do livro: conexao viva e dado com no maximo `max_idade_livro_s`.
         """

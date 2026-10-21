@@ -1,5 +1,21 @@
 """Normalizacao de pares entre corretoras: nome do ativo, multiplicador e preco em USDT."""
 
-from scanner.normalizador.pares import ParNormalizado, converter_livro, normalizar, preco_unitario_usdt
+from scanner.normalizador.pares import (
+    PREFERENCIA_COTACAO,
+    ParNormalizado,
+    converter_livro,
+    mercado_do_market,
+    normalizar,
+    preco_unitario_usdt,
+    prioridade_cotacao,
+)
 
-__all__ = ["ParNormalizado", "converter_livro", "normalizar", "preco_unitario_usdt"]
+__all__ = [
+    "PREFERENCIA_COTACAO",
+    "ParNormalizado",
+    "converter_livro",
+    "mercado_do_market",
+    "normalizar",
+    "preco_unitario_usdt",
+    "prioridade_cotacao",
+]

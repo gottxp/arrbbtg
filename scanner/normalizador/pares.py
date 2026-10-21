@@ -9,6 +9,7 @@ Funcoes puras: nao acessam a rede nem o disco.
 """
 
 from dataclasses import dataclass, replace
+from typing import Literal
 
 from scanner.modelos import Livro
 
@@ -20,6 +21,34 @@ MULTIPLICADORES = (
     ("1M", 1_000_000),
     ("k", 1_000),  # so vale minusculo: KAS e KAVA sao ativos reais, nao prefixos
 )
+
+
+# Moedas de cotacao em ordem de preferencia, quando um ativo tem mais de um par na mesma
+# corretora e mercado (ex.: BTC/USDT:USDT e BTC/USDC:USDC): so uma entra no estado.
+# Moeda fora da lista vem depois de todas, em ordem alfabetica.
+PREFERENCIA_COTACAO = ("USDT", "USDC", "USDG")
+
+
+def prioridade_cotacao(cotacao: str) -> tuple[int, str]:
+    """Chave de ordenacao da moeda de cotacao: menor = preferida (USDT, depois USDC, USDG, as outras)."""
+    if cotacao in PREFERENCIA_COTACAO:
+        return PREFERENCIA_COTACAO.index(cotacao), cotacao
+    return len(PREFERENCIA_COTACAO), cotacao
+
+
+def mercado_do_market(market: dict) -> Literal["spot", "futuro"] | None:
+    """Diz se um market do ccxt entra no scanner: "spot", "futuro" (perpetuo linear) ou None.
+
+    Usa os flags do ccxt e nao o nome do simbolo, porque opcoes (BTC/USDT:USDT-261226-100000-C)
+    e futuros com vencimento tambem tem ":" no nome. Ficam de fora: contratos inversos (pagos em
+    moeda cripto; o contrato vale 1 USD, entao a quantidade nao e em unidades do ativo), futuros
+    com vencimento, opcoes e qualquer market sem os flags.
+    """
+    if market.get("spot"):
+        return "spot"
+    if market.get("swap") and market.get("linear"):
+        return "futuro"
+    return None
 
 
 @dataclass(frozen=True)

@@ -5,8 +5,14 @@ Funcoes puras: nenhum teste acessa a internet.
 
 import pytest
 
-from scanner.normalizador import converter_livro, normalizar, preco_unitario_usdt
-from tests.fabricas import livro
+from scanner.normalizador import (
+    converter_livro,
+    mercado_do_market,
+    normalizar,
+    preco_unitario_usdt,
+    prioridade_cotacao,
+)
+from tests.fabricas import livro, market_ccxt
 
 
 def test_prefixo_1000():
@@ -146,3 +152,31 @@ def test_converter_livro_nao_converte_a_moeda_de_cotacao():
     par = normalizar("hyperliquid", {"base": "BTC", "quote": "USDC", "contractSize": 1})
     original = livro("hyperliquid", "futuro", "BTC/USDC:USDC", 10.0, bids=[(100000.0, 1.0)], asks=[(100001.0, 1.0)])
     assert converter_livro(original, par).bids == [(100000.0, 1.0)]
+
+
+# mercado_do_market: so spot e perpetuo linear entram no scanner (flags do ccxt, nao o nome do simbolo).
+
+def test_mercado_do_market_spot_e_perpetuo_linear():
+    assert mercado_do_market(market_ccxt("BTC/USDT", "BTC")) == "spot"
+    assert mercado_do_market(market_ccxt("BTC/USDT:USDT", "BTC")) == "futuro"
+    assert mercado_do_market(market_ccxt("BTC/USDC:USDC", "BTC", quote="USDC")) == "futuro"
+
+
+@pytest.mark.parametrize("tipo, inverso", [
+    ("swap", True),      # perpetuo inverso (BTC/USD:BTC, contrato vale 1 USD)
+    ("future", False),   # futuro com vencimento
+    ("option", False),   # opcao: o simbolo tambem tem ":"
+])
+def test_mercado_do_market_rejeita_o_que_nao_e_spot_nem_perpetuo_linear(tipo, inverso):
+    assert mercado_do_market(market_ccxt("BTC/USDT:USDT-261226", "BTC", tipo=tipo, inverso=inverso)) is None
+
+
+def test_mercado_do_market_sem_flags_ou_com_linear_desconhecido_e_rejeitado():
+    assert mercado_do_market({}) is None
+    assert mercado_do_market({"swap": True}) is None                    # linear desconhecido: na duvida, fora
+    assert mercado_do_market({"swap": True, "linear": None}) is None
+
+
+def test_prioridade_cotacao_usdt_usdc_usdg_depois_as_outras_em_ordem_alfabetica():
+    ordenadas = sorted(["USDG", "EUR", "USDC", "USDT", "BRL"], key=prioridade_cotacao)
+    assert ordenadas == ["USDT", "USDC", "USDG", "BRL", "EUR"]

@@ -10,7 +10,7 @@ import pytest
 
 from scanner.coletores.dados_lentos import DadosLentos, TaxaDesconhecida, intervalo_funding_h
 from scanner.estado.mercados import EstadoMercados, pares_para_livro
-from tests.fabricas import livro
+from tests.fabricas import livro, market_ccxt
 
 
 # ---------------------------------------------------------------------------
@@ -146,12 +146,22 @@ def test_marcar_desconectada_de_corretora_desconhecida_nao_da_erro():
 def test_ticker_guardado_e_devolvido():
     e = EstadoMercados()
     e.atualizar_ticker("gate", "futuro", "BTC", 100.0, 100.1, recebido_em=200.0,
-                       volume_24h_usd=5_000_000.0, variacao_24h_pct=-1.5)
+                       volume_24h_usd=5_000_000.0, variacao_24h_pct=-1.5,
+                       simbolo_original="BTC/USDC:USDC", cotacao="USDC")
     e.registrar_mensagem("gate", 200.0)
     assert e.obter_ticker("gate", "futuro", "BTC", agora=200.5) == {
         "bid": 100.0, "ask": 100.1, "recebido_em": 200.0,
         "volume_24h_usd": 5_000_000.0, "variacao_24h_pct": -1.5,
+        "simbolo_original": "BTC/USDC:USDC", "cotacao": "USDC",   # o motor precisa da cotacao para converter para USDT
     }
+
+
+def test_ticker_sem_simbolo_e_cotacao_guarda_none():
+    e = EstadoMercados()
+    e.atualizar_ticker("gate", "spot", "BTC", 100.0, 100.1, recebido_em=200.0)
+    e.registrar_mensagem("gate", 200.0)
+    t = e.obter_ticker("gate", "spot", "BTC", agora=200.0)
+    assert t["simbolo_original"] is None and t["cotacao"] is None
 
 
 def test_ticker_sem_volume_e_variacao_guarda_none():
@@ -223,14 +233,9 @@ def test_pares_para_livro_volta_a_contar_quando_sobe_de_novo():
 # Extras: dados lentos (funding e taxas por REST), com corretoras falsas
 # ---------------------------------------------------------------------------
 
-def mercado_rest(simbolo, base, quote="USDT", taker=0.0006, tamanho=1, inverso=False):
-    """Um market no formato do ccxt (so os campos que o scanner le)."""
-    futuro = ":" in simbolo
-    return {
-        "symbol": simbolo, "base": base, "quote": quote,
-        "contractSize": tamanho if futuro else None,
-        "taker": taker, "inverse": inverso,
-    }
+def mercado_rest(simbolo, base, quote="USDT", taker=0.0006, tamanho=1, inverso=False, tipo=None):
+    """Um market no formato do ccxt (veja tests.fabricas.market_ccxt)."""
+    return market_ccxt(simbolo, base, quote, tipo=tipo, tamanho=tamanho, inverso=inverso, taker=taker)
 
 
 class ExchangeRestFalsa:
@@ -340,6 +345,32 @@ def test_atualizar_ignora_mercado_sem_taker_e_inverso_na_taxa():
     assert d.taxa_taker("gate", "futuro") == pytest.approx(0.06)
 
 
+def test_taker_do_futuro_ignora_opcoes_e_futuros_com_vencimento_mesmo_sendo_maioria():
+    # Como a Gate: as opcoes (taker 0,03%) sao muito mais numerosas que os perpetuos (taker 0,05%).
+    # Se contassem como "futuro", a taxa do futuro cairia para 0,03% e criaria sinais falsos.
+    markets = {f"X{i}/USDT:USDT": mercado_rest(f"X{i}/USDT:USDT", f"X{i}", taker=0.0005) for i in range(3)}
+    for i in range(10):
+        simbolo = f"BTC/USDT:USDT-261226-{100000 + i}-C"
+        markets[simbolo] = mercado_rest(simbolo, "BTC", taker=0.0003, tipo="option")
+    for i in range(4):
+        simbolo = f"ETH/USDT:USDT-26122{i}"
+        markets[simbolo] = mercado_rest(simbolo, "ETH", taker=0.0004, tipo="future")
+    markets["BTC/USDT"] = mercado_rest("BTC/USDT", "BTC", taker=0.002)
+    d = DadosLentos()
+    rodar(d.atualizar({"gate": ExchangeRestFalsa(markets)}))
+    assert d.taxa_taker("gate", "futuro") == pytest.approx(0.05)
+    assert d.taxa_taker("gate", "spot") == pytest.approx(0.2)
+    assert set(d._taxas_api) == {("gate", "futuro"), ("gate", "spot")}   # opcoes e vencimentos nao viram um mercado
+
+
+def test_taker_so_de_opcoes_nao_cria_taxa_de_futuro():
+    markets = {"BTC/USDT:USDT-261226-100000-C": mercado_rest("BTC/USDT:USDT-261226-100000-C", "BTC", taker=0.0003, tipo="option")}
+    d = DadosLentos()
+    rodar(d.atualizar({"gate": ExchangeRestFalsa(markets)}))
+    with pytest.raises(TaxaDesconhecida):
+        d.taxa_taker("gate", "futuro")
+
+
 def test_taxa_da_config_continua_valendo_depois_de_atualizar():
     ex = ExchangeRestFalsa({"BTC/USDT:USDT": mercado_rest("BTC/USDT:USDT", "BTC", taker=0.0006)})
     d = DadosLentos(taxas_config={("gate", "futuro"): 0.02})
@@ -401,6 +432,48 @@ def test_funding_um_a_um_quando_a_corretora_nao_tem_lote():
     assert ex.chamadas_lote == 0
     assert d.funding("mexc", "BTC") == (pytest.approx(0.02), 4)
     assert d.funding("mexc", "ETH") == (pytest.approx(0.03), 8)
+
+
+def test_funding_um_a_um_so_pergunta_dos_perpetuos_lineares():
+    markets = {
+        "BTC/USDT:USDT": mercado_rest("BTC/USDT:USDT", "BTC"),
+        "BTC/USD:BTC": mercado_rest("BTC/USD:BTC", "BTC", quote="USD", inverso=True),
+        "BTC/USDT:USDT-261226": mercado_rest("BTC/USDT:USDT-261226", "BTC", tipo="future"),
+        "BTC/USDT:USDT-261226-100000-C": mercado_rest("BTC/USDT:USDT-261226-100000-C", "BTC", tipo="option"),
+        "BTC/USDT": mercado_rest("BTC/USDT", "BTC"),
+    }
+    funding = {"BTC/USDT:USDT": {"symbol": "BTC/USDT:USDT", "fundingRate": 0.0001}}
+    ex = ExchangeRestFalsa(markets, funding, em_lote=False)
+    rodar(DadosLentos().atualizar({"mexc": ex}))
+    assert ex.simbolos_individuais == ["BTC/USDT:USDT"]
+
+
+def test_funding_em_lote_ignora_opcoes_e_futuros_com_vencimento():
+    markets = {
+        "BTC/USDT:USDT-261226": mercado_rest("BTC/USDT:USDT-261226", "BTC", tipo="future"),
+        "ETH/USDT:USDT-261226-3000-C": mercado_rest("ETH/USDT:USDT-261226-3000-C", "ETH", tipo="option"),
+    }
+    funding = {
+        "BTC/USDT:USDT-261226": {"symbol": "BTC/USDT:USDT-261226", "fundingRate": 0.0001},
+        "ETH/USDT:USDT-261226-3000-C": {"symbol": "ETH/USDT:USDT-261226-3000-C", "fundingRate": 0.0001},
+    }
+    d = DadosLentos()
+    rodar(d.atualizar({"gate": ExchangeRestFalsa(markets, funding)}))
+    assert d.funding("gate", "BTC") is None and d.funding("gate", "ETH") is None
+
+
+def test_funding_mesmo_ativo_e_cotacao_desempata_pelo_simbolo_em_qualquer_ordem():
+    markets = {
+        "PEPE/USDT:USDT": mercado_rest("PEPE/USDT:USDT", "PEPE"),
+        "1000PEPE/USDT:USDT": mercado_rest("1000PEPE/USDT:USDT", "1000PEPE"),
+    }
+    um = {"symbol": "1000PEPE/USDT:USDT", "fundingRate": 0.0001, "interval": "8h"}
+    outro = {"symbol": "PEPE/USDT:USDT", "fundingRate": 0.0002, "interval": "4h"}
+    for funding in ({"PEPE/USDT:USDT": outro, "1000PEPE/USDT:USDT": um},
+                    {"1000PEPE/USDT:USDT": um, "PEPE/USDT:USDT": outro}):
+        d = DadosLentos()
+        rodar(d.atualizar({"mexc": ExchangeRestFalsa(markets, funding)}))
+        assert d.funding("mexc", "PEPE") == (pytest.approx(0.01), 8)   # o mesmo simbolo que ocupa a chave do estado
 
 
 def test_funding_um_a_um_erro_num_simbolo_nao_perde_os_outros(caplog):

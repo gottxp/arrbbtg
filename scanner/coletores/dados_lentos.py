@@ -12,8 +12,7 @@ import math
 import re
 from collections import Counter
 
-from scanner.coletores.ccxt_coletor import mercado_do_simbolo
-from scanner.normalizador import normalizar
+from scanner.normalizador import mercado_do_market, normalizar, prioridade_cotacao
 
 registro = logging.getLogger("scanner.coletores")
 
@@ -46,16 +45,20 @@ def _para_percentual(fracao: float) -> float:
 def _taxas_taker_dos_mercados(markets: dict) -> dict[str, float]:
     """Taxa taker em % de cada mercado (spot, futuro) da corretora, lida de `market["taker"]`.
 
+    So contam os markets que o scanner usa (veja mercado_do_market): spot e perpetuo linear.
+    Opcoes, futuros com vencimento e contratos inversos tem taxa propria e puxariam a do futuro
+    para baixo, criando sinais falsos.
     Cada par pode ter uma taxa diferente; fica a mais comum do mercado (as excecoes,
     como pares promocionais, nao mandam). Em empate, a maior: errar para cima so
-    deixa o sinal mais cauteloso. Contratos inversos (cotados em moeda cripto) nao entram.
+    deixa o sinal mais cauteloso.
     """
     contagens: dict[str, Counter] = {}
-    for simbolo, market in markets.items():
+    for market in markets.values():
+        mercado = mercado_do_market(market)
         taker = market.get("taker")
-        if market.get("inverse") or not _numero_valido(taker) or taker < 0:
+        if mercado is None or not _numero_valido(taker) or taker < 0:
             continue
-        contagens.setdefault(mercado_do_simbolo(simbolo), Counter())[_para_percentual(taker)] += 1
+        contagens.setdefault(mercado, Counter())[_para_percentual(taker)] += 1
     return {
         mercado: max(contagem.items(), key=lambda item: (item[1], item[0]))[0]
         for mercado, contagem in contagens.items()
@@ -151,13 +154,15 @@ class DadosLentos:
         for simbolo, item in brutos.items():
             market = markets.get(simbolo)
             funding = _ler_funding(item)
-            if market is None or funding is None or market.get("inverse"):
+            if market is None or funding is None or mercado_do_market(market) != "futuro":
                 continue
-            if mercado_do_simbolo(simbolo) != "futuro" or not market.get("base") or not market.get("quote"):
+            if not market.get("base") or not market.get("quote"):
                 continue
             par = normalizar(corretora, market)
-            # Mais de um futuro pode ter o mesmo ativo (BTC/USDT:USDT e BTC/USDC:USDC): fica o cotado em USDT.
-            preferencia = (par.cotacao != "USDT", par.cotacao)
+            # Mais de um futuro pode ter o mesmo ativo (BTC/USDT:USDT e BTC/USDC:USDC): vale a mesma
+            # regra do estado (moeda preferida e, em empate, ordem do simbolo), para o funding ser do
+            # mesmo contrato cujo preco o motor le.
+            preferencia = (*prioridade_cotacao(par.cotacao), simbolo)
             if par.ativo not in escolhidos or preferencia < escolhidos[par.ativo][0]:
                 escolhidos[par.ativo] = (preferencia, funding)
         return escolhidos
@@ -166,7 +171,7 @@ class DadosLentos:
         """Para corretoras sem busca em lote: pergunta o funding de cada futuro, um por vez."""
         brutos = {}
         falhas = []
-        simbolos = [s for s, m in markets.items() if mercado_do_simbolo(s) == "futuro" and not m.get("inverse")]
+        simbolos = [s for s, m in markets.items() if mercado_do_market(m) == "futuro"]
         for simbolo in simbolos:
             try:
                 brutos[simbolo] = await exchange.fetch_funding_rate(simbolo)
