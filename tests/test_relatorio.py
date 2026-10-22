@@ -364,6 +364,58 @@ def test_erro_no_resumo_vai_para_o_log_e_a_limpeza_da_virada_acontece(banco, lim
     assert [agora for agora, _, _ in limpezas] == [INICIO_21_OUT - 100, INICIO_21_OUT]
 
 
+def test_erro_ao_escrever_as_linhas_do_resumo_vai_para_o_log_e_o_laco_segue(banco, limpezas, monkeypatch, caplog):
+    def linhas_com_defeito(resumo):
+        raise RuntimeError("linhas com defeito")
+
+    monkeypatch.setattr(principal, "linhas_do_resumo", linhas_com_defeito)
+    tempo = Tempo(INICIO_21_OUT - 100, parar_depois=3)
+    with caplog.at_level(logging.ERROR, logger="scanner"):
+        rodar_validacao(MotorDeStatus(gate(0)), banco, cfg_com(intervalo_log_recursos_s=300), tempo)
+    assert any("linhas com defeito" in str(r.exc_info and r.exc_info[1]) for r in caplog.records)
+    assert tempo.espera.esperas == [100, 300, 300]  # a tarefa nao morreu
+    assert [agora for agora, _, _ in limpezas] == [INICIO_21_OUT - 100, INICIO_21_OUT]
+
+
+class TempoQuePula(Tempo):
+    """Tempo que, na espera numero `quando` (contando de 1), pula para `para` em vez de andar o que esperou."""
+
+    def __init__(self, agora: float, parar_depois: int, quando: int, para: float):
+        super().__init__(agora, parar_depois)
+        self._quando, self._para = quando, para
+
+    async def esperar(self, segundos: float) -> None:
+        await super().esperar(segundos)
+        if len(self.espera.esperas) == self._quando:
+            self.agora = self._para
+
+
+def test_relogio_que_volta_para_o_dia_anterior_nao_conta_como_virada(banco, limpezas, caplog):
+    # Ligado as 00:00:10 do dia 21; o relogio do PC e acertado e volta para 23:59:00 do dia 20.
+    tempo = TempoQuePula(INICIO_21_OUT + 10, parar_depois=2, quando=1, para=INICIO_21_OUT - 60)
+    with caplog.at_level(logging.INFO, logger="scanner"):
+        rodar_validacao(MotorDeStatus(gate(1)), banco, cfg_com(intervalo_log_recursos_s=300), tempo)
+    assert not any(r.getMessage().startswith("resumo do dia") for r in caplog.records)
+    assert [agora for agora, _, _ in limpezas] == [INICIO_21_OUT + 10]  # so a de ligar
+    # As leituras continuam no dia que estava correndo (21), nada vai para o dia 20.
+    assert banco.corretoras_do_dia("2026-10-20") == {}
+    assert banco.corretoras_do_dia("2026-10-21") == {"gate": {"atraso_medio_ms": None, "reconexoes": 1}}
+
+
+def test_pc_que_dormiu_atravessando_dias_fecha_o_dia_em_que_dormiu(banco, limpezas, caplog):
+    # Ligado as 10:00 do dia 20; o PC dorme e acorda as 08:00 do dia 23 (a espera "termina" la).
+    acorda = INICIO_20_OUT + 3 * DIA + 8 * 3600
+    tempo = TempoQuePula(INICIO_20_OUT + 10 * 3600, parar_depois=2, quando=1, para=acorda)
+    with caplog.at_level(logging.INFO, logger="scanner"):
+        rodar_validacao(MotorDeStatus(gate(2)), banco, cfg_com(intervalo_log_recursos_s=300), tempo)
+    resumos = [r.getMessage() for r in caplog.records if r.getMessage().startswith("resumo do dia")]
+    assert len(resumos) == 3 and all("2026-10-20" in linha for linha in resumos)  # so o dia em que dormiu
+    assert [agora for agora, _, _ in limpezas] == [INICIO_20_OUT + 10 * 3600, acorda]
+    assert banco.corretoras_do_dia("2026-10-20")["gate"]["reconexoes"] == 2  # a leitura ao acordar fecha o dia 20
+    assert banco.corretoras_do_dia("2026-10-21") == {} and banco.corretoras_do_dia("2026-10-22") == {}
+    assert "gate" in banco.corretoras_do_dia("2026-10-23")
+
+
 def test_rodar_limpa_o_banco_ao_ligar_e_grava_as_corretoras_na_saida(tmp_path, monkeypatch):
     chamadas = []
     original = Banco.limpar_antigos

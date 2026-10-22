@@ -18,7 +18,9 @@ arquivos do painel). A conferencia e um middleware, entao rotas e arquivos novos
 
 Threads: as rotas que leem ou mudam o motor sao `async def`, ou seja, rodam no laco do asyncio,
 o mesmo do motor, e nunca no meio de um ciclo. As que so falam com o banco (que tem trava propria)
-sao `def` comuns e rodam fora do laco, para uma consulta demorada nao parar o motor.
+sao `def` comuns e rodam fora do laco, para uma consulta demorada nao parar o motor. A excecao e a
+/api/validacao: e `def` (le o dia inteiro do banco), mas para hoje le o motor.status no laco do motor,
+com `anyio.from_thread.run_sync`.
 """
 
 import asyncio

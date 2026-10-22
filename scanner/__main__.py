@@ -443,11 +443,10 @@ async def _escrever_resumo(banco: Banco, dia: str) -> None:
     """Escreve no log o resumo do dia `dia`: uma linha por modo e uma das corretoras. Erro vai para o log."""
     try:
         resumo = await asyncio.to_thread(resumo_do_dia, banco, dia)  # le o dia inteiro do banco: fora do laco
+        for linha in linhas_do_resumo(resumo):
+            registro.info(linha)
     except Exception:
         registro.exception("erro ao montar o resumo do dia %s", dia)
-        return
-    for linha in linhas_do_resumo(resumo):
-        registro.info(linha)
 
 
 async def _validacao_diaria(motor: Motor, banco: Banco, cfg: Config, relogio: Callable[[], float],
@@ -468,7 +467,10 @@ async def _validacao_diaria(motor: Motor, banco: Banco, cfg: Config, relogio: Ca
             await esperar(min(cfg.intervalo_log_recursos_s, _ate_a_meia_noite_utc(relogio())))
             agora = relogio()
             _gravar_corretoras(motor, banco, dia, agora)  # na virada, a leitura ainda e do dia que acabou
-            if dia_utc(agora) != dia:
+            # So dia MAIOR vira: o relogio do PC acertado para tras nao conta como virada (as leituras seguem no
+            # dia que estava correndo). PC que dormiu atravessando dias: a leitura ao acordar fecha o dia em que
+            # ele dormiu, so esse resumo vai para o log e os dias dormidos ficam sem leitura.
+            if dia_utc(agora) > dia:
                 await _escrever_resumo(banco, dia)
                 dia = dia_utc(agora)
                 await _limpar_banco(banco, cfg, agora)
