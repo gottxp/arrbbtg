@@ -75,6 +75,8 @@ F = (bid_long − ask_short) / bid_long
 
 **Métricas do período** (janela configurável, padrão 4h): A médio, F médio, maior A, maior F e média dos 10 maiores.
 
+**De onde vêm as amostras das métricas** (alteração aprovada pelo dono em 22/10/2026): para o F médio de um spread que acabou de abrir refletir o período inteiro, como no Arbimax, todo par com ticker nas duas pontas é amostrado pelos tickers (melhor bid/ask, convertido para USDT) a cada `amostra_ticker_s` (padrão 60 s, em blocos de poucos minutos). Quando o par tem livro aberto, a amostra passa a vir do livro (preço de execução para o tamanho de referência) a cada `amostra_s` (padrão 5 s). As duas alimentam a mesma janela do período. As amostras pelos tickers ficam só na memória (não vão ao SQLite nem ao gráfico); a memória a mais esperada é de ~100 a 400 MB. O lote médio vem só das amostras do livro.
+
 **Resultado projetado:**
 
 - **RP bruto** = A atual + F da métrica escolhida (padrão: F médio, como no Arbimax; pode trocar por maior F ou média dos 10 maiores).
@@ -243,7 +245,7 @@ A stack é **obrigatória** e o projeto roda com um comando só (`python -m scan
 | `scanner/painel/` | A página web |
 | `tests/` | Testes automáticos |
 
-**Fluxo de dados:** coletores em duas etapas (etapa 1: melhor bid/ask de todos os pares por stream leve de ticker; etapa 2: livro completo só dos pares com spread de abertura acima do mínimo, cancelado depois de 60s abaixo) → estado em memória → a cada ciclo (padrão 500 ms) o motor percorre os pares candidatos → cálculo → métricas → filtros e modo → gerenciador de sinais → painel (ao vivo) + SQLite. Os spreads A e F de cada par candidato são gravados a cada 5s (configurável) para alimentar o gráfico e as métricas.
+**Fluxo de dados:** coletores em duas etapas (etapa 1: melhor bid/ask de todos os pares por stream leve de ticker; etapa 2: livro completo só dos pares com spread de abertura acima do mínimo, cancelado depois de 60s abaixo) → estado em memória → a cada ciclo (padrão 500 ms) o motor percorre os pares candidatos → cálculo → métricas → filtros e modo → gerenciador de sinais → painel (ao vivo) + SQLite. Os spreads A e F de cada par candidato são gravados a cada 5s (configurável) para alimentar o gráfico e as métricas; os pares sem livro aberto também alimentam as métricas, pelos tickers (seção 3, "De onde vêm as amostras das métricas").
 
 **Ordem de construção:**
 
