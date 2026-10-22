@@ -68,6 +68,7 @@ class ArquivoDoDia(logging.FileHandler):
         self._pasta = pasta
         self._dias = dias
         self._relogio = relogio
+        self._falhando = False  # a ultima linha nao foi gravada (o erro ja foi mostrado no terminal)
         agora = relogio()
         self._marcar_o_dia(agora)
         super().__init__(os.path.join(pasta, nome_do_arquivo(agora)), encoding="utf-8")
@@ -76,22 +77,45 @@ class ArquivoDoDia(logging.FileHandler):
     def _marcar_o_dia(self, agora: float) -> None:
         self._comeco_do_dia = _meia_noite(agora)
         self._proxima_virada = _meia_noite(agora, dias_depois=1)
+        if self._proxima_virada <= agora:
+            # Protecao: num fuso cujo horario de verao comeca a meia-noite, a meia-noite de amanha nao existe,
+            # e alguns sistemas (o C do Windows) a colocam ANTES de agora. Sem isto cada linha trocaria de
+            # arquivo por ate 1 h. Confere de novo daqui a 1 h: o dia novo comeca dentro dessa hora.
+            self._proxima_virada = agora + 3600
 
     def emit(self, record: logging.LogRecord) -> None:
-        agora = self._relogio()
-        if agora >= self._proxima_virada or agora < self._comeco_do_dia:  # outro dia (ou o relogio voltou)
-            self._trocar_de_dia(agora)
-        super().emit(record)
+        """Grava a linha no arquivo do dia, trocando de arquivo se o dia mudou. Nunca levanta erro.
+
+        Se o arquivo nao abrir (pasta apagada, disco cheio, sem permissao), o erro aparece UMA vez no
+        terminal (handleError, como os handlers da biblioteca fazem) e as linhas seguintes sao perdidas
+        em silencio ate o arquivo abrir de novo: o FileHandler tenta abrir a cada linha, entao o log volta
+        sozinho quando a pasta voltar. Quem chamou o log (ex.: o laco do motor) nunca recebe o erro.
+        """
+        try:
+            agora = self._relogio()
+            if agora >= self._proxima_virada or agora < self._comeco_do_dia:  # outro dia (ou o relogio voltou)
+                self._trocar_de_dia(agora)
+            super().emit(record)  # FileHandler: abre o arquivo se ele estiver fechado, e grava
+            self._falhando = False
+        except Exception:
+            if not self._falhando:
+                self._falhando = True
+                self.handleError(record)
 
     def _trocar_de_dia(self, agora: float) -> None:
-        """Fecha o arquivo do dia que acabou e passa a gravar no do dia novo (aberto no proximo emit)."""
-        if self.stream is not None:
-            self.stream.flush()
-            self.stream.close()
-            self.stream = None  # o FileHandler abre de novo, ja no arquivo novo, ao gravar a linha
-        self.baseFilename = os.path.abspath(os.path.join(self._pasta, nome_do_arquivo(agora)))
-        self._marcar_o_dia(agora)
-        self._apagar_os_antigos()
+        """Passa a gravar no arquivo do dia de `agora` (aberto no proximo registro). Mesmo dia: so remarca."""
+        novo = os.path.abspath(os.path.join(self._pasta, nome_do_arquivo(agora)))
+        self._marcar_o_dia(agora)  # antes de tudo: se fechar o arquivo velho falhar, nao tenta trocar de novo
+        if novo == self.baseFilename:
+            return
+        self.baseFilename = novo
+        antigo, self.stream = self.stream, None  # o FileHandler abre o arquivo novo ao gravar a linha
+        try:
+            if antigo is not None:
+                antigo.flush()
+                antigo.close()
+        finally:
+            self._apagar_os_antigos()
 
     def _apagar_os_antigos(self) -> None:
         """Apaga os arquivos de dias anteriores alem dos `dias` mais novos. Nunca levanta erro."""

@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import sqlite3
 import time
 from pathlib import Path
@@ -1460,7 +1461,7 @@ def test_corretora_que_nao_carregou_ao_ligar_volta_sozinha(caplog):
     assert gate.cargas == [False, False, False] and "gate" in coletores and entraram == ["gate"]
     tentativas = [m for m in avisos(caplog) if "gate" in m and "tentativa" in m]
     assert len(tentativas) == 2                                 # cada tentativa que falhou vai para o log
-    assert estado.saude("gate", AGORA)["reconexoes"] == 1
+    assert estado.saude("gate", AGORA)["reconexoes"] == 0       # nunca tinha conectado: a entrada nao e reconexao
 
 
 def test_rodar_corretora_que_falhou_ao_ligar_entra_sozinha_depois(tmp_path, caplog):
@@ -1585,13 +1586,145 @@ def test_iniciar_os_tickers_de_novo_para_a_tarefa_anterior():
     gate = CorretoraFalsa(MARKETS_GATE)
     tickers = principal._Tickers({"gate": ColetorCcxt("gate", gate, estado=EstadoMercados(), relogio=relogio)})
 
+    anterior_terminou = []
+    original = principal._acompanhar_tickers
+
+    async def comeco_anotado(coletor, simbolos):
+        anterior_terminou.append(primeira[0].done())
+        await original(coletor, simbolos)
+
+    primeira = []
+
     async def cenario():
         tickers.iniciar("gate", ["BTC/USDT"])
-        primeira = tickers.tarefas["gate"]
+        primeira.append(tickers.tarefas["gate"])
         await esperar_ate(lambda: gate.pedidos_de("watch_tickers"))
-        tickers.iniciar("gate", ["BTC/USDT"])
-        await esperar_ate(lambda: primeira.done())  # nunca dois streams da mesma corretora
-        assert tickers.tarefas["gate"] is not primeira
+        principal._acompanhar_tickers = comeco_anotado
+        try:
+            tickers.iniciar("gate", ["BTC/USDT"])
+            await esperar_ate(lambda: len(gate.pedidos_de("watch_tickers")) == 2)
+        finally:
+            principal._acompanhar_tickers = original
+        assert primeira[0].done() and tickers.tarefas["gate"] is not primeira[0]
         await parar(tickers.tarefas["gate"])
 
     asyncio.run(cenario())
+    assert anterior_terminou == [True]  # o stream novo so comeca depois que o anterior terminou de verdade
+
+
+
+# ---------------------------------------------------------------------------
+# Correcao pos-revisao 2: o log nunca derruba o scanner; a corretora que volta registra o erro
+# ---------------------------------------------------------------------------
+
+
+def test_virada_com_a_pasta_removida_nao_levanta_e_volta_a_gravar(tmp_path, logs_limpos, fuso_brasilia, capsys):
+    pasta = tmp_path / "logs"
+    agora = [momento_local(2026, 10, 22, 23, 59, 0)]
+    logs.configurar_logs("normal", str(pasta), dias=30, relogio=lambda: agora[0])
+    log = logging.getLogger("scanner.teste")
+    log.info("antes")
+    descarregar()
+    shutil.rmtree(pasta)  # a pasta sumiu (ou a unidade caiu) e chega a meia-noite: o arquivo novo nao abre
+    agora[0] += 120
+    log.info("depois da meia-noite")  # nao pode levantar: o motor chama o log no meio do laco
+    log.info("de novo")
+    erro = capsys.readouterr().err
+    assert erro.count("Logging error") == 1  # avisa uma vez no terminal, nao a cada linha
+    pasta.mkdir()  # a pasta voltou: o log volta a gravar sozinho
+    log.info("voltou")
+    descarregar()
+    assert "voltou" in (pasta / "scanner-2026-10-23.log").read_text(encoding="utf-8")
+
+
+def test_meia_noite_que_o_sistema_poe_antes_de_agora_nao_troca_de_arquivo_a_cada_linha(
+        tmp_path, logs_limpos, fuso_brasilia, monkeypatch):
+    # Fuso cujo horario de verao comeca a meia-noite: a meia-noite de amanha nao existe, e alguns sistemas
+    # (CRT do Windows) a colocam antes de agora. O handler nao pode ficar trocando de arquivo a cada linha.
+    agora = momento_local(2026, 10, 22, 23, 30, 0)
+    real = logs._meia_noite
+    monkeypatch.setattr(logs, "_meia_noite",
+                        lambda momento, dias_depois=0: agora - 1800 if dias_depois else real(momento))
+    logs.configurar_logs("normal", str(tmp_path), dias=30, relogio=lambda: agora)
+    (arquivo,) = [h for h in handlers_do_scanner() if isinstance(h, logs.ArquivoDoDia)]
+    assert arquivo._proxima_virada > agora
+    stream = arquivo.stream
+    for _ in range(3):
+        logging.getLogger("scanner.teste").info("linha")
+    assert arquivo.stream is stream  # o mesmo arquivo aberto, sem fechar e reabrir
+
+
+def test_saude_da_corretora_que_ainda_nao_conectou_nao_conta_reconexao():
+    e = EstadoMercados()
+    e.marcar_esperando("gate")
+    assert e.saude("gate", AGORA)["estado"] == "reconectando"
+    e.marcar_desconectada("gate")  # caiu antes de conectar a primeira vez: continua sem contar
+    e.registrar_mensagem("gate", AGORA)
+    e.marcar_reconectada("gate")
+    assert e.saude("gate", AGORA) == {"estado": "conectada", "atraso_medio_ms": None, "reconexoes": 0}
+    e.marcar_desconectada("gate")  # depois de ter conectado, uma queda de verdade conta
+    e.marcar_reconectada("gate")
+    assert e.saude("gate", AGORA)["reconexoes"] == 1
+
+
+def test_corretora_que_volta_com_erro_ao_entrar_registra_e_tenta_de_novo(caplog):
+    gate = CorretoraQueDemoraACarregar(MARKETS_GATE, falhas=0)
+    estado = EstadoMercados()
+    coletores = {"bitget": ColetorCcxt("bitget", CorretoraFalsa(MARKETS_BITGET), estado=estado, relogio=relogio)}
+    tickers = principal._Tickers(coletores)
+    espera = EsperaFalsa()
+    criacoes = []
+    entraram = []
+
+    def criar_coletor(nome):
+        criacoes.append(nome)
+        if len(criacoes) == 1:
+            raise RuntimeError("defeito ao criar o coletor")
+        return ColetorCcxt(nome, gate, estado=estado, relogio=relogio)
+
+    async def cenario():
+        await principal._trazer_de_volta("gate", gate, coletores, tickers, estado, criar_coletor=criar_coletor,
+                                         ao_entrar=entraram.append, espera_max_s=60, esperar=espera)
+        assert set(tickers.tarefas) == {"gate", "bitget"}
+        for tarefa in tickers.tarefas.values():
+            await parar(tarefa)
+
+    with caplog.at_level(logging.WARNING, logger="scanner"):
+        asyncio.run(cenario())
+    assert espera.esperas == [1, 2] and criacoes == ["gate", "gate"] and entraram == ["gate"]
+    erros = [r for r in caplog.records if r.levelno >= logging.ERROR and "gate" in r.getMessage()]
+    assert len(erros) == 1 and erros[0].exc_info  # nao some em silencio: log com traceback
+    assert estado.saude("gate", AGORA)["estado"] == "reconectando"  # ate o primeiro ticker
+
+
+def test_corretora_que_volta_com_erro_no_ajuste_tenta_de_novo_sem_repetir_o_que_ja_fez(monkeypatch, caplog):
+    gate = CorretoraQueDemoraACarregar(MARKETS_GATE, falhas=0)
+    estado = EstadoMercados()
+    coletores = {"bitget": ColetorCcxt("bitget", CorretoraFalsa(MARKETS_BITGET), estado=estado, relogio=relogio)}
+    tickers = principal._Tickers(coletores)
+    espera = EsperaFalsa()
+    entraram, ajustes = [], []
+    original = principal._ajustar_tickers
+
+    async def ajuste_que_falha_uma_vez(*args):
+        ajustes.append(True)
+        if len(ajustes) == 1:
+            raise RuntimeError("defeito no ajuste")
+        await original(*args)
+
+    monkeypatch.setattr(principal, "_ajustar_tickers", ajuste_que_falha_uma_vez)
+
+    async def cenario():
+        await principal._trazer_de_volta(
+            "gate", gate, coletores, tickers, estado,
+            criar_coletor=lambda nome: ColetorCcxt(nome, gate, estado=estado, relogio=relogio),
+            ao_entrar=entraram.append, espera_max_s=60, esperar=espera)
+        assert set(tickers.tarefas) == {"gate", "bitget"}
+        for tarefa in tickers.tarefas.values():
+            await parar(tarefa)
+
+    with caplog.at_level(logging.WARNING, logger="scanner"):
+        asyncio.run(cenario())
+    assert espera.esperas == [1, 2] and len(ajustes) == 2
+    assert entraram == ["gate"]  # os dados lentos da corretora so foram ligados uma vez
+    assert any(r.exc_info and "defeito no ajuste" in str(r.exc_info[1]) for r in caplog.records)

@@ -102,10 +102,23 @@ class _Tickers:
         anterior = self.tarefas.get(nome)
         if anterior is not None and not anterior.done():
             anterior.cancel()
+        else:
+            anterior = None
         self.simbolos[nome] = list(simbolos)
         self.tarefas[nome] = asyncio.create_task(
-            _acompanhar_tickers(self._coletores[nome], list(simbolos)), name=f"tickers {nome}"
+            self._comecar(self._coletores[nome], list(simbolos), anterior), name=f"tickers {nome}"
         )
+
+    @staticmethod
+    async def _comecar(coletor: ColetorCcxt, simbolos: list[str], anterior: asyncio.Task | None) -> None:
+        """Espera a tarefa anterior (ja cancelada) terminar de verdade e so entao abre o stream novo.
+
+        Os dois streams dividem o estado de reconexao do coletor; sem esperar, por um instante os dois
+        estariam de pe. (Quem chama normalmente ja usa `parar` antes; isto e a protecao extra.)
+        """
+        if anterior is not None:
+            await asyncio.gather(anterior, return_exceptions=True)
+        await _acompanhar_tickers(coletor, simbolos)
 
     async def parar(self, nome: str) -> None:
         """Para os tickers da corretora `nome` e espera a tarefa terminar de verdade."""
@@ -169,29 +182,43 @@ async def _trazer_de_volta(nome: str, exchange, coletores: dict[str, ColetorCcxt
     """Corretora que nao carregou a lista de mercados ao ligar: tenta de novo sozinha ate conseguir.
 
     Espera 1s, 2s, 4s... (ate espera_max_s) entre as tentativas; cada tentativa que falha vai para o log.
-    Enquanto isso o painel mostra "reconectando" para ela. Quando carrega: cria o coletor dela, chama
-    `ao_entrar` (o __main__ liga os dados lentos dela; a recarga dos mercados ja passa a incluir quem
-    esta em `coletores`) e ajusta os tickers de todas (as outras podem ganhar pares em comum com ela).
+    Enquanto isso o painel mostra "reconectando" para ela (a primeira conexao dela nao conta como
+    reconexao). Quando carrega: cria o coletor dela, chama `ao_entrar` (o __main__ liga os dados lentos
+    dela; a recarga dos mercados ja passa a incluir quem esta em `coletores`) e ajusta os tickers de todas
+    (as outras podem ganhar pares em comum com ela).
+    Se der erro nessa entrada (defeito do scanner), vai para o log com traceback e tenta de novo na
+    proxima espera, sem repetir o que ja deu certo: a corretora nunca fica "meio dentro" em silencio.
     """
-    estado.marcar_desconectada(nome)  # painel: "reconectando"
+    estado.marcar_esperando(nome)  # painel: "reconectando"
     tentativa = 0
+    entrou = False  # `ao_entrar` ja foi chamado (os dados lentos dela ja estao ligados)
     while True:
         await esperar(espera_reconexao(tentativa, espera_max_s))
         tentativa += 1
+        proxima = espera_reconexao(tentativa, espera_max_s)
         try:
             await exchange.load_markets()
-            break
         except Exception as erro:  # cancelamento (Ctrl+C) nao entra aqui
             registro.warning("%s: ainda nao consegui carregar a lista de mercados (%s: %s); tentativa %d falhou, "
-                             "tento de novo em %gs", nome, type(erro).__name__, erro, tentativa,
-                             espera_reconexao(tentativa, espera_max_s))
-    registro.info("%s: lista de mercados carregada na tentativa %d; a corretora entra no scanner", nome, tentativa)
-    coletores[nome] = criar_coletor(nome)
-    ao_entrar(nome)
-    await _ajustar_tickers(coletores, tickers, estado)
-    if nome not in tickers.tarefas:  # sem ticker nenhum, nada tiraria o "reconectando" do painel
-        registro.warning("%s: nenhum par em comum com as outras corretoras; fica sem tickers", nome)
-        estado.marcar_reconectada(nome)
+                             "tento de novo em %gs", nome, type(erro).__name__, erro, tentativa, proxima)
+            continue
+        try:
+            if nome not in coletores:
+                coletores[nome] = criar_coletor(nome)
+                registro.info("%s: lista de mercados carregada na tentativa %d; a corretora entra no scanner",
+                              nome, tentativa)
+            if not entrou:
+                ao_entrar(nome)
+                entrou = True
+            await _ajustar_tickers(coletores, tickers, estado)
+        except Exception:
+            registro.exception("%s: a lista de mercados carregou, mas deu erro ao colocar a corretora no scanner; "
+                               "tento de novo em %gs", nome, proxima)
+            continue
+        if nome not in tickers.tarefas:  # sem ticker nenhum, nada tiraria o "reconectando" do painel
+            registro.warning("%s: nenhum par em comum com as outras corretoras; fica sem tickers", nome)
+            estado.marcar_reconectada(nome)
+        return
 
 
 async def _recarregar_mercados_sempre(exchanges: dict, coletores: dict[str, ColetorCcxt], tickers: _Tickers,

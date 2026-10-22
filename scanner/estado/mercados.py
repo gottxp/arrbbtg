@@ -48,6 +48,7 @@ class EstadoMercados:
         # Saude das corretoras (painel).
         self._reconectando: set[str] = set()  # caiu e ainda nao voltou
         self._reconexoes: dict[str, int] = {}  # corretora -> quantas vezes voltou depois de cair
+        self._nunca_conectou: set[str] = set()  # esperando a primeira conexao: ela nao conta como reconexao
         self._atrasos: dict[str, deque] = {}  # corretora -> blocos [numero do bloco, soma dos atrasos, quantidade]
         self._avisados_relogio: set[str] = set()  # corretoras ja avisadas de relogio errado (uma vez cada)
 
@@ -128,15 +129,28 @@ class EstadoMercados:
             for chave in [c for c in dados if c[0] == corretora]:
                 del dados[chave]
 
+    def marcar_esperando(self, corretora: str) -> None:
+        """A corretora ainda nao conectou nenhuma vez (ex.: nao carregou a lista de mercados ao ligar).
+
+        O painel mostra "reconectando" enquanto ela tenta; a primeira conexao dela nao conta como
+        reconexao (nao houve queda). Quedas depois de ter conectado contam normalmente.
+        """
+        self._reconectando.add(corretora)
+        self._nunca_conectou.add(corretora)
+
     def marcar_reconectada(self, corretora: str) -> None:
         """A conexao voltou (chegou a primeira mensagem boa depois da queda): conta uma reconexao.
 
-        So conta se a corretora estava reconectando; chamar de novo nao conta duas vezes (o coletor
-        chama a cada mensagem de ticker, e so a primeira depois da queda conta).
+        So conta se a corretora estava reconectando, e nao conta a primeira conexao de quem nunca tinha
+        conectado (marcar_esperando). Chamar de novo nao conta duas vezes (o coletor chama a cada
+        mensagem de ticker, e so a primeira depois da queda conta).
         """
         if corretora in self._reconectando:
             self._reconectando.discard(corretora)
-            self._reconexoes[corretora] = self._reconexoes.get(corretora, 0) + 1
+            if corretora in self._nunca_conectou:
+                self._nunca_conectou.discard(corretora)
+            else:
+                self._reconexoes[corretora] = self._reconexoes.get(corretora, 0) + 1
 
     def registrar_atraso(self, corretora: str, atraso_s: float, agora: float) -> None:
         """Anota um atraso medido (horario de chegada - horario que a corretora informou), em segundos.
