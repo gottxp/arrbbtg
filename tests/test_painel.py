@@ -255,7 +255,7 @@ def test_javascript_nao_usa_innerhtml_nem_caixas_do_navegador():
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node nao esta instalado")
 def test_app_js_sem_erro_de_sintaxe():
-    resultado = subprocess.run(["node", "--check", str(PASTA_PAINEL / "app.js")], capture_output=True, text=True)
+    resultado = subprocess.run(["node", "--check", str(PASTA_PAINEL / "app.js")], capture_output=True, text=True, encoding="utf-8")
     assert resultado.returncode == 0, resultado.stderr
 
 
