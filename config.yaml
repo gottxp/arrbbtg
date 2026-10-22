@@ -1,31 +1,33 @@
 # Configuracao do scanner de arbitragem.
-# Quase todos os valores abaixo sao os padroes do codigo: se apagar uma linha, vale o padrao.
-# Estas linhas do exemplo NAO sao o padrao (apagar muda o comportamento):
-#   corretoras: o padrao do codigo e so a fase 1 [mexc, gate, bitget]; aqui entram tambem bingx, xt e
-#     hyperliquid (fase 2).
-#   mercados_por_corretora: o padrao e spot e futuro em todas. hyperliquid: so futuro (especificacao,
-#     secao 2; sem a linha o spot dela entraria). xt: so futuro porque o ccxt 4.5.89 nao traz bid/ask no
-#     spot da XT; isto e um desvio da secao 2 (XT spot e futuros): confirme com o dono.
-#   metodo_ticker: o padrao e tentar watch_tickers primeiro; hyperliquid usa watch_ticker porque o lote
-#     dela (allMids) nao traz bid/ask.
-#   intervalo_funding_h: o padrao e o intervalo que o ccxt informa (ou 8h); hyperliquid: 1h, para nao
-#     depender do ccxt (ela cobra de hora em hora).
-# Percentuais estao em % (0.3 = 0,3%).
-# A explicacao completa de cada campo vem no README (ultima etapa do projeto).
-# Fase 3 (Task 16), linhas do exemplo que NAO sao o padrao do codigo:
-#   corretoras: entram tambem kraken (Kraken Pro spot) e lighter; krakenfutures (futuros da Kraken Pro) e
-#     lighter_rh (Lighter Robinhood) ficam comentadas: confirme antes de ativar (especificacao, secao 11).
-#   corretoras_farm: o padrao e vazio (modo Farm desligado); aqui lighter, lighter_rh, kraken e krakenfutures.
-#   mercados_por_corretora: kraken: so spot (os futuros da Kraken Pro sao a corretora krakenfutures).
-#   fontes_cotacao: o padrao e vazio; USD: kraken (os futuros da Kraken cotam em USD e a cotacao vem do par
-#     spot USDT/USD da propria Kraken).
-#   intervalo_funding_h: lighter: 1h (ela cobra de hora em hora).
+# Cada campo tem um comentario logo acima: o que faz, a unidade, o padrao e quando mexer.
+# Se apagar uma linha, vale o padrao do codigo (o "Padrao" do comentario). Percentuais em %: 0.3 = 0,3%.
+# O config.yaml so e lido ao ligar: depois de mudar, confira e religue o scanner.
+#   Windows (PowerShell):  .venv\Scripts\python -m scanner --validar
+#   VPS (terminal):        .venv/bin/python -m scanner --validar
+#   Tem que aparecer "config ok".
+#
+# Linhas deste exemplo que NAO sao o padrao do codigo (apagar muda o comportamento):
+#   corretoras: o padrao e so a fase 1 [mexc, gate, bitget]; aqui entram tambem bingx, xt e hyperliquid
+#     (fase 2), kraken e lighter (fase 3). krakenfutures e lighter_rh ficam comentadas: confirme antes de
+#     ativar (especificacao, secao 11).
+#   corretoras_farm: o padrao e vazio (modo Farm sem sinais); aqui lighter, lighter_rh, kraken e krakenfutures.
+#   mercados_por_corretora: o padrao e spot e futuro em todas. Aqui: hyperliquid so futuro (especificacao,
+#     secao 2; sem a linha o spot dela entraria); kraken so spot (os futuros dela sao a krakenfutures); xt so
+#     futuro, porque o ccxt 4.5.89 nao traz bid/ask no spot da XT. XT so futuro e um desvio da secao 2 (XT spot
+#     e futuros) ainda sem aprovacao: confirme com o dono.
+#   metodo_ticker: o padrao e tentar watch_tickers primeiro; hyperliquid usa watch_ticker porque o lote dela
+#     (allMids) nao traz bid/ask.
+#   fontes_cotacao: o padrao e vazio; aqui USD: kraken (os futuros da Kraken cotam em USD e a cotacao vem do
+#     par spot USDT/USD da propria Kraken).
+#   intervalo_funding_h: o padrao e o intervalo que o ccxt informa (ou 8h); aqui hyperliquid: 1 e lighter: 1
+#     (as duas cobram de hora em hora).
 
-# Corretoras do modo normal (fases 1, 2 e 3).
-#   kraken: Kraken Pro spot; krakenfutures: Kraken Pro futuros (perpetuos em USD). No ccxt sao duas corretoras
-#     (servidores e conexoes diferentes), cada uma com a sua saude no painel; o spot x futuro entre elas vale.
-#   lighter: Lighter principal (so futuros, em USDC); lighter_rh: Lighter Robinhood (so futuros, em USDG).
-#     As duas usam o conector proprio do scanner (sem ccxt) e so leem dados publicos.
+# Corretoras ligadas, uma por linha com "- ". Nomes aceitos: mexc, gate, bitget, bingx, xt, hyperliquid,
+#   kraken (Kraken Pro spot), krakenfutures (Kraken Pro futuros, perpetuos em USD), lighter (Lighter principal,
+#   so futuros em USDC) e lighter_rh (Lighter Robinhood, so futuros em USDG). As duas Lighter usam o conector
+#   proprio do scanner (sem ccxt) e so leem dados publicos.
+# Unidade: lista de nomes. Padrao: [mexc, gate, bitget]. Quando mexer: para ligar ou desligar uma corretora.
+#   Nome errado passa no --validar, mas o scanner para ao ligar com "corretora '...' nao existe no ccxt".
 corretoras:
   - mexc
   - gate
@@ -39,49 +41,77 @@ corretoras:
   # (especificacao, secao 11). Para ativar, apague o "# " do comeco da linha.
   # - krakenfutures
   # - lighter_rh
-# Corretoras do modo Farm (custo de giro baixo, sem buscar lucro). Vazio = modo Farm desligado.
-# Pode listar corretoras desligadas: so valem as que estiverem em corretoras.
+# Corretoras de farm (as que dao pontos de airdrop). No modo Farm so aparece sinal com pelo menos uma ponta
+#   numa delas. Pode listar corretora desligada: so vale a que tambem estiver em corretoras.
+# Unidade: lista de nomes. Padrao: [] (vazio = o modo Farm nao mostra nenhum sinal). Quando mexer: ao mudar onde
+#   voce faz farm.
 corretoras_farm: [lighter, lighter_rh, kraken, krakenfutures]
 
-# Tamanho da ordem usada para calcular o preco de execucao no livro, em USDT.
+# Tamanho da ordem usada no calculo: o preco de execucao e o preco medio comendo o livro ate este valor (ja
+#   inclui o slippage). Tambem e o lote minimo obrigatorio: o melhor nivel do livro de cada ponta precisa valer
+#   pelo menos isto. Unidade: USDT. Padrao: 100. Quando mexer: para simular o tamanho real das suas ordens.
 tamanho_referencia_usd: 100
-# Maximo de segundos sem nenhuma mensagem da corretora antes de ela ser tratada como atrasada.
+# Maximo sem NENHUMA mensagem da corretora (o ticker serve de sinal de vida). Passou disso, ela fica "atrasada"
+#   no painel e nao gera sinal. Unidade: segundos. Padrao: 2. Quando mexer: se uma corretora boa vive "atrasada".
 max_silencio_conexao_s: 2
-# Idade maxima do livro de ofertas, em segundos (livro parado vale ate aqui).
+# Idade maxima de um livro ou ticker parado (a corretora so manda quando o livro muda, entao parado ainda vale
+#   ate aqui). Unidade: segundos. Padrao: 30. Quando mexer: raramente.
 max_idade_livro_s: 30
-# Spread minimo entre os livros para considerar o par, em %.
+# Spread de abertura minimo (pelos tickers) para o scanner abrir o livro completo do par (etapa 2). Sem livro
+#   aberto nao existe sinal. Unidade: %. Padrao: 0.3. Quando mexer: abaixe para ver spreads menores (ex.: modo
+#   Farm), com mais livros abertos (mais assinaturas); suba se uma corretora limitar assinaturas.
 spread_min_livro_pct: 0.3
-# Quanto tempo manter o livro de um par depois que ele deixa de ser interessante, em segundos.
+# Quanto tempo o livro do par continua aberto depois que o spread cai abaixo de spread_min_livro_pct.
+#   Unidade: segundos. Padrao: 60. Quando mexer: raramente.
 manter_livro_s: 60
-# Janela das metricas (F medio, F maior etc.), em horas.
+# Janela das metricas do periodo (A e F medios, maiores, media dos 10 maiores, invertidas, lote medio). O campo
+#   "Periodo das metricas" do painel vale por cima deste. Unidade: horas. Padrao: 4. Quando mexer: para comparar
+#   com outro periodo do Arbimax. Mudar o periodo zera as janelas (recomecam do zero).
 periodo_metricas_h: 4
-# RP liquido minimo para virar sinal, em %.
+# Modo Lucro: RP liquido minimo para virar sinal (com o modo comparacao ligado, vale para o RP bruto). O campo
+#   "Resultado projetado min. (Lucro)" do painel vale por cima deste. Unidade: %. Padrao: 0.2.
+#   Quando mexer: para ver mais (menor) ou menos (maior) sinais.
 rp_min_lucro_pct: 0.2
-# Custo maximo aceito no modo Farm, em % (negativo = aceita perder ate esse valor).
+# Modo Farm: menor RP liquido aceito (negativo = aceita perder ate esse valor). O campo "Custo max. (Farm)" do
+#   painel vale por cima deste. Unidade: %. Padrao: -0.1. Quando mexer: para aceitar gastar mais ou menos no farm.
 custo_max_farm_pct: -0.1
-# Acima deste RP, em %, o sinal e marcado como suspeito (provavel dado errado ou token diferente).
+# Spread de abertura (A) acima disto marca o sinal como SUSPEITO (provavel dado errado ou token diferente com o
+#   mesmo nome); suspeito fica oculto, a menos que "Mostrar suspeitos" esteja ligado no painel.
+#   Unidade: %. Padrao: 30. Quando mexer: raramente.
 limite_suspeito_pct: 30
-# Depois de um sinal, espera estes segundos antes de repetir o mesmo sinal.
+# O mesmo par + tipo + pontas que some e volta antes disto continua no mesmo registro do historico.
+#   Unidade: segundos. Padrao: 60. Quando mexer: raramente.
 anti_repeticao_s: 60
-# Intervalo do ciclo de calculo, em milissegundos.
+# De quanto em quanto tempo o motor recalcula todos os pares. Unidade: milissegundos. Padrao: 500.
+#   Quando mexer: aumente se a CPU da linha "recursos:" do log ficar alta.
 ciclo_ms: 500
-# Intervalo entre amostras gravadas no banco, em segundos.
+# De quanto em quanto tempo os spreads A e F de cada par sao gravados (grafico e metricas do periodo).
+#   Unidade: segundos. Padrao: 5. Quando mexer: raramente (menor = banco maior).
 amostra_s: 5
-# Amostras mais antigas que isso, em dias, sao apagadas.
+# Amostras e sinais encerrados mais velhos que isto sao apagados do banco (ao ligar e a cada virada do dia UTC).
+#   Unidade: dias. Padrao: 7. Quando mexer: para guardar mais historico (banco maior).
 retencao_dias: 7
-# Tempo estimado da operacao, em horas (usado para o funding esperado).
+# Tempo estimado de cada operacao, usado no funding esperado (quantas cobrancas cabem nesse tempo).
+#   Unidade: horas. Padrao: 8. Quando mexer: se as suas operacoes duram bem mais ou bem menos que isso.
 tempo_operacao_h: 8
-# Margem extra de slippage descontada do RP, em %.
+# Margem extra de slippage descontada do RP liquido, alem do slippage que o livro ja mostra.
+#   Unidade: %. Padrao: 0.0. Quando mexer: para ter uma folga de seguranca no RP liquido.
 margem_slippage_pct: 0.0
-# Metrica de spread usada no RP bruto: medio | maior | media_10_maiores
+# Qual F do periodo entra no RP bruto (RP bruto = A atual + F): medio (como o Arbimax), maior ou
+#   media_10_maiores. O campo "Metrica de spread" do painel vale por cima deste. Unidade: uma das 3 opcoes.
+#   Padrao: medio. Quando mexer: raramente.
 metrica_spread: medio
 
-# Taxas taker da sua conta (nivel VIP, descontos), em %. Se nao preencher, vale a taxa que o ccxt traz.
-# Sem taxa nenhuma (nem aqui nem no ccxt), os pares daquele mercado nao geram sinal (o log avisa).
-# Mercados aceitos: spot e futuro. Exemplo:
+# Taxas taker da sua conta (nivel VIP, descontos), por corretora e mercado (spot e/ou futuro). Unidade: % por
+#   ordem. Padrao: {} (vazio = vale a taxa que vem da corretora). Quando mexer: sempre que a sua taxa real for
+#   diferente da publica. Sem taxa nenhuma (nem aqui nem na corretora), os pares daquele mercado nao geram sinal
+#   (o log avisa). Para preencher, troque a linha "taxas: {}" por, por exemplo:
 #   taxas:
 #     mexc:
 #       futuro: 0.02
+#     gate:
+#       spot: 0.1
+#       futuro: 0.05
 # De onde vem a taxa de cada corretora quando nao preenchida (ccxt 4.5.89), e a taxa publica padrao
 # (conta sem nivel VIP), para conferir no site:
 #   mexc, gate, bitget: taxa de cada par informada pela API da corretora.
@@ -97,19 +127,23 @@ metrica_spread: medio
 #   lighter_rh: taxa da API: conta Standard 0; Premium 0.035 (volume de 14 dias abaixo de $1 milhao).
 taxas: {}
 
-# Intervalo para atualizar funding e taxas (REST), em segundos.
+# De quanto em quanto tempo o scanner busca funding e taxas pela API REST (dados lentos).
+#   Unidade: segundos. Padrao: 60. Quando mexer: se o log mostrar bloqueio por excesso de pedidos.
 intervalo_dados_lentos_s: 60
-# Intervalo para recarregar a lista de mercados, em segundos.
+# De quanto em quanto tempo recarrega a lista de mercados (par novo entra, par removido sai sem erro).
+#   Unidade: segundos. Padrao: 3600 (1 hora). Quando mexer: raramente.
 recarregar_mercados_s: 3600
-# Tempo maximo esperando a corretora confirmar que cancelou a assinatura de um livro, em segundos.
-# Passou disso, registra no log e segue (o livro ja foi tirado do scanner).
+# Tempo maximo esperando a corretora confirmar que cancelou a assinatura de um livro; passou disso, o log
+#   registra e o scanner segue (o livro ja saiu do calculo). Unidade: segundos. Padrao: 5. Quando mexer: raramente.
 timeout_desassinar_s: 5
 
-# Mercados usados de cada corretora (spot e/ou futuro). Corretora que nao aparece aqui usa os dois.
+# Mercados usados de cada corretora: [spot], [futuro] ou [spot, futuro]. Corretora fora daqui usa os dois.
+#   Unidade: corretora: [mercados]. Padrao: {} (todas com os dois). Quando mexer: para desligar o spot ou o
+#   futuro de uma corretora.
 #   hyperliquid: so futuros (especificacao, secao 2), apesar de o ccxt listar tambem o spot dela.
 #   xt: so futuros porque o ccxt 4.5.89 nao traz bid/ask em nenhum ticker do spot da XT (conferido no
-#       codigo do ccxt): o spot ficaria sem dados. Para tentar mesmo assim, troque por [spot, futuro]; se
-#       nao funcionar, o log avisa "nenhum metodo de ticker traz bid/ask".
+#       codigo do ccxt): o spot ficaria sem dados. Para seguir a especificacao (spot e futuros), apague a linha
+#       "xt: [futuro]"; se nao funcionar, o log avisa "nenhum metodo de ticker traz bid/ask".
 #   kraken: so spot (os futuros da Kraken Pro sao a corretora krakenfutures).
 #   krakenfutures: so futuros; descomente junto com a krakenfutures em corretoras.
 #   lighter e lighter_rh: nao precisam (o conector da Lighter so le futuros).
@@ -118,101 +152,135 @@ mercados_por_corretora:
   xt: [futuro]
   kraken: [spot]
   # krakenfutures: [futuro]
-# Metodo do ccxt que cada corretora tenta primeiro para os tickers (etapa 1): watch_tickers (todos os
-# pares numa assinatura), watch_bids_asks (so o melhor bid/ask) ou watch_ticker (um par por assinatura).
-# Sem nada, tenta nessa ordem os que a corretora tem; se um nao servir, passa ao seguinte.
+# Metodo do ccxt que cada corretora tenta primeiro para os tickers (etapa 1): watch_tickers (todos os pares numa
+#   assinatura), watch_bids_asks (so o melhor bid/ask) ou watch_ticker (um par por assinatura). Se um nao servir,
+#   o scanner passa ao seguinte sozinho (o log avisa). Unidade: corretora: metodo. Padrao: {} (cada corretora
+#   tenta nessa ordem). Quando mexer: raramente.
 #   hyperliquid: o watch_tickers dela (allMids) so traz o preco medio, sem bid/ask.
 metodo_ticker:
   hyperliquid: watch_ticker
-# Se um metodo de ticker so entrega tickers sem bid/ask por tantas mensagens seguidas (sem nenhum ticker
-# bom antes), o coletor passa ao proximo metodo e avisa no log.
+# Quantas mensagens seguidas de tickers sem bid/ask (sem nenhum ticker bom antes) fazem o scanner trocar de
+#   metodo de ticker (na Lighter: passar a etapa 1 para os livros). Unidade: mensagens (inteiro). Padrao: 10.
+#   Quando mexer: raramente.
 mensagens_sem_bid_ask: 10
 
-# Cotacao das moedas fora de USDT (ex.: USDC da Hyperliquid): meio do bid/ask do par spot MOEDA/USDT
-# (ou USDT/MOEDA) da corretora fonte_cotacao. Precisa ser uma corretora ligada e com spot.
+# Corretora de onde vem a cotacao das moedas fora de USDT (ex.: USDC da Hyperliquid e da Lighter): meio do
+#   bid/ask do par spot MOEDA/USDT (ou USDT/MOEDA) dela. Precisa estar em corretoras e ter spot.
+#   Unidade: nome de corretora. Padrao: bitget. Quando mexer: se a bitget for desligada.
 fonte_cotacao: bitget
-# Fonte diferente para alguma moeda:
+# Fonte diferente para alguma moeda. Unidade: MOEDA: corretora. Padrao: {} (todas pela fonte_cotacao).
+#   Quando mexer: para tirar a cotacao de uma moeda de outra corretora.
 #   USD: kraken: os futuros da Kraken (krakenfutures) e os pares spot da Kraken sem USDT cotam em USD; a
 #     cotacao vem do par spot USDT/USD da propria Kraken (1 USD = 1/preco USDT).
 #   USDG (Lighter Robinhood): vem da fonte_cotacao (bitget) se ela tiver o par spot USDG/USDT; senao, o log
 #     avisa e os pares em USDG usam 1:1 com aviso_cotacao. Outra corretora ligada com o par: USDG: nome.
 fontes_cotacao:
   USD: kraken
-# Cotacao mais longe de 1 do que isto, em %, e tratada como sem cotacao (usa 1:1 e marca aviso_cotacao).
+# Cotacao mais longe de 1 do que isto e tratada como sem cotacao (usa 1:1 e marca COTACAO 1:1 no sinal).
+#   Unidade: %. Padrao: 10. Quando mexer: raramente.
 faixa_cotacao_pct: 10
 
-# Intervalo do funding em horas, por corretora. Vale sobre o que o ccxt informa; sem nada, vale o do ccxt
-# e, se ele nao informar, 8h.
+# Intervalo do funding por corretora, por cima do que o ccxt informa (sem nada: o do ccxt e, se ele nao
+#   informar, 8h). Unidade: horas (inteiro). Padrao: {}. Quando mexer: se o FR do painel mostrar um intervalo
+#   diferente do site da corretora.
 #   hyperliquid: cobra de hora em hora.
 #   bingx e xt: o ccxt ja traz o intervalo de cada contrato (pode ser diferente entre contratos); nao
 #     preencha, senao o mesmo valor vale para todos os contratos da corretora.
 #   lighter e lighter_rh: cobram de hora em hora (o conector ja usa 1h; a linha deixa explicito).
 #   krakenfutures: o ccxt ja informa 1h; descomente junto com a krakenfutures em corretoras.
+#   Linha de corretora que nao esta em corretoras da erro no --validar: descomente so junto com ela.
 intervalo_funding_h:
   hyperliquid: 1
   lighter: 1
   # krakenfutures: 1
   # lighter_rh: 1
 
-# Conexao que cai tenta de novo sozinha, esperando 1s, 2s, 4s... ate este maximo, em segundos.
+# Conexao que cai tenta de novo sozinha, esperando 1s, 2s, 4s... ate este maximo entre as tentativas.
+#   Unidade: segundos. Padrao: 60. Quando mexer: raramente.
 espera_max_reconexao_s: 60
-# Maximo de assinaturas por corretora (livros abertos; e tickers, se a corretora so assina um par
-# por vez, como a bingx e a hyperliquid com watch_ticker). Ficam os pares de maior volume 24h.
-# Vazio = sem limite; se o log disser que a mensagem "parece de limite de assinaturas", preencha. Na Lighter
-# (que nao documenta o limite) o limite vale para os livros; com a etapa 1 pelos livros (quando o market_stats
-# nao traz bid/ask), ele vale para todos os livros, os da etapa 1 e os da etapa 2. Exemplo:
+# Maximo de assinaturas por corretora (livros abertos; e tickers, se a corretora so assina um par por vez, como
+#   a bingx e a hyperliquid com watch_ticker). Ficam os pares de maior volume 24h. Unidade: assinaturas
+#   (inteiro). Padrao: {} (sem limite). Quando mexer: se o log disser que a mensagem "parece de limite de
+#   assinaturas" daquela corretora. Na Lighter (que nao documenta o limite) o limite vale para os livros; com a
+#   etapa 1 pelos livros (quando o market_stats nao traz bid/ask), ele vale para todos os livros, os da etapa 1
+#   e os da etapa 2. Para preencher, troque a linha "limites_assinatura: {}" por, por exemplo:
 #   limites_assinatura:
-#     bingx: 200
+#     mexc: 200
 limites_assinatura: {}
-# Atraso do dado (chegada - horario da corretora) acima disto, para mais ou para menos, e relogio
-# errado e fica fora do atraso medio do painel, em segundos.
+# Atraso do dado (chegada - horario da corretora) acima disto, para mais ou para menos, e relogio errado e fica
+#   fora do atraso medio do painel. Unidade: segundos. Padrao: 30. Quando mexer: raramente (acerte o relogio do PC).
 atraso_max_valido_s: 30
-# Pasta dos logs: um arquivo por dia (scanner-AAAA-MM-DD.log), com o horario LOCAL do computador
-# (cada linha mostra tambem o fuso, ex.: -0300); o arquivo vira a meia-noite local.
+# Pasta dos logs, dentro da pasta onde o scanner roda: um arquivo por dia (scanner-AAAA-MM-DD.log), com o
+#   horario LOCAL do computador (cada linha mostra o fuso, ex.: -0300); o arquivo vira a meia-noite local.
+#   Unidade: nome de pasta. Padrao: logs. Quando mexer: raramente.
 pasta_logs: logs
 # Quantos arquivos de dias anteriores guardar, alem do de hoje (os mais velhos sao apagados).
+#   Unidade: dias (inteiro). Padrao: 30. Quando mexer: para guardar mais ou menos log.
 dias_logs: 30
-# De quanto em quanto tempo o log registra memoria, CPU e descartes, em segundos.
+# De quanto em quanto tempo o log escreve a linha "recursos:" (memoria, CPU) e o resumo dos descartes; no mesmo
+#   intervalo o banco grava o atraso e as reconexoes de cada corretora para a validacao. Unidade: segundos.
+#   Padrao: 300 (5 minutos). Quando mexer: raramente.
 intervalo_log_recursos_s: 300
 
-# Lighter (fase 3): enderecos da API publica de cada instancia (REST e WebSocket). O WebSocket e aberto
-# sempre so leitura (?readonly=true, vale tambem em regiao restrita): o scanner nunca opera.
+# Lighter principal: endereco da API REST (lista de mercados). Unidade: endereco https://. Padrao: o oficial
+#   abaixo. Quando mexer: so se a Lighter mudar o endereco.
 url_rest_lighter: https://mainnet.zklighter.elliot.ai
+# Lighter principal: endereco do WebSocket. O scanner abre sempre so leitura (?readonly=true): nunca opera.
+#   Unidade: endereco wss://. Padrao: o oficial abaixo. Quando mexer: so se a Lighter mudar o endereco.
 url_ws_lighter: wss://mainnet.zklighter.elliot.ai/stream
+# Lighter Robinhood: endereco da API REST. Unidade: endereco https://. Padrao: o oficial abaixo. Quando mexer: so
+#   se a Lighter mudar.
 url_rest_lighter_rh: https://api.rh.lighter.xyz
+# Lighter Robinhood: endereco do WebSocket (tambem so leitura). Unidade: endereco wss://. Padrao: o oficial
+#   abaixo. Quando mexer: so se a Lighter mudar.
 url_ws_lighter_rh: wss://api.rh.lighter.xyz/stream
-# De quanto em quanto tempo o scanner manda um ping a Lighter, em segundos (menos que 120: o servidor fecha
-# a conexao depois de 2 minutos sem nada do cliente).
+# De quanto em quanto tempo o scanner manda um ping a Lighter. Precisa ser menos que 120 (o servidor fecha a
+#   conexao depois de 2 minutos sem nada do cliente). Unidade: segundos. Padrao: 30. Quando mexer: raramente.
 intervalo_ping_lighter_s: 30
-# Sem nenhuma mensagem da Lighter por tantos intervalos de ping (nem a resposta do ping), a conexao e dada
-# como morta e o scanner reconecta (numero inteiro).
+# Sem nenhuma mensagem da Lighter por tantos intervalos de ping (nem a resposta do ping), a conexao e dada como
+#   morta e o scanner reconecta. Unidade: pings (inteiro). Padrao: 2. Quando mexer: raramente.
 pings_sem_resposta_lighter: 2
-# Tempo maximo de uma chamada REST da Lighter (lista de mercados) e da abertura da conexao WebSocket, em segundos.
+# Tempo maximo de uma chamada REST da Lighter (lista de mercados) e da abertura da conexao WebSocket.
+#   Unidade: segundos. Padrao: 10. Quando mexer: se a internet for lenta e o log mostrar tempo esgotado na Lighter.
 tempo_max_rede_lighter_s: 10
-# Niveis de cada lado do livro da Lighter que vao para o scanner (os melhores). A Lighter manda o livro inteiro
-# (milhares de niveis nos pares grandes); o calculo so come o livro ate o tamanho de referencia. Se aumentar
-# muito o tamanho_referencia_usd, aumente aqui tambem (livro curto demais = "sem liquidez" = sem sinal).
+# Niveis de cada lado do livro da Lighter que vao para o calculo (os melhores; a Lighter manda o livro inteiro).
+#   Unidade: niveis (inteiro). Padrao: 100. Quando mexer: se aumentar muito o tamanho_referencia_usd, aumente
+#   aqui tambem (livro curto demais = "sem liquidez" = sem sinal).
 niveis_livro_lighter: 100
-# Livro pedido a Lighter que nao recebe o livro completo em tantos segundos e pedido de novo (1s, 2s, 4s... de
-# espera se continuar sem chegar).
+# Livro pedido a Lighter que nao recebe o livro completo neste tempo e pedido de novo (1s, 2s, 4s... de espera se
+#   continuar sem chegar). Unidade: segundos. Padrao: 10. Quando mexer: raramente.
 tempo_max_livro_completo_lighter_s: 10
 # Mudancas de livro seguidas sem o livro completo antes delas para o log avisar (uma vez por par): sinal de que o
-# formato da Lighter mudou.
+#   formato da Lighter mudou. Unidade: mensagens (inteiro). Padrao: 10. Quando mexer: raramente.
 mudancas_sem_livro_completo_lighter: 10
 # Se o market_stats da Lighter nao trouxer bid/ask (mensagens_sem_bid_ask mensagens seguidas, de pares
-# diferentes), a etapa 1 dela passa a vir dos livros; volta quando ele trouxer bid/ask do mesmo jeito. Depois de
-# cada troca, fica pelo menos este tempo no modo novo antes de trocar de novo, em segundos (evita trocar e
-# destrocar). A troca e tudo ou nada: com alguns pares sempre com bid/ask e outros sempre sem, nao troca.
+#   diferentes), a etapa 1 dela passa a vir dos livros; volta quando ele trouxer bid/ask do mesmo jeito. Depois de
+#   cada troca, fica pelo menos este tempo no modo novo antes de trocar de novo (evita trocar e destrocar). A troca
+#   e tudo ou nada: com alguns pares sempre com bid/ask e outros sempre sem, nao troca. Unidade: segundos.
+#   Padrao: 300. Quando mexer: raramente.
 tempo_min_modo_etapa1_lighter_s: 300
 
-# Painel web. Na VPS, preencha usuario e senha.
+# Painel web: endereco, porta, usuario e senha (cada item explicado abaixo). Unidade: bloco com 4 itens.
+#   Padrao: os valores abaixo.
+#   Quando mexer: no PC deixe como esta; na VPS preencha usuario e senha (veja o README, parte 3).
 painel:
+  # Endereco onde o painel escuta: 127.0.0.1 = so a propria maquina (no PC e na VPS com tunel SSH); 0.0.0.0 =
+  #   aberto para a internet (so com usuario e senha). Unidade: endereco IP. Padrao: 127.0.0.1.
+  #   Quando mexer: so na VPS, para abrir a porta na internet (README, parte 3.5, opcao B).
   host: 127.0.0.1
+  # Porta do painel (http://localhost:8000). Unidade: numero inteiro de 1 a 65535. Padrao: 8000.
+  #   Quando mexer: se o log disser que a porta ja esta em uso.
   porta: 8000
+  # Usuario do painel (o navegador pede ao abrir). Unidade: texto, sem ":"; null = sem senha. Padrao: null.
+  #   Quando mexer: na VPS. Usuario sem senha (ou senha sem usuario) impede o scanner de ligar.
   usuario: null
+  # Senha do painel. Unidade: texto (entre aspas se tiver simbolos); null = sem senha. Padrao: null.
+  #   Quando mexer: na VPS (sempre junto com o usuario).
   senha: null
 
-# Arquivo do banco SQLite.
+# Arquivo do banco SQLite (historico dos sinais, amostras do grafico, grupos de filtros e metricas da validacao),
+#   dentro da pasta onde o scanner roda. Unidade: nome de arquivo. Padrao: scanner.db. Quando mexer: raramente.
 banco: scanner.db
-# Nivel do log: normal | detalhado
+# Quanto o log escreve: normal ou detalhado (tambem cada livro e ticker descartado; o arquivo cresce muito).
+#   Unidade: uma das 2 opcoes. Padrao: normal. Quando mexer: so para investigar um problema.
 nivel_log: normal

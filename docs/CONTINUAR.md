@@ -45,34 +45,15 @@ Cada tarefa passou por um implementador e por um revisor independente. As corre�
 | 17 | Métricas de validação, README completo e `config.yaml` comentado |
 | Final | Revisão do código inteiro por um revisor independente, correções e entrega |
 
-## Testar no seu PC agora (opcional, Windows)
+## Testar no seu PC agora
 
-O scanner já roda sem o painel: os sinais aparecem no log e na API. Para conferir:
+Siga o `README.md` (na pasta do projeto), nesta ordem:
 
-1. Instale o Python 3.12 (python.org, marcando "Add Python to PATH").
-2. Abra o PowerShell na pasta do projeto e rode:
+1. Parte 1: instalar no Windows (termina com os testes passando).
+2. Parte 2: rodar no Windows e abrir o painel em `http://localhost:8000`.
+3. Parte 4: conferir cada marco, do marco 1 (preços das corretoras) ao marco 5 (validação de 3 dias), e os avisos específicos A a F.
 
-```
-python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements-dev.txt
-.venv\Scripts\python -m pytest -q
-```
-
-Deve aparecer `647 passed`.
-
-3. Primeiro marco: preços ao vivo das 3 corretoras, para comparar com os sites.
-
-```
-.venv\Scripts\python -m scanner.ferramentas.imprimir_precos mexc gate bitget
-```
-
-4. Scanner completo (Ctrl+C para parar). Os sinais ativos aparecem no log a cada minuto e em `http://localhost:8000/api/sinais`.
-
-```
-.venv\Scripts\python -m scanner
-```
-
-Se algo der erro, copie a mensagem inteira e cole na próxima conversa.
+Se algo der erro, veja a parte 8 do README. O que não estiver lá: copie a mensagem inteira e cole na próxima conversa.
 
 ## Decisões que tomei no seu lugar
 

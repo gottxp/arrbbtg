@@ -1,5 +1,6 @@
 """Testes da leitura e validacao do config.yaml."""
 
+import re
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 
@@ -388,3 +389,63 @@ def test_cabecalho_do_config_yaml_lista_os_campos_que_nao_sao_o_padrao():
         assert campo in texto, f"{campo} difere do padrao e nao aparece no cabecalho do config.yaml"
     assert "Todos os valores abaixo sao os padroes" not in texto
     assert "confirme com o dono" in texto  # o xt: [futuro] e um desvio da especificacao (secao 2)
+
+
+# ---------------------------------------------------------------------------
+# Guardas da documentacao (Task 17, parte B): a documentacao nao pode ficar velha
+# ---------------------------------------------------------------------------
+
+def _comentario_logo_acima(linhas: list[str], indice: int, recuo: str) -> list[str]:
+    """As linhas de comentario coladas acima de linhas[indice] que comecam com `recuo` + "#"."""
+    bloco = []
+    for linha in reversed(linhas[:indice]):
+        if not linha.startswith(recuo + "#"):
+            break
+        bloco.append(linha)
+    return bloco[::-1]
+
+
+# O que o comentario de cada campo do config.yaml precisa dizer (alem do que o campo faz).
+PARTES_DO_COMENTARIO = ("Unidade", "Padrao", "Quando mexer")
+
+
+def _falta_no_comentario(bloco: list[str]) -> list[str]:
+    texto = "\n".join(bloco)
+    return [parte for parte in PARTES_DO_COMENTARIO if parte not in texto]
+
+
+def test_todo_campo_da_config_tem_comentario_completo_logo_acima_no_config_yaml():
+    # Comentario de cada campo: o que faz, unidade, padrao e quando mexer, colado acima do campo. Um campo novo
+    # na Config sem esse comentario quebra o teste.
+    linhas = (RAIZ / "config.yaml").read_text(encoding="utf-8").splitlines()
+    posicoes = {}
+    for i, linha in enumerate(linhas):
+        if not linha.startswith((" ", "#")) and ":" in linha:
+            posicoes[linha.split(":", 1)[0]] = i
+    for campo in (f.name for f in fields(Config)):
+        assert campo in posicoes, f"{campo} nao aparece no config.yaml"
+        bloco = _comentario_logo_acima(linhas, posicoes[campo], "")
+        assert bloco, f"{campo}: falta o comentario logo acima do campo no config.yaml"
+        assert not _falta_no_comentario(bloco), f"{campo}: falta {_falta_no_comentario(bloco)} no comentario"
+    for item in Config().painel:  # os itens do bloco painel, com recuo de 2 espacos
+        indice = next(i for i in range(posicoes["painel"] + 1, len(linhas)) if linhas[i].startswith(f"  {item}:"))
+        bloco = _comentario_logo_acima(linhas, indice, "  ")
+        assert bloco, f"painel.{item}: falta o comentario logo acima do item no config.yaml"
+        assert not _falta_no_comentario(bloco), f"painel.{item}: falta {_falta_no_comentario(bloco)} no comentario"
+
+
+def test_todo_campo_da_config_esta_na_tabela_do_readme_com_o_padrao_do_codigo():
+    # README, parte 6 (Mudar a configuracao), tabela "Todos os campos": uma linha por campo, com o padrao em yaml.
+    texto = (RAIZ / "README.md").read_text(encoding="utf-8")
+    inicio = texto.index("\n## 6. ")
+    fim = texto.index("\n## ", inicio + 1)
+    linhas = re.findall(r"^\| `([a-z_0-9.]+)` \| `([^`]*)` \|", texto[inicio:fim], flags=re.MULTILINE)
+    tabela = dict(linhas)
+    assert len(tabela) == len(linhas), "campo repetido na tabela do README"
+    padrao = Config()
+    esperado = {f.name: getattr(padrao, f.name) for f in fields(Config) if f.name != "painel"}
+    esperado.update({f"painel.{item}": valor for item, valor in padrao.painel.items()})
+    assert set(tabela) == set(esperado), (
+        f"faltam no README: {sorted(set(esperado) - set(tabela))}; sobram: {sorted(set(tabela) - set(esperado))}")
+    for campo, valor in tabela.items():
+        assert yaml.safe_load(valor) == esperado[campo], f"{campo}: o README diz {valor}, o codigo {esperado[campo]!r}"
