@@ -7,8 +7,14 @@
       "lucro": {"quantidade_sinais": 3, "abertos": 0, "rp_liquido_medio_pct": 0.4, "duracao_media_s": 17.333,
                 "pct_sumiu_5s": 33.33, "pct_sumiu_30s": 66.67},
       "farm":  {...o mesmo para o modo farm...},
+      "comparacao": {...o mesmo para os sinais que nasceram com o modo comparacao ligado (lucro e farm)...},
       "corretoras": {"gate": {"atraso_medio_ms": 180.5, "reconexoes": 2}, ...},
     }
+
+Modo comparacao: SEPARADO dos modos. Com ele ligado o sinal passa pelo RP bruto (como o Arbimax), entao o RP
+liquido dele pode ser negativo e as duracoes sao as de outra regra. Misturado, o "RP liquido medio" do modo Lucro
+deixaria de dizer o que o scanner mostraria de verdade. Separado (em vez de jogado fora), o dono ainda ve quantos
+sinais apareceram durante a comparacao com o Arbimax (criterio 2 da secao 9).
 
 O __main__ escreve esse resumo no log quando o dia vira (`linhas_do_resumo`) e a API o entrega em
 GET /api/validacao.
@@ -74,7 +80,7 @@ def resumo_do_dia(banco: Banco, dia: str, status_corretoras: dict | None = None)
     Dia = dia UTC do `detectado_em` do sinal (como Banco.sinais_do_dia): um sinal que nasce as 23:59:50 UTC
     e some depois da meia-noite conta inteiro no dia em que nasceu.
 
-    Por modo (lucro e farm):
+    Por modo (lucro e farm), sem os sinais que nasceram em modo comparacao (esses ficam juntos em "comparacao"):
     - quantidade_sinais: todos os sinais detectados no dia, inclusive os ainda abertos (`abertos` diz quantos);
     - rp_liquido_medio_pct: media do RP liquido gravado de cada sinal (o ultimo visto; o do aberto e o do inicio);
     - duracao_media_s, pct_sumiu_5s e pct_sumiu_30s: so sobre os sinais ja encerrados; sem nenhum, ficam None.
@@ -89,7 +95,8 @@ def resumo_do_dia(banco: Banco, dia: str, status_corretoras: dict | None = None)
     sinais = banco.sinais_do_dia(dia)
     resumo = {"dia": date.fromisoformat(dia).isoformat()}
     for modo in MODOS:
-        resumo[modo] = _resumo_do_modo([s for s in sinais if s["modo"] == modo])
+        resumo[modo] = _resumo_do_modo([s for s in sinais if s["modo"] == modo and not s.get("comparacao")])
+    resumo["comparacao"] = _resumo_do_modo([s for s in sinais if s.get("comparacao")])
     resumo["corretoras"] = banco.corretoras_do_dia(dia, status_corretoras)
     return resumo
 
@@ -105,13 +112,15 @@ def _texto(valor: float | None, formato: str, unidade: str = "") -> str:
 
 
 def linhas_do_resumo(resumo: dict) -> list[str]:
-    """O resumo do dia em linhas para o log: uma por modo e uma com as corretoras."""
+    """O resumo do dia em linhas para o log: uma por modo, uma do modo comparacao (se houver) e uma das corretoras."""
     inicio = f"resumo do dia {resumo['dia']} UTC"
     linhas = []
-    for modo in MODOS:
-        m = resumo[modo]
+    grupos = [(f"modo {modo}", resumo[modo]) for modo in MODOS]
+    if resumo.get("comparacao", {}).get("quantidade_sinais"):
+        grupos.append(("modo comparacao (RP bruto, fora dos modos acima)", resumo["comparacao"]))
+    for nome, m in grupos:
         linhas.append(
-            f"{inicio}, modo {modo}: {m['quantidade_sinais']} sinais ({m['abertos']} ainda aberto(s)); "
+            f"{inicio}, {nome}: {m['quantidade_sinais']} sinais ({m['abertos']} ainda aberto(s)); "
             f"RP liquido medio {_texto(m['rp_liquido_medio_pct'], '.4f', '%')}; "
             f"duracao media {_texto(m['duracao_media_s'], '.1f', ' s')}; "
             f"sumiram em menos de {SUMIU_RAPIDO_S} s: {_texto(m['pct_sumiu_5s'], '.1f', '%')}; "

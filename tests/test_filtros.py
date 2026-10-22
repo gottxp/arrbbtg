@@ -523,32 +523,41 @@ def test_campos_de_motor_e_painel_nao_mudam_o_resultado_de_passa():
 # Todos os filtros ligados ao mesmo tempo
 # ---------------------------------------------------------------------------
 
-def test_todos_os_filtros_juntos_e_um_por_vez_falhando():
+def test_todos_os_filtros_juntos_e_cada_variacao_quebrando_um_so():
+    # BTC, ETH e AKAM em "apenas mostrar": assim ETH (nunca mostrar) e AKAM (lista negra) quebram so a lista deles.
     f = Filtros(
         corretoras_lado1=["bitget"], corretoras_lado2=["gate"], tipos=["futuro_futuro"],
         volume_min_usd=1000, spread_min_pct=0.1, lote_min_usd=500, lote_medio_min_usd=500,
         limite_ordem_min_usd=1000, maior_abertura_min_pct=0.1, maior_fechamento_min_pct=-1,
         abertura_media_min_pct=0.1, fechamento_medio_min_pct=-1, invertidas_min=0,
         funding_min_pct=-1, funding_max_pct=1, fr_yield_min_pct=0, intervalos_funding=[8],
-        funding_sincronizado=True, rp_min_pct=0.3, apenas_mostrar=["BTC"], nunca_mostrar=["ETH"],
+        funding_sincronizado=True, rp_min_pct=0.3, apenas_mostrar=["BTC", "ETH", "AKAM"], nunca_mostrar=["ETH"],
         lista_negra=["AKAM"],
     )
     assert passa(candidato(), f, "lucro", cfg)
     # Cada variacao abaixo quebra exatamente um filtro e precisa reprovar.
-    assert not passa(candidato(long="mexc"), f, "lucro", cfg)
-    assert not passa(candidato(short="mexc"), f, "lucro", cfg)
-    assert not passa(candidato(mercado_long="spot"), f, "lucro", cfg)
-    assert not passa(candidato(campos_long={"volume_24h_usd": 10}), f, "lucro", cfg)
-    assert not passa(candidato(spread_abertura_pct=0.05), f, "lucro", cfg)
-    assert not passa(candidato(lote_long=400), f, "lucro", cfg)
-    assert not passa(candidato(campos_long={"lote_medio_usd": 400}), f, "lucro", cfg)
-    assert not passa(candidato(campos_long={"limite_ordem_usd": 500}), f, "lucro", cfg)
+    assert not passa(candidato(long="mexc"), f, "lucro", cfg)  # corretoras do lado 1
+    assert not passa(candidato(short="mexc"), f, "lucro", cfg)  # corretoras do lado 2
+    assert not passa(candidato(mercado_long="spot"), f, "lucro", cfg)  # tipos
+    assert not passa(candidato(campos_long={"volume_24h_usd": 10}), f, "lucro", cfg)  # volume
+    assert not passa(candidato(spread_abertura_pct=0.05), f, "lucro", cfg)  # spread minimo
+    assert not passa(candidato(lote_long=400), f, "lucro", cfg)  # lote minimo
+    assert not passa(candidato(campos_long={"lote_medio_usd": 400}), f, "lucro", cfg)  # lote medio
+    assert not passa(candidato(campos_long={"limite_ordem_usd": 500}), f, "lucro", cfg)  # limite de ordem
+    assert not passa(candidato(metricas_periodo=metricas(maior_abertura=0.05)), f, "lucro", cfg)  # maior A
+    assert not passa(candidato(campos_long={"funding_pct": 2.0}), f, "lucro", cfg)  # funding maximo
+    assert not passa(candidato(fr_yield_8h_pct=-0.01), f, "lucro", cfg)  # FR Yield
+    # As duas pontas em 4h: quebra so o intervalo (continuam sincronizadas).
+    assert not passa(candidato(campos_long={"funding_intervalo_h": 4}, campos_short={"funding_intervalo_h": 4}),
+                     f, "lucro", cfg)
+    assert not passa(candidato(campos_long={"funding_intervalo_h": 4}),
+                     Filtros(funding_sincronizado=True), "lucro", cfg)  # so a sincronizacao
+    assert not passa(candidato(rp_liquido=0.25), f, "lucro", cfg)  # RP minimo
+    assert not passa(candidato(par="ETH/USDT"), f, "lucro", cfg)  # nunca mostrar
+    assert not passa(candidato(par="AKAM/USDT"), f, "lucro", cfg)  # lista negra
+    assert not passa(candidato(par="SOL/USDT"), f, "lucro", cfg)  # apenas mostrar
+    # Sem metricas do periodo (combinacao que acabou de aparecer), os filtros do periodo reprovam juntos.
     assert not passa(candidato(metricas_periodo=None), f, "lucro", cfg)
-    assert not passa(candidato(campos_long={"funding_pct": 2.0}), f, "lucro", cfg)
-    assert not passa(candidato(fr_yield_8h_pct=-0.01), f, "lucro", cfg)
-    assert not passa(candidato(campos_long={"funding_intervalo_h": 4}), f, "lucro", cfg)
-    assert not passa(candidato(rp_liquido=0.25), f, "lucro", cfg)
-    assert not passa(candidato(par="ETH/USDT"), f, "lucro", cfg)
 
 
 # ---------------------------------------------------------------------------

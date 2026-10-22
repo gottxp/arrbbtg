@@ -669,7 +669,7 @@ def test_rodar_agenda_a_recarga_e_os_recursos_com_os_intervalos_da_config(tmp_pa
         agendados["recarga"] = intervalo_s
         await asyncio.sleep(3600)
 
-    async def recursos_falsos(motor, coletores, intervalo_s, esperar=asyncio.sleep, medidor=None):
+    async def recursos_falsos(motor, coletores, intervalo_s, esperar=asyncio.sleep, medidor=None, **nomeados):
         agendados["recursos"] = intervalo_s
         await asyncio.sleep(3600)
 
@@ -716,12 +716,13 @@ def fuso_brasilia():
 
 
 def handlers_do_scanner():
-    return [h for h in logging.getLogger().handlers if getattr(h, "do_scanner", False)]
+    """Os handlers que escrevem de verdade (terminal e arquivo), atras da fila do log (veja scanner/logs.py)."""
+    return logs.handlers_do_scanner()
 
 
 def descarregar():
-    for h in handlers_do_scanner():
-        h.flush()
+    """Espera a thread do log escrever tudo o que ja estava na fila."""
+    assert logs.descarregar_logs()
 
 
 def momento_local(ano, mes, dia, hora, minuto, segundo) -> float:
@@ -793,6 +794,7 @@ def test_guarda_o_arquivo_de_hoje_e_os_dias_logs_anteriores(tmp_path, logs_limpo
     assert arquivos_de_log(tmp_path) == [f"scanner-2026-10-{d}.log" for d in ("08", "09", "10", "11")]
     agora[0] = momento_local(2026, 10, 12, 0, 0, 1)
     logging.getLogger("scanner.teste").info("dia novo")
+    descarregar()
     assert arquivos_de_log(tmp_path) == [f"scanner-2026-10-{d}.log" for d in ("09", "10", "11", "12")]
     assert (tmp_path / "outra-coisa.txt").exists()
 
@@ -834,6 +836,7 @@ def test_pasta_de_logs_que_nao_abre_deixa_so_o_terminal(tmp_path, logs_limpos, c
     arquivo_no_lugar.write_text("um arquivo com o nome da pasta")
     logs.configurar_logs("normal", str(arquivo_no_lugar), dias=3)
     assert len(handlers_do_scanner()) == 1
+    descarregar()
     assert "arquivo de log" in capsys.readouterr().err
 
 
@@ -1230,8 +1233,8 @@ def test_evento_recusado_pelo_banco_vai_ao_log_e_os_outros_sao_gravados(tmp_path
     original = m.gerenciador.processar
     estragados = []
 
-    def processar_com_um_nan(aprovados, agora):
-        eventos = original(aprovados, agora)
+    def processar_com_um_nan(aprovados, agora, **nomeados):
+        eventos = original(aprovados, agora, **nomeados)
         eventos[0].sinal["rp_liquido_pct"] = math.nan  # o JSON da spec nao aceita NaN
         estragados.append(eventos[0].sinal)
         return eventos
@@ -1632,6 +1635,7 @@ def test_virada_com_a_pasta_removida_nao_levanta_e_volta_a_gravar(tmp_path, logs
     agora[0] += 120
     log.info("depois da meia-noite")  # nao pode levantar: o motor chama o log no meio do laco
     log.info("de novo")
+    descarregar()
     erro = capsys.readouterr().err
     assert erro.count("Logging error") == 1  # avisa uma vez no terminal, nao a cada linha
     pasta.mkdir()  # a pasta voltou: o log volta a gravar sozinho
@@ -1654,6 +1658,7 @@ def test_meia_noite_que_o_sistema_poe_antes_de_agora_nao_troca_de_arquivo_a_cada
     stream = arquivo.stream
     for _ in range(3):
         logging.getLogger("scanner.teste").info("linha")
+    descarregar()
     assert arquivo.stream is stream  # o mesmo arquivo aberto, sem fechar e reabrir
 
 

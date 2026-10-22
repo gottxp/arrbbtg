@@ -19,8 +19,14 @@ Lighter (Task 16): lighter e lighter_rh usam o conector proprio (scanner/coletor
 ccxt; o funding e a taxa delas chegam ao DadosLentos pelo proprio coletor (fora do laco REST dele).
 
 Validacao (especificacao, secao 9): no mesmo intervalo o banco guarda o atraso e as reconexoes de cada
-corretora no dia; quando o dia UTC vira, o resumo do dia anterior vai para o log. O banco apaga o que passou
-de `retencao_dias` ao ligar e a cada virada do dia (_validacao_diaria).
+corretora no dia; quando o dia UTC vira, o resumo do dia anterior vai para o log. O banco apaga as amostras que
+passaram de `retencao_dias` ao ligar e a cada virada do dia (_validacao_diaria).
+
+Banco (revisao final): tudo o que o laco grava (eventos, amostras, sessao, metricas das corretoras) vai para o
+EscritorBanco, que grava numa thread propria: o laco nunca espera o disco. Ao ligar: os sinais que ficaram
+abertos de uma execucao que caiu sao fechados, o motor comeca na ultima sessao do painel e as janelas do
+periodo sao recarregadas das amostras do banco. Ao parar: os sinais ativos sao encerrados e a fila do escritor
+e gravada antes de fechar o banco.
 
 Com --validar, so confere o config.yaml e sai (nao conecta em nada).
 """
@@ -34,7 +40,7 @@ import time
 from collections.abc import Awaitable, Callable
 
 from scanner.api import conferir_painel, criar_app, servir_api
-from scanner.armazenamento import Banco
+from scanner.armazenamento import Banco, EscritorBanco
 from scanner.coletores.base import ColetorDoScanner
 from scanner.coletores.ccxt_coletor import ColetorCcxt
 from scanner.coletores.dados_lentos import DadosLentos
@@ -43,7 +49,14 @@ from scanner.coletores.lighter import criar_coletor_lighter, e_lighter
 from scanner.coletores.reconexao import espera_reconexao
 from scanner.config.carregar import Config, ErroConfig, carregar_config
 from scanner.estado import EstadoMercados
-from scanner.logs import MedidorCpu, configurar_logs, linha_de_recursos, memoria_do_processo
+from scanner.logs import (
+    MedidorCpu,
+    TemposDoCiclo,
+    configurar_logs,
+    desligar_logs,
+    linha_de_recursos,
+    memoria_do_processo,
+)
 from scanner.motor import Motor, simbolos_para_tickers
 from scanner.sinais import Evento
 from scanner.validacao import dia_utc, linhas_do_resumo, resumo_do_dia
@@ -53,6 +66,8 @@ registro = logging.getLogger("scanner.principal")
 
 # De quanto em quanto tempo o log mostra a quantidade de sinais ativos (especificacao: a cada minuto).
 INTERVALO_LOG_SINAIS_S = 60
+# Quanto o resumo do dia espera o escritor gravar a ultima leitura das corretoras antes de ler o banco (segundos).
+ESPERA_ESCRITOR_RESUMO_S = 10
 
 
 def configurar_log(cfg: Config) -> None:
@@ -302,18 +317,24 @@ def _resumo_dos_descartes(coletores: dict[str, ColetorDoScanner], intervalo_s: f
 
 async def _registrar_recursos(motor: Motor, coletores: dict[str, ColetorDoScanner], intervalo_s: float,
                               esperar: Callable[[float], Awaitable] = asyncio.sleep,
-                              medidor: MedidorCpu | None = None) -> None:
+                              medidor: MedidorCpu | None = None, tempos: TemposDoCiclo | None = None,
+                              banco: Banco | None = None, escritor: EscritorBanco | None = None) -> None:
     """A cada `intervalo_s` (intervalo_log_recursos_s), registra no log memoria, CPU e o resumo dos descartes.
 
-    Memoria = RSS do processo; CPU = % desde a linha anterior. Na mesma linha: sinais ativos e quantos
-    historicos (combinacoes com amostras na memoria) o motor guarda. Um erro aqui nunca para o scanner.
+    Memoria = RSS do processo; CPU = % desde a linha anterior. Na mesma linha: sinais ativos, quantos
+    historicos (combinacoes com amostras na memoria) o motor guarda, o tempo medio e o maior do ciclo do motor
+    (`tempos`), o tamanho do banco no disco e quantos itens esperam o escritor do banco. Um erro aqui nunca
+    para o scanner.
     """
     medidor = MedidorCpu() if medidor is None else medidor
     while True:
         await esperar(intervalo_s)
         try:
-            registro.info(linha_de_recursos(memoria_do_processo(), medidor.medir(), len(motor.sinais_ativos()),
-                                            motor.quantidade_historicos()))
+            registro.info(linha_de_recursos(
+                memoria_do_processo(), medidor.medir(), len(motor.sinais_ativos()), motor.quantidade_historicos(),
+                ciclo=tempos.tirar() if tempos is not None else None,
+                banco_bytes=banco.tamanho_bytes() if banco is not None else None,
+                fila_banco=escritor.pendentes() if escritor is not None else None))
             registro.info(_resumo_dos_descartes(coletores, intervalo_s))
         except Exception:
             registro.exception("erro ao registrar memoria e CPU no log")
@@ -372,7 +393,8 @@ async def _servir_painel(app, cfg: Config) -> None:
 
 async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorDoScanner], cfg: Config,
                          relogio: Callable[[], float], ciclos: int | None,
-                         publicar: Callable[[list[Evento]], None] | None = None) -> None:
+                         publicar: Callable[[list[Evento]], None] | None = None,
+                         tempos: TemposDoCiclo | None = None) -> None:
     """A cada `ciclo_ms`: roda o ciclo do motor, transmite os eventos ao painel e ajusta os livros abertos (etapa 2).
 
     O ajuste dos livros roda em tarefas proprias (uma por corretora), fora do ritmo do motor: se uma
@@ -380,6 +402,7 @@ async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorDoScanner], c
     dela so comeca quando o anterior acabar.
     ciclos: quantos ciclos rodar (os testes usam 2); None = ate ser cancelado (Ctrl+C).
     publicar: recebe os eventos de cada ciclo (o `Transmissor` da API); o motor nunca espera por ele.
+    tempos: anota quanto cada ciclo levou (calculo + etapa 2), para a linha "recursos:" do log.
     Erro no ciclo (sinais) e erro na etapa 2 (escolha dos livros) sao separados: um nao impede o
     outro; vai para o log e o proximo ciclo tenta de novo.
     """
@@ -396,6 +419,7 @@ async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorDoScanner], c
             # Ritmo fixo de ciclo_ms, descontando o tempo gasto no ciclo; se atrasar, segue sem "recuperar" ciclos.
             proximo = max(proximo + intervalo_s, relogio_do_laco())
             agora = relogio()
+            inicio_do_ciclo = time.perf_counter()
             try:
                 eventos = motor.ciclo(agora)
             except Exception:
@@ -408,6 +432,8 @@ async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorDoScanner], c
                 registro.exception("erro na etapa 2 (escolha dos livros); tentando de novo no proximo ciclo")
             else:
                 _iniciar_ajustes(coletores, selecao, ajustes, com_traceback)
+            if tempos is not None:
+                tempos.registrar((time.perf_counter() - inicio_do_ciclo) * 1000)
             feitos += 1
             if ultimo_log is None or agora - ultimo_log >= INTERVALO_LOG_SINAIS_S:
                 ultimo_log = agora
@@ -444,8 +470,11 @@ async def _limpar_banco(banco: Banco, cfg: Config, agora: float) -> None:
         registro.info("limpeza do banco: %d amostras com mais de %g dias apagadas", apagadas, cfg.retencao_dias)
 
 
-def _gravar_corretoras(motor: Motor, banco: Banco, dia: str, agora: float) -> None:
-    """Grava no dia `dia` o atraso medio e as reconexoes de cada corretora (Motor.status). Erro vai para o log."""
+def _gravar_corretoras(motor: Motor, banco, dia: str, agora: float) -> None:
+    """Grava no dia `dia` o atraso medio e as reconexoes de cada corretora (Motor.status). Erro vai para o log.
+
+    banco: o Banco ou, no scanner, o EscritorBanco (que so poe na fila: o laco nao espera o disco).
+    """
     try:
         banco.registrar_corretoras(dia, motor.status(agora))
     except Exception:
@@ -463,37 +492,48 @@ async def _escrever_resumo(banco: Banco, dia: str) -> None:
 
 
 async def _validacao_diaria(motor: Motor, banco: Banco, cfg: Config, relogio: Callable[[], float],
-                            esperar: Callable[[float], Awaitable] = asyncio.sleep) -> None:
+                            esperar: Callable[[float], Awaitable] = asyncio.sleep,
+                            escritor: EscritorBanco | None = None) -> None:
     """Metricas de validacao por dia (especificacao, secao 9) e limpeza do banco (secao 8).
 
-    - ao ligar: apaga do banco o que passou de `retencao_dias`;
+    - ao ligar: apaga do banco as amostras que passaram de `retencao_dias`;
     - a cada `intervalo_log_recursos_s`: grava o atraso medio e as reconexoes de cada corretora no dia UTC;
     - quando o dia UTC vira (a espera e encurtada para acordar na meia-noite): essa leitura fecha o dia que
       acabou, o resumo dele vai para o log e a limpeza roda de novo;
     - ao sair (Ctrl+C): grava a ultima leitura.
+    escritor: com ele (no scanner), as leituras vao para a fila do escritor (o laco nao espera o disco), e o
+        resumo do dia espera o escritor gravar a ultima leitura antes de ler o banco.
     Nenhum erro aqui para o scanner: vai para o log e o laco segue.
     """
+    gravar_em = escritor if escritor is not None else banco
     dia = dia_utc(relogio())  # o dia que esta correndo
     try:
         await _limpar_banco(banco, cfg, relogio())
         while True:
             await esperar(min(cfg.intervalo_log_recursos_s, _ate_a_meia_noite_utc(relogio())))
             agora = relogio()
-            _gravar_corretoras(motor, banco, dia, agora)  # na virada, a leitura ainda e do dia que acabou
+            _gravar_corretoras(motor, gravar_em, dia, agora)  # na virada, a leitura ainda e do dia que acabou
             # So dia MAIOR vira: o relogio do PC acertado para tras nao conta como virada (as leituras seguem no
             # dia que estava correndo). PC que dormiu atravessando dias: a leitura ao acordar fecha o dia em que
             # ele dormiu, so esse resumo vai para o log e os dias dormidos ficam sem leitura.
             if dia_utc(agora) > dia:
+                if escritor is not None:  # a leitura que fecha o dia precisa estar no banco antes do resumo
+                    await asyncio.to_thread(escritor.descarregar, ESPERA_ESCRITOR_RESUMO_S)
                 await _escrever_resumo(banco, dia)
                 dia = dia_utc(agora)
                 await _limpar_banco(banco, cfg, agora)
     finally:
-        _gravar_corretoras(motor, banco, dia_utc(relogio()), relogio())
+        _gravar_corretoras(motor, gravar_em, dia_utc(relogio()), relogio())
 
 
 async def _encerrar(tarefas: list[asyncio.Task], coletores: dict[str, ColetorDoScanner], exchanges: dict,
-                    banco: Banco | None) -> None:
-    """Para tudo e libera as conexoes e o banco. Um erro ao fechar uma coisa nao impede fechar as outras."""
+                    banco: Banco | None, motor: Motor | None = None, escritor: EscritorBanco | None = None,
+                    relogio: Callable[[], float] = time.time) -> None:
+    """Para tudo e libera as conexoes e o banco. Um erro ao fechar uma coisa nao impede fechar as outras.
+
+    Antes de fechar o banco: encerra os sinais ativos (cada registro ganha `encerrado_em` = agora) e espera o
+    escritor gravar tudo o que estava na fila.
+    """
     for tarefa in tarefas:
         tarefa.cancel()
     await asyncio.gather(*tarefas, return_exceptions=True)
@@ -503,6 +543,15 @@ async def _encerrar(tarefas: list[asyncio.Task], coletores: dict[str, ColetorDoS
     for erro in await asyncio.gather(*fechamentos, return_exceptions=True):
         if isinstance(erro, Exception):
             registro.warning("erro ao fechar uma corretora (%s: %s)", type(erro).__name__, erro)
+    if motor is not None:
+        try:
+            encerrados = motor.encerrar_sinais(relogio())
+            if encerrados:
+                registro.info("%d sinais ativos encerrados ao parar o scanner", len(encerrados))
+        except Exception:
+            registro.exception("erro ao encerrar os sinais ativos; os registros deles ficam abertos ate religar")
+    if escritor is not None:
+        await asyncio.to_thread(escritor.parar)  # grava o que falta na fila (sem parar o laco enquanto isso)
     if banco is not None:
         banco.fechar()
 
@@ -533,12 +582,24 @@ async def rodar(
     tickers = _Tickers(coletores, dados_lentos)
     tarefas: list[asyncio.Task] = []
     banco: Banco | None = None
+    escritor: EscritorBanco | None = None
+    motor: Motor | None = None
+    tempos = TemposDoCiclo()
     try:
         for nome in dict.fromkeys(cfg.corretoras):  # sem nomes repetidos, na ordem da config
             exchanges[nome] = criar_exchange(nome)
-        banco = Banco(cfg.banco)
+        # O grafico do painel nunca le alem da retencao (o banco so guarda isso de amostras).
+        banco = Banco(cfg.banco, periodo_max_s=cfg.retencao_dias * SEGUNDOS_POR_DIA, relogio=relogio)
+        abertos = banco.fechar_abertos()  # antes de qualquer evento novo
+        if abertos:
+            registro.warning("%d sinais ficaram abertos na execucao anterior (o scanner caiu ou o PC desligou sem "
+                             "Ctrl+C); cada um foi fechado com a ultima hora conhecida do par", abertos)
+        escritor = EscritorBanco(banco)
+        escritor.iniciar()
         # As cotacoes (USDC/USDT...) vem dos tickers spot da fonte: o motor converte para USDT com elas.
-        motor = Motor(cfg, estado, dados_lentos, banco=banco, cotacoes=dados_lentos.cotacoes)
+        motor = Motor(cfg, estado, dados_lentos, banco=banco, cotacoes=dados_lentos.cotacoes, escritor=escritor)
+        _restaurar_sessao(motor, banco)
+        motor.recarregar_do_banco(relogio())  # numa thread: o F medio e o lote medio nao comecam do zero
         app = criar_app(motor, banco, cfg, relogio=relogio)  # antes de conectar: painel mal configurado para tudo
 
         carregadas = await _carregar_mercados(exchanges)
@@ -604,15 +665,30 @@ async def rodar(
             _recarregar_mercados_sempre(exchanges, coletores, tickers, estado, cfg.recarregar_mercados_s),
             name="recarga dos mercados"))
         tarefas.append(asyncio.create_task(
-            _registrar_recursos(motor, coletores, cfg.intervalo_log_recursos_s), name="recursos"))
+            _registrar_recursos(motor, coletores, cfg.intervalo_log_recursos_s, tempos=tempos, banco=banco,
+                                escritor=escritor), name="recursos"))
 
         # Metricas de validacao por dia e limpeza do banco (ao ligar e a cada virada do dia UTC).
-        tarefas.append(asyncio.create_task(_validacao_diaria(motor, banco, cfg, relogio), name="validacao"))
+        tarefas.append(asyncio.create_task(_validacao_diaria(motor, banco, cfg, relogio, escritor=escritor),
+                                           name="validacao"))
 
-        await _laco_do_motor(motor, coletores, cfg, relogio, ciclos, publicar=app.state.transmissor.publicar)
+        await _laco_do_motor(motor, coletores, cfg, relogio, ciclos, publicar=app.state.transmissor.publicar,
+                             tempos=tempos)
     finally:
         # A recarga dos mercados (em `tarefas`) e cancelada junto: ela nao comeca tickers novos depois disto.
-        await _encerrar(tarefas + list(tickers.tarefas.values()), coletores, exchanges, banco)
+        await _encerrar(tarefas + list(tickers.tarefas.values()), coletores, exchanges, banco, motor=motor,
+                        escritor=escritor, relogio=relogio)
+
+
+def _restaurar_sessao(motor: Motor, banco: Banco) -> None:
+    """O motor comeca na ultima sessao do painel guardada no banco (modo, filtros e comparacao), se houver."""
+    try:
+        dados = banco.ler_sessao()
+    except ValueError as erro:  # texto guardado estragado
+        registro.warning("sessao salva no banco ilegivel (%s); o scanner comeca com o padrao do config.yaml", erro)
+        return
+    if dados is not None:
+        motor.restaurar_sessao(dados)
 
 
 def main(argv=None) -> int:
@@ -638,9 +714,12 @@ def main(argv=None) -> int:
         asyncio.run(rodar(cfg))
     except KeyboardInterrupt:  # Ctrl+C: o asyncio.run ja cancelou tudo e o `rodar` fechou as conexoes
         print("\nEncerrado.")
-    except Exception as erro:  # mostra o motivo em uma linha, sem o textao do traceback
+    except Exception as erro:  # no terminal, o motivo em uma linha; o traceback inteiro vai so para o arquivo de log
+        registro.exception("o scanner parou por um erro inesperado", extra={"so_no_arquivo": True})
         print(f"Erro: {type(erro).__name__}: {erro}", file=sys.stderr)
         return 1
+    finally:
+        desligar_logs()  # a thread do log escreve o que faltava antes de o programa sair
     return 0
 
 

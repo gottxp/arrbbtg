@@ -88,7 +88,7 @@ def test_dia_sem_sinais_da_zero_e_none_sem_dividir_por_zero(tmp_path, fechar):
     resumo = resumo_do_dia(b, "2026-10-19")
     vazio = {"quantidade_sinais": 0, "abertos": 0, "rp_liquido_medio_pct": None, "duracao_media_s": None,
              "pct_sumiu_5s": None, "pct_sumiu_30s": None}
-    assert resumo == {"dia": "2026-10-19", "lucro": vazio, "farm": vazio, "corretoras": {}}
+    assert resumo == {"dia": "2026-10-19", "lucro": vazio, "farm": vazio, "comparacao": vazio, "corretoras": {}}
 
 
 def test_modo_sem_sinais_ao_lado_de_um_com_sinais(tmp_path, fechar):

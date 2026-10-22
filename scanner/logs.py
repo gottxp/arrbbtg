@@ -1,5 +1,11 @@
 """Log do scanner (especificacao, secao 8): terminal + um arquivo por dia, e a medida de memoria e CPU.
 
+Fila: quem chama o log (o laco do asyncio: motor, coletores, painel) nunca espera o terminal nem o disco. Na
+raiz do logging fica so um QueueHandler, que poe a linha numa fila e volta na hora; uma thread propria
+(QueueListener, da biblioteca padrao) tira da fila e escreve no terminal e no arquivo. Sem isso, no Windows,
+selecionar texto na janela do PowerShell ("Edicao Rapida") faz a escrita no terminal esperar o Enter, e o
+scanner inteiro parava junto. Agora so a thread do log espera (o terminal congela, o scanner nao).
+
 Arquivo: `<pasta_logs>/scanner-AAAA-MM-DD.log`, com a data LOCAL da maquina. O scanner grava direto no
 arquivo do dia e, a meia-noite (horario local), passa a gravar no arquivo do dia novo. Nenhum arquivo
 e renomeado: no Windows, renomear falha se outro programa estiver com o arquivo aberto (ex.: o dono
@@ -15,9 +21,12 @@ medida pela diferenca do tempo de processador entre duas medidas.
 """
 
 import logging
+import logging.handlers
 import os
+import queue
 import re
 import sys
+import threading
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -90,9 +99,12 @@ class ArquivoDoDia(logging.FileHandler):
         terminal (handleError, como os handlers da biblioteca fazem) e as linhas seguintes sao perdidas
         em silencio ate o arquivo abrir de novo: o FileHandler tenta abrir a cada linha, entao o log volta
         sozinho quando a pasta voltar. Quem chamou o log (ex.: o laco do motor) nunca recebe o erro.
+        O dia e o da hora em que a linha foi escrita no log (marcada pela fila), e nao a da thread que grava.
         """
         try:
-            agora = self._relogio()
+            agora = getattr(record, "momento_do_log", None)
+            if agora is None:
+                agora = self._relogio()
             if agora >= self._proxima_virada or agora < self._comeco_do_dia:  # outro dia (ou o relogio voltou)
                 self._trocar_de_dia(agora)
             super().emit(record)  # FileHandler: abre o arquivo se ele estiver fechado, e grava
@@ -135,23 +147,93 @@ class ArquivoDoDia(logging.FileHandler):
                                  "tento de novo na proxima virada do dia\n")
 
 
+class _FilaDoLog(logging.handlers.QueueHandler):
+    """O handler da raiz: monta a linha (com o traceback, se houver) e poe na fila. Nunca espera disco nem terminal.
+
+    Marca em cada linha a hora do `relogio` (momento_do_log): o arquivo do dia usa essa hora, mesmo que a thread
+    do log so grave a linha um pouco depois (ex.: virada da meia-noite).
+    """
+
+    def __init__(self, fila: queue.SimpleQueue, relogio: Callable[[], float]):
+        super().__init__(fila)
+        self._relogio = relogio
+
+    def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
+        preparado = super().prepare(record)
+        preparado.momento_do_log = self._relogio()
+        return preparado
+
+
+class _Ouvinte(logging.handlers.QueueListener):
+    """A thread do log: tira as linhas da fila e entrega ao terminal e ao arquivo. Tambem atende `descarregar_logs`."""
+
+    def handle(self, record) -> None:
+        if isinstance(record, threading.Event):  # pedido de descarregar_logs: tudo antes dele ja foi escrito
+            for handler in self.handlers:
+                handler.flush()
+            record.set()
+            return
+        super().handle(record)
+
+
+def _fora_do_terminal(record: logging.LogRecord) -> bool:
+    """Filtro do terminal: a linha marcada com extra={"so_no_arquivo": True} vai so para o arquivo.
+
+    Ex.: o traceback do erro inesperado que derruba o scanner (o main ja mostra a mensagem curta no terminal).
+    """
+    return not getattr(record, "so_no_arquivo", False)
+
+
+# A fila e a thread do log ligadas agora (None = o log do scanner nao esta configurado).
+_ouvinte: _Ouvinte | None = None
+_fila_do_log: queue.SimpleQueue | None = None
+
+
+def handlers_do_scanner() -> list[logging.Handler]:
+    """Os handlers que escrevem de verdade (terminal e arquivo do dia), atras da fila. Vazio se o log esta desligado."""
+    return list(_ouvinte.handlers) if _ouvinte is not None else []
+
+
+def descarregar_logs(timeout: float = 5) -> bool:
+    """Espera a thread do log escrever tudo o que ja estava na fila (e da flush). True se deu tempo.
+
+    Para os testes e para quem vai ler o arquivo de log logo em seguida.
+    """
+    if _ouvinte is None or _fila_do_log is None:
+        return True
+    pronto = threading.Event()
+    _fila_do_log.put(pronto)
+    return pronto.wait(timeout)
+
+
 def desligar_logs() -> None:
-    """Tira (e fecha) os handlers que `configurar_logs` colocou. Usado ao reconfigurar e nos testes."""
+    """Para a thread do log (escrevendo antes tudo o que estava na fila), tira a fila da raiz e fecha os handlers.
+
+    Usado ao reconfigurar, ao sair do scanner (o main chama) e nos testes.
+    """
+    global _ouvinte, _fila_do_log
     raiz = logging.getLogger()
     for handler in [h for h in raiz.handlers if getattr(h, "do_scanner", False)]:
         raiz.removeHandler(handler)
         handler.close()
+    ouvinte, _ouvinte, _fila_do_log = _ouvinte, None, None
+    if ouvinte is not None:
+        ouvinte.stop()  # escreve o que ja estava na fila e termina a thread
+        for handler in ouvinte.handlers:
+            handler.close()
 
 
 def configurar_logs(nivel: str, pasta: str, dias: int, relogio: Callable[[], float] = time.time) -> None:
-    """Liga o log no terminal e no arquivo do dia, dentro de `pasta` (criada se nao existir).
+    """Liga o log no terminal e no arquivo do dia, dentro de `pasta` (criada se nao existir), pela fila.
 
     nivel: "normal" (INFO do scanner) ou "detalhado" (tambem o DEBUG do scanner, ex.: cada descarte).
         As bibliotecas (ccxt, uvicorn, asyncio) so aparecem a partir de WARNING.
     dias: quantos arquivos de dias anteriores guardar, alem do de hoje (dias_logs da Config).
     Pode ser chamada de novo: troca os handlers antigos pelos novos, sem abrir o arquivo duas vezes.
     Se a pasta nao puder ser criada ou o arquivo nao abrir, segue so com o terminal e avisa.
+    Na raiz fica so a fila (veja o topo do arquivo); terminal e arquivo ficam na thread do log.
     """
+    global _ouvinte, _fila_do_log
     desligar_logs()
     raiz = logging.getLogger()
     raiz.setLevel(logging.WARNING)
@@ -160,18 +242,27 @@ def configurar_logs(nivel: str, pasta: str, dias: int, relogio: Callable[[], flo
     terminal = logging.StreamHandler()  # sys.stderr
     terminal.setFormatter(_FormatoLocal(FORMATO))
     terminal.do_scanner = True
-    raiz.addHandler(terminal)
-
+    terminal.addFilter(_fora_do_terminal)
+    handlers: list[logging.Handler] = [terminal]
+    aviso = None
     try:
         os.makedirs(pasta, exist_ok=True)
         arquivo = ArquivoDoDia(pasta, dias, relogio=relogio)
     except OSError as erro:
-        registro.warning("sem arquivo de log: nao consegui usar a pasta '%s' (%s); o log fica so no terminal",
-                         pasta, erro)
-        return
-    arquivo.setFormatter(_FormatoLocal(FORMATO))
-    arquivo.do_scanner = True
-    raiz.addHandler(arquivo)
+        aviso = (pasta, erro)
+    else:
+        arquivo.setFormatter(_FormatoLocal(FORMATO))
+        arquivo.do_scanner = True
+        handlers.append(arquivo)
+
+    _fila_do_log = queue.SimpleQueue()
+    fila = _FilaDoLog(_fila_do_log, relogio)
+    fila.do_scanner = True
+    _ouvinte = _Ouvinte(_fila_do_log, *handlers, respect_handler_level=True)
+    _ouvinte.start()
+    raiz.addHandler(fila)
+    if aviso is not None:
+        registro.warning("sem arquivo de log: nao consegui usar a pasta '%s' (%s); o log fica so no terminal", *aviso)
 
 
 # ---------------------------------------------------------------------------
@@ -274,13 +365,45 @@ class MedidorCpu:
         return (cpu - cpu_antes) / (agora - parede_antes) * 100
 
 
+class TemposDoCiclo:
+    """Tempo de cada ciclo do motor (calculo + etapa 2), para a linha "recursos:" do log: media e o maior.
+
+    O laco do motor chama `registrar` a cada ciclo; a linha de recursos chama `tirar`, que devolve
+    (media, maior) em ms desde a linha anterior e zera (None se nenhum ciclo rodou).
+    """
+
+    def __init__(self):
+        self._soma, self._quantos, self._maior = 0.0, 0, 0.0
+
+    def registrar(self, ms: float) -> None:
+        self._soma += ms
+        self._quantos += 1
+        self._maior = max(self._maior, ms)
+
+    def tirar(self) -> tuple[float, float] | None:
+        if not self._quantos:
+            return None
+        resultado = (self._soma / self._quantos, self._maior)
+        self._soma, self._quantos, self._maior = 0.0, 0, 0.0
+        return resultado
+
+
 def linha_de_recursos(memoria: tuple[int, str] | None, cpu_pct: float | None, sinais_ativos: int,
-                      historicos: int) -> str:
+                      historicos: int, ciclo: tuple[float, float] | None = None, banco_bytes: int | None = None,
+                      fila_banco: int | None = None) -> str:
     """Texto da linha de recursos do log, ex.: "recursos: memoria 150.0 MB (atual), CPU 12.3%, sinais ativos 3, ..."
 
     historicos: quantas combinacoes o motor acompanha com amostras na memoria (cada uma guarda ate 4h).
+    ciclo: (media, maior) do tempo do ciclo do motor em ms desde a linha anterior (TemposDoCiclo); perto de
+        ciclo_ms (500) = o PC nao esta dando conta.
+    banco_bytes: tamanho do banco no disco; fila_banco: itens esperando o escritor do banco (cresce = disco lento).
     """
     texto_memoria = "indisponivel" if memoria is None else f"{memoria[0] / (1024 * 1024):.1f} MB ({memoria[1]})"
     texto_cpu = "indisponivel" if cpu_pct is None else f"{cpu_pct:.1f}%"
-    return (f"recursos: memoria {texto_memoria}, CPU {texto_cpu}, sinais ativos {sinais_ativos}, "
-            f"historicos {historicos}")
+    texto_ciclo = "-" if ciclo is None else f"medio {ciclo[0]:.1f} ms (maior {ciclo[1]:.1f} ms)"
+    texto_banco = "indisponivel" if banco_bytes is None else f"{banco_bytes / (1024 * 1024):.1f} MB"
+    linha = (f"recursos: memoria {texto_memoria}, CPU {texto_cpu}, sinais ativos {sinais_ativos}, "
+             f"historicos {historicos}, ciclo {texto_ciclo}, banco {texto_banco}")
+    if fila_banco is not None:
+        linha += f", fila do banco {fila_banco}"
+    return linha

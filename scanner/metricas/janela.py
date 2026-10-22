@@ -315,6 +315,14 @@ class JanelaMetricas:
         self._descartar_antigas(agora)
         return not self._amostras.n
 
+    def amostras(self) -> list[tuple[float, float, float, float, float]]:
+        """Copia das amostras guardadas agora, da mais antiga a mais nova: (ts, A, F, lote do long, lote do short).
+
+        O motor usa para juntar as amostras novas da memoria com as janelas recarregadas do banco.
+        """
+        colunas = [self._amostras.coluna(c) for c in (_TS, _A, _F, _LOTE_LONG, _LOTE_SHORT)]
+        return list(zip(*colunas))
+
     # --- por dentro -----------------------------------------------------------
 
     def _mudou(self) -> None:

@@ -50,6 +50,9 @@ class Config:
     tempo_operacao_h: float = 8
     margem_slippage_pct: float = 0.0
     metrica_spread: str = "medio"
+    # Etapa 2 no modo Farm: combinacao com ponta numa corretora de farm abre o livro a partir deste spread de
+    # abertura (pelos tickers), em %. Vale o menor entre este e spread_min_livro_pct.
+    spread_min_livro_farm_pct: float = -0.3
 
     # Taxas taker sobrescritas por (corretora, mercado). Ex.: {("mexc", "futuro"): 0.02}
     taxas: dict = field(default_factory=dict)
@@ -57,6 +60,9 @@ class Config:
     # Dados lentos (REST).
     intervalo_dados_lentos_s: float = 60
     recarregar_mercados_s: float = 3600
+    # Funding mais velho que isto (a busca REST falhou?) fica desconhecido no calculo, em segundos.
+    # Precisa ser maior que intervalo_dados_lentos_s.
+    validade_funding_s: float = 900
 
     # Tempo maximo esperando a corretora confirmar o cancelamento da assinatura de um livro.
     timeout_desassinar_s: float = 5
@@ -168,6 +174,7 @@ CAMPOS_POSITIVOS = (
     "intervalo_reassinar_livros_s",
     "prazo_primeiro_ticker_s",
     "prazo_primeiro_livro_s",
+    "validade_funding_s",
 )
 
 # Campos numericos que aceitam qualquer valor (inclusive zero ou negativo).
@@ -177,6 +184,7 @@ CAMPOS_NUMERICOS_LIVRES = (
     "custo_max_farm_pct",
     "limite_suspeito_pct",
     "margem_slippage_pct",
+    "spread_min_livro_farm_pct",
 )
 
 
@@ -435,6 +443,9 @@ def carregar_config(caminho: str) -> Config:
             dados = yaml.safe_load(arquivo)
     except OSError as erro:
         raise ErroConfig(f"nao consegui abrir o arquivo de configuracao '{caminho}': {erro.strerror}") from erro
+    except UnicodeDecodeError as erro:  # salvo em ANSI/cp1252 (ex.: Bloco de Notas antigo) com algum acento
+        raise ErroConfig(f"o arquivo '{caminho}' nao esta salvo em UTF-8 (byte {erro.start}); no Bloco de Notas: "
+                         "Arquivo > Salvar como > Codificacao: UTF-8, ou tire os acentos") from erro
     except yaml.YAMLError as erro:
         raise ErroConfig(f"o arquivo '{caminho}' nao e um yaml valido: {erro}") from erro
 
@@ -453,7 +464,16 @@ def carregar_config(caminho: str) -> Config:
     _conferir_nomes_das_corretoras(config)
     _conferir_fontes_de_cotacao(config, fonte_escrita="fonte_cotacao" in dados)
     _conferir_reserva_dos_livros(config)
+    _conferir_validade_do_funding(config)
     return config
+
+
+def _conferir_validade_do_funding(config: Config) -> None:
+    """O funding e buscado a cada intervalo_dados_lentos_s: com uma validade menor ele venceria entre duas buscas."""
+    if config.validade_funding_s <= config.intervalo_dados_lentos_s:
+        raise ErroConfig(f"validade_funding_s ({config.validade_funding_s}) precisa ser maior que "
+                         f"intervalo_dados_lentos_s ({config.intervalo_dados_lentos_s}): senao o funding venceria "
+                         "entre uma busca e a proxima")
 
 
 # Campos {corretora: valor}: o nome da corretora precisa estar em `corretoras`.
@@ -462,12 +482,15 @@ CAMPOS_POR_CORRETORA = ("limites_assinatura", "mercados_por_corretora", "metodo_
 
 
 def _conferir_nomes_das_corretoras(config: Config) -> None:
-    """Campos por corretora (veja CAMPOS_POR_CORRETORA) so com corretoras que estao em `corretoras`.
+    """Campos por corretora (veja CAMPOS_POR_CORRETORA, e `taxas`) so com corretoras que estao em `corretoras`.
 
-    Um nome com erro de digitacao seria ignorado em silencio (o ajuste ficaria desligado).
+    Um nome com erro de digitacao seria ignorado em silencio (o ajuste ficaria desligado; nas taxas, o RP
+    liquido usaria a taxa publica da API no lugar da sua).
     """
-    for campo in CAMPOS_POR_CORRETORA:
-        fora = sorted(set(getattr(config, campo)) - set(config.corretoras))
+    nomes = {campo: set(getattr(config, campo)) for campo in CAMPOS_POR_CORRETORA}
+    nomes["taxas"] = {corretora for corretora, _ in config.taxas}  # as chaves sao (corretora, mercado)
+    for campo, usadas in nomes.items():
+        fora = sorted(usadas - set(config.corretoras))
         if fora:
             raise ErroConfig(f"{campo}: {', '.join(fora)} nao esta em corretoras (erro de digitacao?); "
                              f"corretoras: {', '.join(config.corretoras)}")

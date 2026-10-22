@@ -157,6 +157,9 @@ class DadosLentos:
         self._intervalos_config = dict(intervalos_funding) if intervalos_funding else {}
         self._taxas_api: dict[tuple[str, str], float] = {}  # (corretora, mercado) -> taxa taker em %
         self._funding: dict[tuple[str, str], tuple[float, int]] = {}  # (corretora, ativo) -> (taxa %, horas)
+        # (corretora, ativo) -> quando o funding chegou (relogio): o motor deixa de usar funding velho demais
+        # (validade_funding_s da Config), ex.: o REST da corretora falhando por horas.
+        self._funding_em: dict[tuple[str, str], float] = {}
         # Cotacoes.
         self._estado = estado
         self._fonte_cotacao = fonte_cotacao
@@ -177,6 +180,10 @@ class DadosLentos:
     def funding(self, corretora: str, ativo: str) -> tuple[float, int] | None:
         """(taxa de funding em %, intervalo de cobranca em horas) do ativo, ou None se nao se sabe."""
         return self._funding.get((corretora, ativo))
+
+    def funding_recebido_em(self, corretora: str, ativo: str) -> float | None:
+        """Quando (segundos do relogio) o funding do ativo chegou pela ultima vez; None se nunca chegou."""
+        return self._funding_em.get((corretora, ativo))
 
     def taxa_taker(self, corretora: str, mercado: str) -> float:
         """Taxa taker em %: a do config.yaml se existir, senao a da API.
@@ -307,6 +314,7 @@ class DadosLentos:
             return
         horas = self._intervalos_config.get(corretora, intervalo_h)
         self._funding[(corretora, ativo)] = (float(taxa_pct), horas)
+        self._funding_em[(corretora, ativo)] = self._relogio()
 
     # --- atualizacao (REST) --------------------------------------------------
 
@@ -447,6 +455,7 @@ class DadosLentos:
             return
         escolhidos[par.ativo] = preferencia
         self._funding[(corretora, par.ativo)] = funding
+        self._funding_em[(corretora, par.ativo)] = self._relogio()  # o motor deixa de usar funding velho demais
         if horas_da_config is None and _sem_intervalo(item):
             sem_intervalo.append(simbolo)
 

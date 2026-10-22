@@ -431,6 +431,7 @@ def criar_app(
             raise HTTPException(400, str(erro)) from None
         # Um objeto novo de uma vez so (nunca campo a campo): o motor le a sessao sem nunca ver metade da troca.
         motor.sessao = Sessao(modo=corpo.modo, filtros=filtros, comparacao=corpo.comparacao)
+        motor.salvar_sessao()  # guarda no banco (pela fila do escritor): o scanner religado comeca nesta sessao
         return _sessao_json(motor.sessao)
 
     # --- Status das corretoras -------------------------------------------------

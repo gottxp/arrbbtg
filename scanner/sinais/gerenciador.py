@@ -35,6 +35,9 @@ class Evento:
     tipo: Literal["novo", "atualizado", "encerrado"]
     sinal: dict  # o sinal no formato JSON da spec (secao 5)
     registrar_historico: bool  # True: grava/fecha o registro do historico; False: so mostra ao vivo
+    # True: o ciclo que gerou o evento estava com o modo comparacao ligado (decidiu pelo RP bruto). Nao entra no
+    # JSON do sinal (o formato da spec nao muda): o banco guarda numa coluna propria (a do nascimento do sinal).
+    comparacao: bool = False
 
 
 @dataclass
@@ -132,12 +135,13 @@ class GerenciadorSinais:
 
     # --- API ---------------------------------------------------------------
 
-    def processar(self, candidatos: list[Candidato], agora: float) -> list[Evento]:
+    def processar(self, candidatos: list[Candidato], agora: float, comparacao: bool = False) -> list[Evento]:
         """Compara os candidatos de agora com os sinais ativos e devolve os eventos.
 
         Ordem dos eventos (sempre a mesma): primeiro os encerrados, na ordem em que foram
         detectados; depois os novos e atualizados, na ordem de `candidatos`.
         Se a mesma chave aparecer mais de uma vez em `candidatos`, vale a ultima.
+        comparacao: o modo comparacao do ciclo; vai em cada evento (Evento.comparacao).
         """
         self._esquecer_encerrados_antigos(agora)
 
@@ -152,7 +156,8 @@ class GerenciadorSinais:
         for chave in [c for c in self._ativos if c not in por_chave]:
             ativo = self._ativos.pop(chave)
             self._encerrados[chave] = ativo  # lembra, para a anti-repeticao
-            eventos.append(Evento("encerrado", self._sinal(ativo, encerrado_em=agora), registrar_historico=True))
+            eventos.append(Evento("encerrado", self._sinal(ativo, encerrado_em=agora), registrar_historico=True,
+                                  comparacao=comparacao))
 
         # 2) Quem veio agora: atualizado (ja estava ativo) ou novo.
         for chave, candidato in por_chave.items():
@@ -160,7 +165,8 @@ class GerenciadorSinais:
             if ativo is not None:
                 ativo.candidato = candidato
                 ativo.atualizado_em = agora
-                eventos.append(Evento("atualizado", self._sinal(ativo), registrar_historico=False))
+                eventos.append(Evento("atualizado", self._sinal(ativo), registrar_historico=False,
+                                      comparacao=comparacao))
                 continue
 
             anterior = self._encerrados.pop(chave, None)
@@ -172,7 +178,7 @@ class GerenciadorSinais:
                 ativo = _Ativo(candidato, self._novo_id(candidato, agora), agora, agora)
                 registrar = True
             self._ativos[chave] = ativo
-            eventos.append(Evento("novo", self._sinal(ativo), registrar_historico=registrar))
+            eventos.append(Evento("novo", self._sinal(ativo), registrar_historico=registrar, comparacao=comparacao))
 
         return eventos
 

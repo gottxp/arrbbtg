@@ -62,15 +62,17 @@ max_silencio_conexao_s: 2
 #   ate aqui). Unidade: segundos. Padrao: 30. Quando mexer: raramente.
 max_idade_livro_s: 30
 # Spread de abertura minimo (pelos tickers) para o scanner abrir o livro completo do par (etapa 2). Sem livro
-#   aberto nao existe sinal. Unidade: %. Padrao: 0.3. Quando mexer: abaixe para ver spreads menores (ex.: modo
-#   Farm), com mais livros abertos (mais assinaturas); suba se uma corretora limitar assinaturas.
+#   aberto nao existe sinal. Unidade: %. Padrao: 0.3. Quando mexer: abaixe para ver spreads menores, com mais
+#   livros abertos (mais assinaturas); suba se uma corretora limitar assinaturas. O modo Farm tem o seu proprio
+#   (spread_min_livro_farm_pct) e as moedas de "Sempre mostrar" sempre abrem livro.
 spread_min_livro_pct: 0.3
 # Quanto tempo o livro do par continua aberto depois que o spread cai abaixo de spread_min_livro_pct.
 #   Unidade: segundos. Padrao: 60. Quando mexer: raramente.
 manter_livro_s: 60
 # Janela das metricas do periodo (A e F medios, maiores, media dos 10 maiores, invertidas, lote medio). O campo
 #   "Periodo das metricas" do painel vale por cima deste. Unidade: horas. Padrao: 4. Quando mexer: para comparar
-#   com outro periodo do Arbimax. Mudar o periodo zera as janelas (recomecam do zero).
+#   com outro periodo do Arbimax. Mudar o periodo (ou religar o scanner) recarrega as janelas com as amostras
+#   gravadas no banco. Maximo no painel: retencao_dias x 24 horas.
 periodo_metricas_h: 4
 # Modo Lucro: RP liquido minimo para virar sinal (com o modo comparacao ligado, vale para o RP bruto). O campo
 #   "Resultado projetado min. (Lucro)" do painel vale por cima deste. Unidade: %. Padrao: 0.2.
@@ -79,9 +81,10 @@ rp_min_lucro_pct: 0.2
 # Modo Farm: menor RP liquido aceito (negativo = aceita perder ate esse valor). O campo "Custo max. (Farm)" do
 #   painel vale por cima deste. Unidade: %. Padrao: -0.1. Quando mexer: para aceitar gastar mais ou menos no farm.
 custo_max_farm_pct: -0.1
-# Spread de abertura (A) acima disto marca o sinal como SUSPEITO (provavel dado errado ou token diferente com o
-#   mesmo nome); suspeito fica oculto, a menos que "Mostrar suspeitos" esteja ligado no painel.
-#   Unidade: %. Padrao: 30. Quando mexer: raramente.
+# Diferenca entre os precos das duas pontas acima disto marca o sinal como SUSPEITO (provavel dado errado ou token
+#   diferente com o mesmo nome): (maior preco / menor preco - 1) x 100, nos dois sentidos, entao as duas direcoes
+#   do mesmo par recebem a mesma marca (A de +40% ou de -30% sao suspeitos). Suspeito fica oculto, a menos que
+#   "Mostrar suspeitos" esteja ligado no painel. Unidade: %. Padrao: 30. Quando mexer: raramente.
 limite_suspeito_pct: 30
 # O mesmo par + tipo + pontas que some e volta antes disto continua no mesmo registro do historico.
 #   Unidade: segundos. Padrao: 60. Quando mexer: raramente.
@@ -92,8 +95,10 @@ ciclo_ms: 500
 # De quanto em quanto tempo os spreads A e F de cada par sao gravados (grafico e metricas do periodo).
 #   Unidade: segundos. Padrao: 5. Quando mexer: raramente (menor = banco maior).
 amostra_s: 5
-# Amostras e sinais encerrados mais velhos que isto sao apagados do banco (ao ligar e a cada virada do dia UTC).
-#   Unidade: dias. Padrao: 7. Quando mexer: para guardar mais historico (banco maior).
+# Amostras (grafico e janelas das metricas) mais velhas que isto sao apagadas do banco (ao ligar e a cada virada
+#   do dia UTC); o historico dos sinais e as metricas da validacao ficam. Tambem e o limite do grafico e do
+#   "Periodo das metricas" do painel (retencao_dias x 24 horas). Unidade: dias. Padrao: 7. Quando mexer: para
+#   guardar mais historico (banco maior).
 retencao_dias: 7
 # Tempo estimado de cada operacao, usado no funding esperado (quantas cobrancas cabem nesse tempo).
 #   Unidade: horas. Padrao: 8. Quando mexer: se as suas operacoes duram bem mais ou bem menos que isso.
@@ -105,6 +110,12 @@ margem_slippage_pct: 0.0
 #   media_10_maiores. O campo "Metrica de spread" do painel vale por cima deste. Unidade: uma das 3 opcoes.
 #   Padrao: medio. Quando mexer: raramente.
 metrica_spread: medio
+# Modo Farm: combinacao com ponta numa corretora de corretoras_farm abre o livro completo (etapa 2) a partir deste
+#   spread de abertura pelos tickers, em vez de spread_min_livro_pct (vale o menor dos dois). As operacoes de farm
+#   baratas tem spread perto de zero ou negativo: sem isto o livro delas nunca abria e elas nunca apareciam.
+#   Unidade: %. Padrao: -0.3. Quando mexer: suba (ex.: 0) se uma corretora de farm limitar assinaturas; abaixe para
+#   ver farm mais caro.
+spread_min_livro_farm_pct: -0.3
 
 # Taxas taker da sua conta (nivel VIP, descontos), por corretora e mercado (spot e/ou futuro). Unidade: % por
 #   ordem. Padrao: {} (vazio = vale a taxa que vem da corretora). Quando mexer: sempre que a sua taxa real for
@@ -140,6 +151,11 @@ recarregar_mercados_s: 3600
 # Tempo maximo esperando a corretora confirmar que cancelou a assinatura de um livro; passou disso, o log
 #   registra e o scanner segue (o livro ja saiu do calculo). Unidade: segundos. Padrao: 5. Quando mexer: raramente.
 timeout_desassinar_s: 5
+# Funding que nao foi atualizado ha mais que isto (a busca REST da corretora esta falhando) deixa de valer: fica
+#   desconhecido no calculo (0 no funding esperado, e os filtros de funding nao passam) ate chegar de novo; o log
+#   avisa uma vez por corretora. Precisa ser maior que intervalo_dados_lentos_s. Unidade: segundos. Padrao: 900
+#   (15 minutos). Quando mexer: se aumentar intervalo_dados_lentos_s, aumente este junto.
+validade_funding_s: 900
 
 # Mercados usados de cada corretora: [spot], [futuro] ou [spot, futuro]. Corretora fora daqui usa os dois.
 #   Unidade: corretora: [mercados]. Padrao: {} (todas com os dois). Quando mexer: para desligar o spot ou o
@@ -325,8 +341,9 @@ painel:
   #   Quando mexer: na VPS (sempre junto com o usuario).
   senha: null
 
-# Arquivo do banco SQLite (historico dos sinais, amostras do grafico, grupos de filtros e metricas da validacao),
-#   dentro da pasta onde o scanner roda. Unidade: nome de arquivo. Padrao: scanner.db. Quando mexer: raramente.
+# Arquivo do banco SQLite (historico dos sinais, amostras do grafico, grupos de filtros, metricas da validacao e a
+#   ultima sessao do painel), dentro da pasta onde o scanner roda. Unidade: nome de arquivo. Padrao: scanner.db.
+#   Quando mexer: raramente.
 banco: scanner.db
 # Quanto o log escreve: normal ou detalhado (tambem cada livro e ticker descartado; o arquivo cresce muito).
 #   Unidade: uma das 2 opcoes. Padrao: normal. Quando mexer: so para investigar um problema.

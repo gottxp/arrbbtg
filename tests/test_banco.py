@@ -283,23 +283,21 @@ def test_limpar_antigos_apaga_so_o_que_passou_do_limite(banco):
     assert banco.limpar_antigos(agora=8 * DIA, dias=7) == 0  # de novo: nada a apagar
 
 
-def test_limpar_antigos_apaga_sinais_encerrados_antigos_mas_nao_os_abertos_nem_os_recentes(banco):
+def test_limpar_antigos_nao_apaga_sinais(banco):
+    # Revisao final (M10): a limpeza apaga so amostras (especificacao, secao 8); o historico dos sinais fica.
     agora = INICIO_20 + 10 * DIA  # 2026-10-30 00:00 UTC; limite de 7 dias = 2026-10-23 00:00 UTC
     eventos = [
-        # encerrado antes do limite: apaga
         Evento("encerrado", _sinal(id="velho", detectado_em="2026-10-20T10:00:00.000Z",
                                    encerrado_em="2026-10-22T10:00:00.000Z"), True),
-        # encerrado depois do limite: fica
         Evento("encerrado", _sinal(id="recente", detectado_em="2026-10-20T10:00:00.000Z",
                                    encerrado_em="2026-10-25T10:00:00.000Z"), True),
-        # ainda aberto, mesmo velho: fica
         Evento("novo", _sinal(id="aberto", detectado_em="2026-10-20T10:00:00.000Z"), True),
     ]
     for e in eventos:
         banco.gravar_evento(e)
 
     assert banco.limpar_antigos(agora=agora, dias=7) == 0  # o retorno conta so amostras
-    assert _ids(banco, "2026-10-20") == ["aberto", "recente"]
+    assert _ids(banco, "2026-10-20") == ["aberto", "recente", "velho"]
 
 
 def test_limpar_antigos_aceita_dias_fracionados(banco):
@@ -443,7 +441,7 @@ def test_lote_que_falha_no_sqlite_e_refeito_linha_a_linha(banco, monkeypatch):
 
     def sem_validacao(e):
         if e.sinal["id"] == "ruim":
-            return ("ruim", "lucro", None, "spot_futuro", "2026-10-20T15:00:00.000Z", None, None, "{}")  # par NULL
+            return ("ruim", "lucro", None, "spot_futuro", "2026-10-20T15:00:00.000Z", None, None, "{}", 0)  # par NULL
         return original(e)
 
     monkeypatch.setattr(Banco, "_linha_do_evento", staticmethod(sem_validacao))
@@ -464,27 +462,30 @@ def test_lote_que_falha_no_sqlite_e_refeito_linha_a_linha(banco, monkeypatch):
 
 
 def test_limpar_antigos_em_lotes_pequenos_da_o_mesmo_resultado(banco):
-    # Amostras fora de ordem de horario (relogio que voltou, banco reaberto): os lotes andam pelo rowid,
-    # entao nenhuma escapa.
+    # Amostras gravadas fora de ordem de horario (relogio que voltou, banco reaberto): a chave (combinacao, ts)
+    # as guarda em ordem, e os lotes pegam as mais velhas de cada combinacao, entao nenhuma escapa.
     horarios = [5 * DIA, 0, 8 * DIA, 0.5 * DIA, 2 * DIA, DIA - 1, 7.5 * DIA, 0.1, 3 * DIA, 0.9 * DIA]
     for ts in horarios:
         banco.gravar_amostra("k", ts, 1, -1, 1, 1, 1, 1)
+    banco.gravar_amostra("outra", 0, 1, -1, 1, 1, 1, 1)
     comandos = []
     banco._conn.set_trace_callback(comandos.append)
-    assert banco.limpar_antigos(agora=8 * DIA, dias=7, lote=3) == 5  # limite = 1 dia
+    assert banco.limpar_antigos(agora=8 * DIA, dias=7, lote=3) == 6  # limite = 1 dia
     banco._conn.set_trace_callback(None)
     assert sorted(x["ts"] for x in banco.amostras("k", desde=0)) == [2 * DIA, 3 * DIA, 5 * DIA, 7.5 * DIA, 8 * DIA]
+    assert banco.amostras("outra", desde=0) == []
     apagar_amostras = [c for c in comandos if c.startswith("DELETE FROM amostras")]
-    assert len(apagar_amostras) == 4  # 10 linhas em lotes de 3 rowids: um comando (e uma transacao) por lote
+    # "k": 5 velhas em lotes de 3 (3 + 2); "outra": 1. Um comando (e uma transacao) por lote.
+    assert len(apagar_amostras) == 3
 
 
-def test_limpar_antigos_em_lotes_apaga_os_sinais_encerrados_antigos(banco):
+def test_limpar_antigos_em_lotes_nao_apaga_os_sinais_encerrados_antigos(banco):
     agora = INICIO_20 + 10 * DIA  # limite de 7 dias = 2026-10-23 00:00 UTC
     for i in range(7):
         banco.gravar_evento(Evento("encerrado", _sinal(id=f"velho{i}", encerrado_em="2026-10-22T10:00:00.000Z"), True))
         banco.gravar_evento(Evento("novo", _sinal(id=f"aberto{i}"), True))
     banco.limpar_antigos(agora=agora, dias=7, lote=2)
-    assert _ids(banco, "2026-10-20") == [f"aberto{i}" for i in range(7)]
+    assert len(_ids(banco, "2026-10-20")) == 14  # so amostras sao apagadas (M10)
 
 
 def test_limpar_antigos_com_banco_vazio(banco):
@@ -617,12 +618,12 @@ def test_registrar_corretoras_sem_reconexoes_conta_zero(banco):
     assert banco.corretoras_do_dia("2026-10-20") == {"gate": {"atraso_medio_ms": None, "reconexoes": 0}}
 
 
-def test_limpar_antigos_apaga_as_metricas_das_corretoras_dos_dias_antigos(banco):
+def test_limpar_antigos_nao_apaga_as_metricas_das_corretoras(banco):
+    # Revisao final (M10): as metricas da validacao (uma linha por corretora por dia) ficam.
     for dia in ("2026-10-21", "2026-10-22", "2026-10-23", "2026-10-29"):
         banco.registrar_corretoras(dia, _status(0, 10.0))
     banco.limpar_antigos(agora=INICIO_20 + 10 * DIA, dias=7)  # limite = 2026-10-23 00:00 UTC
-    assert banco.corretoras_do_dia("2026-10-22") == {}
-    assert banco.corretoras_do_dia("2026-10-23") != {} and banco.corretoras_do_dia("2026-10-29") != {}
+    assert all(banco.corretoras_do_dia(dia) != {} for dia in ("2026-10-21", "2026-10-22", "2026-10-23", "2026-10-29"))
 
 
 def test_limpar_antigos_com_o_limite_antes_de_1970(banco):
