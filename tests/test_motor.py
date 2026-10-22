@@ -916,6 +916,17 @@ def test_selecao_com_minimo_zero_ou_negativo(minimo, esperado):
     assert m.selecao_livros(agora=10) == esperado
 
 
+def test_selecao_pula_o_short_que_nao_forma_par_e_segue_procurando():
+    # Minimo negativo: o maior bid de BTC e o do proprio futuro da gate, que nao pode ser o short do
+    # futuro da gate (futuro x futuro na mesma corretora). O proximo (mexc) forma par e chega ao minimo.
+    e = EstadoMercados()
+    ticker(e, "gate", "futuro", "BTC", 99.9, 100.0, 10.0)
+    ticker(e, "mexc", "futuro", "BTC", 99.8, 100.4, 10.0)  # gate x mexc: -0,2%; mexc x gate: ~ -0,5%
+    m = Motor(cfg_com(spread_min_livro_pct=-0.3), e, DadosLentosFalso())
+    assert m.selecao_livros(agora=10) == {"gate": {"BTC/USDT:USDT"}, "mexc": {"BTC/USDT:USDT"}}
+    assert list(m._ultima_vez_acima) == [("BTC", "gate", "futuro", "mexc", "futuro")]
+
+
 def test_selecao_acompanha_mercados_que_aparecem_e_somem():
     e = EstadoMercados()
     m = motor_so_tickers(e)

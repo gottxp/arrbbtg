@@ -21,7 +21,8 @@ e vale nas duas direcoes.
 Desempenho: com 9 corretoras e centenas de ativos sao dezenas de milhares de combinacoes. Por
 isso cada mercado e lido uma vez so por ciclo (e nao uma vez por combinacao), e as combinacoes
 montadas ficam guardadas enquanto os mercados nao mudam. Os candidatos so olham as combinacoes
-com livro valido nas duas pontas. As metricas do periodo sao incrementais (JanelaMetricas).
+com livro valido nas duas pontas; a etapa 2, por ativo, anda nos shorts do maior bid para o menor
+e para no primeiro que nao chega ao minimo. As metricas do periodo sao incrementais (JanelaMetricas).
 
 Nada aqui acessa a rede: tudo vem do estado (coletores) e dos dados lentos (funding e taxas).
 Regra geral: dado em que nao se pode confiar (velho, sem liquidez, sem taxa, numero invalido)
@@ -252,6 +253,32 @@ class _CombinacoesGuardadas:
         return self._lista
 
 
+class _CombinacoesPorAtivo:
+    """`combinacoes(mercados)` arrumadas para a etapa 2, guardadas enquanto os mercados nao mudam.
+
+    Para cada ativo: {chave do long: {chave do short: combo}} (com quais shorts cada long forma
+    combinacao) e a lista de todas as chaves de short. Chave = (corretora, mercado, ativo).
+    """
+
+    def __init__(self):
+        self._mercados: dict | None = None  # os mercados da ultima arrumacao
+        self._por_ativo: dict[str, tuple[dict, list]] = {}
+
+    def obter(self, mercados: dict[str, set[tuple[str, str]]]) -> dict[str, tuple[dict, list]]:
+        if mercados != self._mercados:
+            self._mercados = mercados
+            por_ativo: dict[str, tuple[dict, list]] = {}
+            for combo in combinacoes(mercados):
+                ativo, corretora_long, mercado_long, corretora_short, mercado_short = combo
+                longs, shorts = por_ativo.setdefault(ativo, ({}, []))
+                chave_short = (corretora_short, mercado_short, ativo)
+                longs.setdefault((corretora_long, mercado_long, ativo), {})[chave_short] = combo
+                if chave_short not in shorts:
+                    shorts.append(chave_short)
+            self._por_ativo = por_ativo
+        return self._por_ativo
+
+
 @dataclass
 class Sessao:
     """O que o usuario escolheu no painel: modo, grupo de filtros e modo comparacao."""
@@ -353,11 +380,11 @@ class Motor:
         # Etapa 2: combo com livro (as de _ultima_vez_acima) -> ((corretora, simbolo) do long, do short).
         self._simbolos_livro: dict[tuple, tuple[tuple[str, str], tuple[str, str]]] = {}
         self._avisados: set = set()  # avisos de log ja dados (cada um aparece uma vez so)
-        # Listas de combinacoes guardadas: uma para os candidatos (mercados com livro valido agora) e
-        # uma para a etapa 2 (todos os mercados com ticker guardado, validos ou nao: essa lista so
-        # muda quando entra ou sai um mercado). Separadas, para uma nao desfazer a outra.
+        # Combinacoes guardadas: uma lista para os candidatos (mercados com livro valido agora) e as
+        # da etapa 2 arrumadas por ativo (todos os mercados com ticker guardado, validos ou nao: so
+        # mudam quando entra ou sai um mercado). Separadas, para uma nao desfazer a outra.
         self._combos_candidatos = _CombinacoesGuardadas()
-        self._combos_selecao = _CombinacoesGuardadas()
+        self._combos_selecao = _CombinacoesPorAtivo()
 
     # --- API -----------------------------------------------------------------
 
@@ -406,30 +433,38 @@ class Motor:
     def selecao_livros(self, agora: float) -> dict[str, set[str]]:
         """Etapa 2: os simbolos que devem ter livro completo, por corretora.
 
-        Para cada combinacao (spot x futuro e futuro x futuro) calcula o spread de abertura com os
+        Para as combinacoes (spot x futuro e futuro x futuro) calcula o spread de abertura com os
         TICKERS (ask do long e bid do short, em USDT). Quem passa de `spread_min_livro_pct` ganha o
         livro das duas pontas e o mantem por `manter_livro_s` depois de cair abaixo (mesmo se o
         ticker sumir nesse tempo). O filtro "tipos de oportunidade" nao muda quais livros abrem.
+        Combinacao que nao chega ao minimo nem precisa ter o spread calculado: para cada long, os
+        shorts sao olhados do maior bid para o menor, e o spread so cai quando o bid cai.
         """
         cotacoes = self._cotacoes_validas()
         minimo = self.cfg.spread_min_livro_pct
-        # A lista de combinacoes sai de TODOS os mercados com ticker guardado: ticker que fica velho
-        # e volta (comum) nao obriga a montar a lista de novo. Quem nao tem preco valido agora e
-        # pulado no laco (precos tem uma entrada para cada mercado da lista).
+        # As combinacoes saem de TODOS os mercados com ticker guardado: ticker que fica velho e volta
+        # (comum) nao obriga a arruma-las de novo. Quem nao tem preco valido agora e pulado no laco
+        # (precos tem uma entrada para cada mercado).
         mercados = self.estado.mercados()
         precos = self._precos_dos_tickers(mercados, agora, cotacoes)  # cada mercado lido uma vez so
         asks, bids = precos.asks, precos.bids
-        acima: dict[tuple, float] = {}  # combo -> spread, so as que chegam ao minimo agora
-        for combo, chave_long, chave_short in self._combos_selecao.obter(mercados):
-            ask_long, bid_short = asks[chave_long], bids[chave_short]
-            if ask_long is None or bid_short is None:
-                continue  # uma das pontas sem preco valido agora
-            if minimo > 0 and bid_short <= ask_long:
-                continue  # spread zero ou negativo nunca chega a um minimo positivo: pula a conta (a maioria)
-            spread = spread_abertura(ask_long, bid_short)
-            # Abaixo do minimo nao muda nada em pares_para_livro: nem entra no dicionario.
-            if spread >= minimo:
-                acima[combo] = spread
+        # So as combinacoes que chegam ao minimo agora: as outras nao mudam nada em pares_para_livro.
+        acima: dict[tuple, float] = {}  # combo -> spread
+        for longs, shorts in self._combos_selecao.obter(mercados).values():  # um ativo por vez
+            # Os shorts do ativo com bid valido, do maior bid para o menor.
+            vendas = sorted(((bids[chave], chave) for chave in shorts if bids[chave] is not None), reverse=True)
+            for chave_long, combos_do_long in longs.items():
+                ask_long = asks[chave_long]
+                if ask_long is None:
+                    continue  # sem ask valido agora: nao serve de long
+                for bid_short, chave_short in vendas:
+                    combo = combos_do_long.get(chave_short)
+                    if combo is None:
+                        continue  # nao forma combinacao com este long (ex.: futuro x futuro na mesma corretora)
+                    spread = spread_abertura(ask_long, bid_short)
+                    if spread < minimo:
+                        break  # os proximos shorts tem bid menor ou igual: spread menor ou igual
+                    acima[combo] = spread
 
         escolhidos = pares_para_livro(acima, minimo, self._ultima_vez_acima, agora, self.cfg.manter_livro_s)
         # Simbolos das escolhidas: os do ticker de agora (mesma condicao do spread acima); se o
