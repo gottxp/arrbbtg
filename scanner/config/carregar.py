@@ -88,6 +88,8 @@ class Config:
     intervalo_reassinar_livros_s: float = 900
     # Pares pedidos que nao mandam nenhum ticker neste tempo depois de (re)abrir os tickers vao para um aviso no log.
     prazo_primeiro_ticker_s: float = 60
+    # Livro pedido (ccxt) que nao manda nada neste tempo depois de assinado vai para um aviso no log, em segundos.
+    prazo_primeiro_livro_s: float = 60
 
     # Fase 2 de corretoras (Task 15).
     # Mercados usados de cada corretora, ex.: {"hyperliquid": ("futuro",)}. Corretora fora daqui usa os dois.
@@ -165,6 +167,7 @@ CAMPOS_POSITIVOS = (
     "tempo_min_modo_etapa1_lighter_s",
     "intervalo_reassinar_livros_s",
     "prazo_primeiro_ticker_s",
+    "prazo_primeiro_livro_s",
 )
 
 # Campos numericos que aceitam qualquer valor (inclusive zero ou negativo).

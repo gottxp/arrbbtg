@@ -189,7 +189,10 @@ class ColetorComSaude(Coletor):
 
         Devolve {"livros": n, "tickers": n, "sequencia_quebrada": n} e zera os contadores (o __main__ chama a
         cada intervalo_log_recursos_s para o resumo do log).
+        Aproveita a chamada periodica para conferir os pares que nunca mandaram ticker: sem isso, um mercado sem
+        nenhum ticker (nada chega para disparar a conta) nunca seria avisado.
         """
+        self._conferir_tickers_no_prazo(self._relogio())
         resumo = {tipo: self._descartes[tipo] for tipo in TIPOS_DE_DESCARTE}
         self._descartes.clear()
         return resumo
@@ -210,6 +213,16 @@ class ColetorComSaude(Coletor):
         if conferencia is None or conferencia.feita:
             return
         conferencia.recebidos.update(simbolos)
+        self._fechar_conferencia_no_prazo(mercado, conferencia, agora)
+
+    def _conferir_tickers_no_prazo(self, agora: float) -> None:
+        """Fecha as contas que passaram do prazo mesmo sem nenhum ticker chegando (um mercado mudo tambem avisa)."""
+        for mercado, conferencia in list(self._conferencias.items()):
+            if not conferencia.feita:
+                self._fechar_conferencia_no_prazo(mercado, conferencia, agora)
+
+    def _fechar_conferencia_no_prazo(self, mercado: str, conferencia: _ConferenciaDeTickers, agora: float) -> None:
+        """Passado o prazo, avisa (uma vez) dos pares pedidos que nunca mandaram ticker."""
         if agora - conferencia.inicio < self._prazo_primeiro_ticker_s:
             return
         conferencia.feita = True

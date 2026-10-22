@@ -17,7 +17,8 @@
 #     e futuros) ainda sem aprovacao: confirme com o dono.
 #   metodo_ticker: o padrao e tentar watch_tickers primeiro; hyperliquid usa watch_ticker porque o lote dela
 #     (allMids) nao traz bid/ask; kraken usa watch_bids_asks (o ticker dela so muda a cada negocio; o
-#     watch_bids_asks muda a cada mudanca do melhor bid/ask e continua trazendo o volume).
+#     watch_bids_asks muda a cada mudanca do melhor bid/ask e continua trazendo o volume); mexc usa watch_ticker
+#     (no spot, o watch_bids_asks do ccxt 4.5.89 nunca entrega o bookTicker, que chega em protobuf).
 #   fontes_cotacao: o padrao e vazio; aqui USD: kraken (os futuros da Kraken cotam em USD e a cotacao vem do
 #     par spot USDT/USD da propria Kraken).
 #   intervalo_funding_h: o padrao e o intervalo que o ccxt informa (ou 8h); aqui hyperliquid: 1 e lighter: 1
@@ -163,9 +164,13 @@ mercados_por_corretora:
 #   kraken: o watch_tickers dela so manda o ticker quando ha negocio (par pouco negociado fica com bid/ask velho
 #     e sai da etapa 1); o watch_bids_asks assina o mesmo canal com o gatilho bbo: manda a cada mudanca do melhor
 #     bid/ask, com o volume e a variacao do dia (conferido no codigo do ccxt 4.5.89).
+#   mexc: no spot o watch_tickers nao existe e o watch_bids_asks assina o bookTicker, que chega em protobuf; o
+#     ccxt 4.5.89 entrega essa mensagem so para o watch_ticker (o watch_bids_asks fica esperando para sempre,
+#     sem erro). No futuro e o metodo em que a troca automatica ja terminava (o lote dele nao traz bid/ask).
 metodo_ticker:
   hyperliquid: watch_ticker
   kraken: watch_bids_asks
+  mexc: watch_ticker
 # Quantas mensagens seguidas de tickers sem bid/ask (sem nenhum ticker bom antes) fazem o scanner trocar de
 #   metodo de ticker (na Lighter: passar a etapa 1 para os livros). Unidade: mensagens (inteiro). Padrao: 10.
 #   Quando mexer: raramente.
@@ -254,6 +259,10 @@ intervalo_reassinar_livros_s: 900
 # Pares pedidos que nao mandam nenhum ticker neste tempo depois de (re)abrir os tickers vao para um aviso no log
 #   ("X de Y pares pedidos ... nunca mandaram ticker"). Unidade: segundos. Padrao: 60. Quando mexer: raramente.
 prazo_primeiro_ticker_s: 60
+# Livro pedido (todas as corretoras menos a Lighter) que nao manda nada neste tempo depois de assinado vai para um
+#   aviso no log ("o livro pedido nao mandou nada"); o scanner continua esperando. Unidade: segundos. Padrao: 60.
+#   Quando mexer: raramente.
+prazo_primeiro_livro_s: 60
 
 # Lighter principal: endereco da API REST (lista de mercados). Unidade: endereco https://. Padrao: o oficial
 #   abaixo. Quando mexer: so se a Lighter mudar o endereco.

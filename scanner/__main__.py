@@ -562,6 +562,7 @@ async def rodar(
                 reassinar_livros_s=(cfg.intervalo_reassinar_livros_s if nome in cfg.reassinar_livros_corretoras
                                     else None),
                 prazo_primeiro_ticker_s=cfg.prazo_primeiro_ticker_s,
+                prazo_primeiro_livro_s=cfg.prazo_primeiro_livro_s,
             )
 
         for nome in carregadas:

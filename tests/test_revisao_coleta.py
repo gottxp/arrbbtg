@@ -84,6 +84,7 @@ def coletor_de_livros(corretora, nome="mexc", estado=None, **kwargs):
     estado = EstadoMercados() if estado is None else estado
     kwargs.setdefault("relogio", relogio)
     kwargs.setdefault("esperar", EsperaFalsa())
+    kwargs.setdefault("sortear", lambda: 0.5)  # prazo da reassinatura sem variacao (veja o teste da variacao)
     return ColetorCcxt(nome, corretora, estado=estado, **kwargs), estado
 
 
@@ -266,7 +267,8 @@ def test_rodar_passa_a_reassinatura_so_as_corretoras_da_lista(tmp_path, monkeypa
 
     def init_anotando(self, nome, *args, **kwargs):
         recebidos[nome] = (kwargs.get("reassinar_livros_s"), kwargs.get("limites_assinatura_mercado"),
-                           kwargs.get("livros_reservados_limite_mercado"), kwargs.get("prazo_primeiro_ticker_s"))
+                           kwargs.get("livros_reservados_limite_mercado"), kwargs.get("prazo_primeiro_ticker_s"),
+                           kwargs.get("prazo_primeiro_livro_s"))
         original(self, nome, *args, **kwargs)
 
     monkeypatch.setattr(ColetorCcxt, "__init__", init_anotando)
@@ -275,10 +277,10 @@ def test_rodar_passa_a_reassinatura_so_as_corretoras_da_lista(tmp_path, monkeypa
     config = cfg_com(corretoras=["mexc", "gate"], banco=str(tmp_path / "s.db"), ciclo_ms=50,
                      reassinar_livros_corretoras=["mexc", "xt"], intervalo_reassinar_livros_s=600,
                      limites_assinatura_mercado={"mexc": {"spot": 30}}, livros_reservados_limite_mercado=8,
-                     prazo_primeiro_ticker_s=45)
+                     prazo_primeiro_ticker_s=45, prazo_primeiro_livro_s=50)
     asyncio.run(asyncio.wait_for(
         principal.rodar(config, criar_exchange=exchanges.__getitem__, relogio=relogio, ciclos=1), timeout=5))
-    assert recebidos == {"mexc": (600, {"spot": 30}, 8, 45), "gate": (None, {}, 8, 45)}
+    assert recebidos == {"mexc": (600, {"spot": 30}, 8, 45, 50), "gate": (None, {}, 8, 45, 50)}
 
 
 # ---------------------------------------------------------------------------
@@ -1020,3 +1022,441 @@ def test_kraken_com_watch_bids_asks_assina_o_ticker_com_gatilho_bbo_e_traz_o_vol
     assert (guardado["bid"], guardado["ask"]) == (67000.0, 67000.5)
     assert guardado["volume_24h_usd"] == pytest.approx(100.0 * 66900.0)
     assert guardado["variacao_24h_pct"] == pytest.approx(0.75)
+
+
+# ===========================================================================
+# Correcao pos-re-revisao (R1, R2, m1, m2, m3, m6)
+# ===========================================================================
+
+
+class MexcDeVerdade:
+    """A MEXC do ccxt 4.5.89 com uma conexao falsa: o que o ccxt mandaria fica anotado, nada sai para a rede.
+
+    `ativas` conta as assinaturas da conexao spot (SUBSCRIPTION soma, UNSUBSCRIPTION subtrai) e `maximo` guarda
+    o maior valor visto. As mensagens da MEXC entram pelo `entregar` (exchange.handle_message, como o cliente WS).
+    """
+
+    def __init__(self, n=40, volumes=None):
+        import ccxt.pro as ccxtpro
+
+        self.ex = ccxtpro.mexc()
+        self.ex.enableRateLimit = False  # sem a fila de envio do ccxt (a conexao e falsa): o teste nao espera
+        self.simbolos = [f"T{i:02d}/USDT" for i in range(n)]
+        self.ex.set_markets([self.ex.safe_market_structure({
+            "id": f"T{i:02d}USDT", "symbol": f"T{i:02d}/USDT", "base": f"T{i:02d}", "quote": "USDT",
+            "baseId": f"T{i:02d}", "quoteId": "USDT", "type": "spot", "spot": True, "swap": False, "future": False,
+            "option": False, "contract": False, "active": True, "precision": {"amount": 0.0001, "price": 0.01},
+            "limits": {}}) for i in range(n)])
+        self.volumes = dict(volumes or {s: 1000.0 + i for i, s in enumerate(self.simbolos)})
+        self.cliente = self.ex.client(self.ex.urls["api"]["ws"]["spot"])
+        pronto = asyncio.get_running_loop().create_future()
+        pronto.set_result(True)
+        self.cliente.connected = pronto
+        self.enviadas = []
+        self.ativas = 0
+        self.maximo = 0
+
+        async def enviar(msg):
+            self.enviadas.append(msg)
+            n_params = len(msg.get("params", []))
+            self.ativas += n_params if msg.get("method") == "SUBSCRIPTION" else -n_params
+            self.maximo = max(self.maximo, self.ativas)
+
+        async def fetch_tickers(symbols=None, params={}):
+            return {s: {"symbol": s, "quoteVolume": self.volumes[s]} for s in (symbols or self.simbolos)}
+
+        self.cliente.send = enviar
+        self.ex.fetch_tickers = fetch_tickers
+
+    def entregar(self, mensagem):
+        self.ex.handle_message(self.cliente, mensagem)
+
+    def assinados(self, tipo):
+        """Os ids assinados agora no canal `tipo` ("bookTicker" ou "depth"), pela ordem das mensagens."""
+        ids = set()
+        for msg in self.enviadas:
+            for canal in msg.get("params", []):
+                if tipo in canal:
+                    (ids.add if msg.get("method") == "SUBSCRIPTION" else ids.discard)(canal.rsplit("@", 1)[-1])
+        return ids
+
+
+def _protobuf_book_ticker(ident, bid, ask):
+    from ccxt.protobuf.mexc import PushDataV3ApiWrapper_pb2 as pb
+
+    m = pb.PushDataV3ApiWrapper(channel=f"spot@public.aggre.bookTicker.v3.api.pb@100ms@{ident}", symbol=ident,
+                                sendTime=int(AGORA * 1000))
+    m.publicAggreBookTicker.bidPrice, m.publicAggreBookTicker.bidQuantity = str(bid), "2"
+    m.publicAggreBookTicker.askPrice, m.publicAggreBookTicker.askQuantity = str(ask), "3"
+    return m.SerializeToString()
+
+
+def _protobuf_mudanca(ident, versao, bid, ask):
+    from ccxt.protobuf.mexc import PushDataV3ApiWrapper_pb2 as pb
+
+    m = pb.PushDataV3ApiWrapper(channel=f"spot@public.aggre.depth.v3.api.pb@100ms@{ident}", symbol=ident,
+                                sendTime=int(AGORA * 1000))
+    d = m.publicAggreDepths
+    d.eventType, d.fromVersion, d.toVersion = "spot@public.aggre.depth.v3.api.pb@100ms", str(versao), str(versao)
+    nb, na = d.bids.add(), d.asks.add()
+    nb.price, nb.quantity, na.price, na.quantity = str(bid), "1.5", str(ask), "2.5"
+    return m.SerializeToString()
+
+
+async def _ceder(vezes=20):
+    for _ in range(vezes):
+        await asyncio.sleep(0)
+
+
+def coletor_mexc_spot(mexc, **kwargs):
+    estado = EstadoMercados()
+    kwargs.setdefault("metodo_ticker", "watch_ticker")  # o config.yaml de exemplo (R1)
+    coletor = ColetorCcxt("mexc", mexc.ex, estado=estado, relogio=relogio, mercados=("spot",),
+                          limites_assinatura_mercado={"spot": 30}, livros_reservados_limite_mercado=10,
+                          timeout_desassinar_s=1, **kwargs)
+    return coletor, estado
+
+
+def test_mexc_spot_com_protobuf_de_verdade_ticker_e_livro_chegam_ao_estado():
+    # R1: o bookTicker e o livro da MEXC spot chegam em protobuf; com watch_ticker o ccxt resolve o ticker.
+    async def cenario():
+        mexc = MexcDeVerdade()
+        coletor, estado = coletor_mexc_spot(mexc)
+        tarefa = asyncio.create_task(coletor.manter_tickers(mexc.simbolos))
+        await esperar_ate(lambda: len(mexc.assinados("bookTicker")) == 20)
+        mexc.entregar(_protobuf_book_ticker("T39USDT", 1.00, 1.01))
+        await esperar_ate(lambda: estado.obter_ticker("mexc", "spot", "T39", AGORA) is not None)
+        ticker = estado.obter_ticker("mexc", "spot", "T39", AGORA)
+
+        async def snapshot(symbol, limit=None, params={}):
+            livro = mexc.ex.parse_order_book({"bids": [[0.99, 4]], "asks": [[1.02, 6]]}, symbol)
+            livro["nonce"] = 100
+            return livro
+
+        mexc.ex.fetch_rest_order_book_safe = snapshot
+        await coletor.assinar_livros({"T39/USDT"})
+        await esperar_ate(lambda: "T39USDT" in mexc.assinados("depth"))
+        mexc.entregar({"id": 0, "code": 0, "msg": "spot@public.aggre.depth.v3.api.pb@100ms@T39USDT"})
+        for versao in range(101, 127):  # depois da 25a mudanca o ccxt pede o livro completo (snapshot REST)
+            mexc.entregar(_protobuf_mudanca("T39USDT", versao, 1.00, 1.01))
+            await asyncio.sleep(0)
+        await esperar_ate(lambda: estado.obter_livro("mexc", "spot", "T39", AGORA) is not None)
+        livro = estado.obter_livro("mexc", "spot", "T39", AGORA)
+        await parar(tarefa)
+        await coletor.fechar()
+        return ticker, livro, mexc
+
+    ticker, livro, mexc = asyncio.run(cenario())
+    assert (ticker["bid"], ticker["ask"], ticker["volume_24h_usd"]) == (1.0, 1.01, 1039.0)  # volume pela REST
+    assert livro.bids[:2] == [(1.0, 1.5), (0.99, 4.0)] and livro.asks[:2] == [(1.01, 2.5), (1.02, 6.0)]
+    assert mexc.maximo <= 30
+
+
+def test_mexc_spot_com_watch_bids_asks_nao_entrega_ticker_no_ccxt_4_5_89():
+    # Registro do porque do metodo_ticker: o bookTicker protobuf resolve "ticker:", nunca "bidask:".
+    async def cenario():
+        mexc = MexcDeVerdade(n=3)
+        coletor, estado = coletor_mexc_spot(mexc, metodo_ticker=None)
+        tarefa = asyncio.create_task(coletor.manter_tickers(mexc.simbolos))
+        await esperar_ate(lambda: len(mexc.assinados("bookTicker")) == 3)
+        mexc.entregar(_protobuf_book_ticker("T00USDT", 1.00, 1.01))
+        await _ceder()
+        ticker = estado.obter_ticker("mexc", "spot", "T00", AGORA)
+        await parar(tarefa)
+        await coletor.fechar()
+        return ticker
+
+    assert asyncio.run(cenario()) is None
+
+
+def test_mercado_sem_nenhum_ticker_e_avisado_na_conferencia_periodica(caplog):
+    # R1: sem nenhum ticker, o aviso nao pode depender de um ticker chegar.
+    mexc = MexcSpotFalsa({s: SEIS_SPOT[s] for s in ("T0/USDT", "T1/USDT")}, VOLUMES)
+    r = Relogio()
+    coletor, _ = coletor_de_livros(mexc, relogio=r, prazo_primeiro_ticker_s=60)
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers(["T0/USDT", "T1/USDT"]))
+        await esperar_ate(lambda: mexc.pedidos_de("watch_bids_asks"))
+        r.agora += 30
+        coletor.tirar_descartes()
+        assert not [m for m in avisos(caplog) if "nunca mandaram ticker" in m]
+        r.agora += 30
+        coletor.tirar_descartes()  # o __main__ chama a cada intervalo_log_recursos_s
+        coletor.tirar_descartes()
+        await parar(tarefa)
+
+    with caplog.at_level(logging.WARNING, logger="scanner"):
+        asyncio.run(cenario())
+    linhas = [m for m in avisos(caplog) if "nunca mandaram ticker" in m]
+    assert len(linhas) == 1 and "2 de 2" in linhas[0] and "spot" in linhas[0]
+
+
+def test_config_yaml_do_projeto_usa_watch_ticker_na_mexc():
+    from pathlib import Path
+
+    c = carregar_config(str(Path(__file__).resolve().parent.parent / "config.yaml"))
+    assert c.metodo_ticker.get("mexc") == "watch_ticker"
+
+
+def test_troca_de_livro_na_mexc_spot_nunca_passa_de_30_assinaturas():
+    # R2: com 20 tickers e 10 livros, o livro que sai e cancelado antes do novo ser assinado.
+    async def cenario():
+        mexc = MexcDeVerdade()
+        coletor, _ = coletor_mexc_spot(mexc)
+        tarefa = asyncio.create_task(coletor.manter_tickers(mexc.simbolos))
+        await esperar_ate(lambda: len(mexc.assinados("bookTicker")) == 20)
+        tickers = sorted(mexc.assinados("bookTicker"))
+        primeiros = {f"{i[:3]}/USDT" for i in tickers[:10]}
+        await coletor.assinar_livros(primeiros)
+        await esperar_ate(lambda: len(mexc.assinados("depth")) == 10)
+        assert mexc.ativas == 30
+        trocado = (primeiros - {f"{tickers[0][:3]}/USDT"}) | {f"{tickers[10][:3]}/USDT"}
+        await coletor.assinar_livros(trocado)
+        await esperar_ate(lambda: tickers[10] in mexc.assinados("depth"))
+        await _ceder()
+        await parar(tarefa)
+        await coletor.fechar()
+        return mexc
+
+    mexc = asyncio.run(cenario())
+    assert mexc.maximo == 30 and mexc.ativas == 30
+
+
+def test_tickers_que_saem_do_limite_recebem_un_watch_antes_dos_novos():
+    # R2: reiniciar os tickers (recarga, corretora que entra) com outro top 20 cancela os que saem antes.
+    async def cenario():
+        mexc = MexcDeVerdade()
+        coletor, _ = coletor_mexc_spot(mexc)
+        tarefa = asyncio.create_task(coletor.manter_tickers(mexc.simbolos))
+        await esperar_ate(lambda: len(mexc.assinados("bookTicker")) == 20)
+        antes = set(mexc.assinados("bookTicker"))
+        await coletor.assinar_livros({"T39/USDT", "T38/USDT"})
+        await esperar_ate(lambda: len(mexc.assinados("depth")) == 2)
+        await parar(tarefa)  # o __main__ para o stream antes de reiniciar (_Tickers.parar)
+        # Volumes novos: T00..T04 passam muito na frente (bem mais que a margem de 10%).
+        for i in range(5):
+            mexc.volumes[f"T{i:02d}/USDT"] = 1_000_000.0
+        coletor._volumes_conhecidos.clear()
+        tarefa = asyncio.create_task(coletor.manter_tickers(mexc.simbolos))
+        await esperar_ate(lambda: {f"T{i:02d}USDT" for i in range(5)} <= mexc.assinados("bookTicker"))
+        await _ceder()
+        depois = set(mexc.assinados("bookTicker"))
+        await parar(tarefa)
+        await coletor.fechar()
+        return mexc, antes, depois
+
+    mexc, antes, depois = asyncio.run(cenario())
+    assert len(depois) == 20 and len(antes - depois) == 5
+    assert mexc.maximo <= 30
+    metodos = [m.get("method") for m in mexc.enviadas if any("bookTicker" in p for p in m.get("params", []))]
+    primeira_nova = metodos.index("SUBSCRIPTION", 20)  # depois das 20 primeiras assinaturas
+    assert metodos[20:primeira_nova] == ["UNSUBSCRIPTION"] * 5  # os 5 que sairam, antes dos novos
+
+
+def test_top_dos_tickers_nao_troca_por_diferenca_pequena_de_volume():
+    async def cenario():
+        mexc = MexcDeVerdade()
+        coletor, _ = coletor_mexc_spot(mexc)
+        tarefa = asyncio.create_task(coletor.manter_tickers(mexc.simbolos))
+        await esperar_ate(lambda: len(mexc.assinados("bookTicker")) == 20)
+        antes = set(mexc.assinados("bookTicker"))
+        await parar(tarefa)
+        mexc.volumes["T19/USDT"] = 1021.0  # passa o ultimo do top (T20 = 1020) por menos de 10%
+        coletor._volumes_conhecidos.clear()
+        tarefa = asyncio.create_task(coletor.manter_tickers(mexc.simbolos))
+        await _ceder(50)
+        depois = set(mexc.assinados("bookTicker"))
+        await parar(tarefa)
+        await coletor.fechar()
+        return antes, depois
+
+    antes, depois = asyncio.run(cenario())
+    assert antes == depois
+
+
+def test_livro_pedido_que_nao_manda_nada_avisa_uma_vez(caplog):
+    mexc = CorretoraFalsa([MEXC_BTC_FUT])
+    coletor, estado = coletor_de_livros(mexc, prazo_primeiro_livro_s=0.02)
+
+    async def cenario():
+        await coletor.assinar_livros({"BTC/USDT:USDT"})
+        await asyncio.sleep(0.1)
+        mexc.entregar(("livro", "BTC/USDT:USDT"), ob())
+        await esperar_ate(lambda: estado.obter_livro("mexc", "futuro", "BTC", AGORA) is not None)
+        await coletor.fechar()
+
+    with caplog.at_level(logging.WARNING, logger="scanner"):
+        asyncio.run(cenario())
+    linhas = [m for m in avisos(caplog) if "nao mandou nada" in m]
+    assert len(linhas) == 1 and "BTC/USDT:USDT" in linhas[0] and "limites_assinatura" in linhas[0]
+
+
+def test_campo_do_prazo_do_primeiro_livro(tmp_path):
+    assert Config().prazo_primeiro_livro_s == 60
+    assert carregar_config(escrever(tmp_path, "prazo_primeiro_livro_s: 90\n")).prazo_primeiro_livro_s == 90
+    with pytest.raises(ErroConfig, match="prazo_primeiro_livro_s"):
+        carregar_config(escrever(tmp_path, "prazo_primeiro_livro_s: 0\n"))
+
+
+@pytest.mark.parametrize("sorteio, prazo", [(0.0, 720), (0.5, 900), (1.0, 1080)])
+def test_prazo_da_reassinatura_varia_ate_20_por_cento(sorteio, prazo):
+    # m1: livros abertos juntos nao sao reassinados todos juntos.
+    mexc = CorretoraFalsa([MEXC_BTC_FUT])
+    r = Relogio()
+    coletor, _ = coletor_de_livros(mexc, relogio=r, reassinar_livros_s=900, sortear=lambda: sorteio)
+
+    async def cenario():
+        await coletor.assinar_livros({"BTC/USDT:USDT"})
+        mexc.entregar(("livro", "BTC/USDT:USDT"), ob())
+        await esperar_ate(lambda: len(mexc.livro_guardado_ao_pedir) == 2)
+        r.agora += prazo - 1
+        mexc.entregar(("livro", "BTC/USDT:USDT"), ob())
+        await esperar_ate(lambda: len(mexc.livro_guardado_ao_pedir) == 3)
+        assert mexc.desassinados == []
+        r.agora += 1
+        mexc.entregar(("livro", "BTC/USDT:USDT"), ob())
+        await esperar_ate(lambda: mexc.desassinados == ["BTC/USDT:USDT"])
+        await coletor.fechar()
+
+    asyncio.run(cenario())
+
+
+def test_saude_atrasada_se_um_mercado_em_uso_esta_mudo():
+    # m2: com o spot mudo e o futuro vivo, a corretora nao pode aparecer "conectada".
+    e = EstadoMercados()
+    e.usar_mercados("mexc", {"spot", "futuro"})
+    e.registrar_mensagem("mexc", 100.0, mercado="futuro")
+    assert e.saude("mexc", 100.5)["estado"] == "atrasada"
+    e.registrar_mensagem("mexc", 100.0, mercado="spot")
+    assert e.saude("mexc", 100.5)["estado"] == "conectada"
+    e.registrar_mensagem("gate", 100.0, mercado="spot")  # sem mercados em uso informados: como antes
+    assert e.saude("gate", 100.5)["estado"] == "conectada"
+
+
+def test_coletor_informa_os_mercados_em_uso():
+    gate = CorretoraFalsa([market_ccxt("BTC/USDT", "BTC"), MEXC_BTC_FUT])
+    r = Relogio()
+    coletor, estado = coletor_de_livros(gate, nome="gate", relogio=r)
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers(["BTC/USDT", "BTC/USDT:USDT"]))
+        gate.entregar(("watch_tickers", "spot"), {"BTC/USDT": tk()})
+        gate.entregar(("watch_tickers", "futuro"), {"BTC/USDT:USDT": tk()})
+        await esperar_ate(lambda: estado.conexao_viva("gate", r.agora, mercado="futuro"))
+        assert estado.saude("gate", r.agora)["estado"] == "conectada"
+        r.agora += 2.5  # so o spot continua mandando: o futuro esta mudo
+        gate.entregar(("watch_tickers", "spot"), {"BTC/USDT": tk()})
+        await esperar_ate(lambda: estado.conexao_viva("gate", r.agora, mercado="spot"))
+        assert estado.saude("gate", r.agora)["estado"] == "atrasada"
+        await parar(tarefa)
+
+    asyncio.run(cenario())
+
+
+class MexcSpotQueDemoraNoVolume(MexcSpotFalsa):
+    def __init__(self, markets, volumes):
+        super().__init__(markets, volumes)
+        self.liberar = None
+
+    async def fetch_tickers(self, symbols=None, params=None):
+        if self.liberar is not None:
+            await self.liberar.wait()
+        return await super().fetch_tickers(symbols, params)
+
+
+def test_livros_nao_passam_do_limite_enquanto_os_tickers_buscam_volume():
+    # m3: no meio do pedido REST de volumes, o limite dos livros continua contando os tickers assinados.
+    mexc = MexcSpotQueDemoraNoVolume(SEIS_SPOT, VOLUMES)
+    coletor, _ = coletor_de_livros(mexc, limites_assinatura_mercado={"spot": 5}, livros_reservados_limite_mercado=2)
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers(sorted(SEIS_SPOT)))
+        await esperar_ate(lambda: mexc.pedidos_de("watch_bids_asks"))
+        await parar(tarefa)
+        mexc.liberar = asyncio.Event()
+        coletor._volumes_conhecidos.clear()
+        tarefa = asyncio.create_task(coletor.manter_tickers(sorted(SEIS_SPOT)))
+        await _ceder()  # parado no pedido REST de volumes
+        await coletor.assinar_livros({"T5/USDT", "T4/USDT", "T3/USDT"})
+        assert len(coletor._tarefas_livro) == 2  # 5 - 3 tickers, e nao 5
+        mexc.liberar.set()
+        await parar(tarefa)
+        await coletor.fechar()
+
+    asyncio.run(cenario())
+
+
+def test_bitget_depois_da_queda_o_snapshot_nao_traz_o_nivel_fantasma():
+    # m6: o ccxt da Bitget aplica o snapshot por cima do livro guardado; esquecido depois da queda, nao ha fantasma.
+    import ccxt.pro as ccxtpro
+
+    class Cliente:
+        def __init__(self):
+            self.subscriptions, self.resolvidos = {}, []
+
+        def resolve(self, valor, hash_):
+            self.resolvidos.append(hash_)
+
+        def reject(self, *a, **k):
+            pass
+
+    async def cenario():
+        ex = ccxtpro.bitget()
+        ex.set_markets([ex.safe_market_structure({
+            "id": "BTCUSDT", "symbol": "BTC/USDT:USDT", "base": "BTC", "quote": "USDT", "settle": "USDT",
+            "baseId": "BTC", "quoteId": "USDT", "settleId": "USDT", "type": "swap", "spot": False, "swap": True,
+            "future": False, "option": False, "contract": True, "linear": True, "inverse": False, "contractSize": 1,
+            "active": True, "precision": {"amount": 0.0001, "price": 0.1}, "limits": {},
+            "info": {"productType": "USDT-FUTURES"}})])
+        snapshot = {"action": "snapshot", "arg": {"instType": "USDT-FUTURES", "channel": "books", "instId": "BTCUSDT"},
+                    "data": [{"asks": [["100050", "3"]], "bids": [["99995", "4"]], "checksum": 0, "ts": "1"}],
+                    "ts": 1}
+        pedidos = 0
+
+        async def watch_order_book(symbol, limit=None, params={}):
+            nonlocal pedidos
+            pedidos += 1
+            if pedidos == 1:  # antes da queda: o livro com um nivel que sumiu durante a queda
+                velho = ex.counted_order_book({})
+                velho["asks"].storeArray([100000.0, 5.0, ["100000", "5"]])
+                velho["bids"].storeArray([99990.0, 1.0, ["99990", "1"]])
+                ex.orderbooks[symbol] = velho
+                return velho.limit()
+            if pedidos == 2:
+                raise NetworkError("conexao caiu")
+            if pedidos > 3:
+                await asyncio.Event().wait()
+            ex.handle_order_book(Cliente(), snapshot)  # o handler de verdade, com o snapshot da conexao nova
+            return ex.orderbooks[symbol].limit()
+
+        ex.watch_order_book = watch_order_book
+        estado = EstadoMercados()
+        coletor = ColetorCcxt("bitget", ex, estado=estado, relogio=relogio, esperar=EsperaFalsa())
+        await coletor.assinar_livros({"BTC/USDT:USDT"})
+        await esperar_ate(lambda: pedidos == 4)
+        livro = estado.obter_livro("bitget", "futuro", "BTC", AGORA)
+        await coletor.fechar()
+        return livro
+
+    livro = asyncio.run(cenario())
+    assert livro.asks == [(100050.0, 3.0)] and livro.bids == [(99995.0, 4.0)]
+
+
+def test_metodo_que_nao_existe_no_mercado_nao_deixa_assinatura_anotada(caplog):
+    # O watch_tickers da MEXC spot da NotSupported antes de assinar qualquer coisa: o metodo seguinte nao pode
+    # tentar cancelar assinaturas dele.
+    mexc = MexcSpotFalsa({s: SEIS_SPOT[s] for s in ("T0/USDT", "T1/USDT")}, VOLUMES)
+    mexc.has["watchTickers"] = True
+    coletor, _ = coletor_de_livros(mexc, limites_assinatura_mercado={"spot": 30})
+
+    async def cenario():
+        mexc.entregar(("watch_tickers", "spot"), NotSupported("mexc watchTickers does not support spot markets"))
+        tarefa = asyncio.create_task(coletor.manter_tickers(["T0/USDT", "T1/USDT"]))
+        await esperar_ate(lambda: mexc.pedidos_de("watch_bids_asks"))
+        await parar(tarefa)
+
+    with caplog.at_level(logging.WARNING, logger="scanner"):
+        asyncio.run(cenario())
+    assert not [m for m in avisos(caplog) if "un_watch" in m]
+    assert coletor._tickers_assinados == {"spot": ("watch_bids_asks", {"T0/USDT", "T1/USDT"})}

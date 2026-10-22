@@ -57,6 +57,7 @@ class EstadoMercados:
         self._atraso_max_valido_s = atraso_max_valido_s
         self._ultima_mensagem: dict[str, float] = {}  # corretora -> ultima mensagem sem mercado (vale para todos)
         self._ultima_do_mercado: dict[tuple[str, str], float] = {}  # (corretora, mercado) -> ultima mensagem
+        self._mercados_em_uso: dict[str, set[str]] = {}  # corretora -> mercados que o coletor acompanha (saude)
         self._livros: dict[tuple[str, str, str], Livro] = {}
         self._tickers: dict[tuple[str, str, str], dict] = {}
         self._cotacoes: dict[tuple[str, str], dict] = {}  # (corretora, simbolo) -> ticker do par de cotacao
@@ -82,6 +83,14 @@ class EstadoMercados:
             self._ultima_mensagem[corretora] = agora
         else:
             self._ultima_do_mercado[(corretora, mercado)] = agora
+
+    def usar_mercados(self, corretora: str, mercados) -> None:
+        """Os mercados que o coletor da corretora acompanha agora (ex.: {"spot", "futuro"}).
+
+        Com eles, a saude so fica "conectada" se TODOS mandaram mensagem ha pouco: um mercado mudo (ex.: o spot
+        sem nenhum ticker) deixa a corretora "atrasada" no painel, mesmo com o outro vivo. Nao some na queda.
+        """
+        self._mercados_em_uso[corretora] = set(mercados)
 
     def atualizar_ticker(
         self,
@@ -298,11 +307,14 @@ class EstadoMercados:
         """Saude da corretora para o painel: {"estado", "atraso_medio_ms", "reconexoes"}.
 
         estado: "reconectando" (caiu e o coletor esta tentando de novo), "conectada" (mensagem ha no
-        maximo `max_silencio_s`) ou "atrasada" (silenciosa, ou nunca mandou nada).
+        maximo `max_silencio_s` em cada mercado em uso; veja usar_mercados) ou "atrasada" (algum mercado em uso
+        silencioso, ou nunca mandou nada). Sem mercados em uso informados, vale qualquer mensagem da corretora.
         """
+        mercados = self._mercados_em_uso.get(corretora)
         if corretora in self._reconectando:
             estado = "reconectando"
-        elif self.conexao_viva(corretora, agora):
+        elif (all(self.conexao_viva(corretora, agora, m) for m in mercados) if mercados
+              else self.conexao_viva(corretora, agora)):
             estado = "conectada"
         else:
             estado = "atrasada"
