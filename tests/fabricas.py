@@ -1,8 +1,12 @@
 """Helpers de teste compartilhados (as proximas tarefas acrescentam os seus aqui)."""
 
 import asyncio
+import base64
 from dataclasses import replace
 from datetime import datetime, timezone
+from urllib.parse import urljoin
+
+from fastapi.testclient import TestClient
 
 from scanner.armazenamento import Banco
 from scanner.coletores.ccxt_coletor import mercado_do_simbolo
@@ -611,3 +615,27 @@ def banco_com_sinais(
             encerrado = {**sinal, "encerrado_em": iso_utc(nasceu + duracao)}
             banco.gravar_evento(Evento("encerrado", encerrado, registrar_historico=True))
     return banco
+
+
+# ---------------------------------------------------------------------------
+# Painel (API): cliente de teste no endereco da propria maquina e cabecalho da senha
+# ---------------------------------------------------------------------------
+
+# O endereco que o navegador usa no PC (e pelo tunel SSH). Sem senha, o painel so aceita os nomes da
+# propria maquina no cabecalho Host (o "testserver" padrao do TestClient seria recusado com 400).
+BASE_PAINEL = "http://localhost:8000"
+
+
+class ClienteDoPainel(TestClient):
+    """TestClient no endereco BASE_PAINEL, inclusive no WebSocket (o original sempre usa ws://testserver)."""
+
+    def __init__(self, app, **opcoes):
+        super().__init__(app, base_url=BASE_PAINEL, **opcoes)
+
+    def websocket_connect(self, url, *argumentos, **opcoes):
+        return super().websocket_connect(urljoin(BASE_PAINEL.replace("http", "ws", 1), url), *argumentos, **opcoes)
+
+
+def basic(usuario: str, senha: str) -> dict:
+    """O cabecalho Authorization do HTTP Basic (para o WebSocket: o TestClient so monta o do HTTP sozinho)."""
+    return {"Authorization": "Basic " + base64.b64encode(f"{usuario}:{senha}".encode()).decode()}

@@ -1156,7 +1156,8 @@ function prepararGrupos() {
 //   {"tipo": "snapshot", "sinais": [...]}       substitui a tabela inteira (ao conectar)
 //   {"tipo": "novo" | "atualizado", "sinal": {...}}  poe ou troca o sinal pela chave
 //   {"tipo": "encerrado", "sinal": {...}}        tira o sinal
-//   {"tipo": "vivo"}                             sinal de vida (a cada 5 s sem eventos): so a "Ultima atualizacao"
+//   {"tipo": "vivo"}                             sinal de vida: o motor manda a cada 5 s sem eventos, so depois
+//                                                de um ciclo que deu certo (atualiza so a "Ultima atualizacao")
 // Caiu a conexao: tenta de novo em 1 s, 2 s, 4 s... ate 30 s. A espera so volta a 1 s depois que o
 // snapshot chega (um servidor que aceita e fecha logo em seguida nao vira uma tentativa por segundo).
 // Nao da para saber pelo codigo de fechamento se foi senha errada: no servidor de verdade isso chega

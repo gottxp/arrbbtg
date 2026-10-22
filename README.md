@@ -641,7 +641,7 @@ Verde = positivo; vermelho = negativo. Linha com faixa amarela à esquerda = fix
 
 ### 5.4 Barra de status (rodapé)
 
-- `Última atualização`: horário de Brasília, com milissegundos, da última mensagem que o painel recebeu do scanner. Sem sinais, o scanner manda um sinal de vida a cada 5 s, então o horário continua andando. `Ao vivo` com o horário parado há mais de 10 s = a conexão travou: aperte F5.
+- `Última atualização`: horário de Brasília, com milissegundos, da última mensagem que o painel recebeu do scanner. Sem sinais, o motor manda um sinal de vida a cada 5 s (só depois de um ciclo que deu certo), então o horário continua andando. `Ao vivo` com o horário parado há mais de 10 s: veja o log. Com `erro no ciclo do motor`, o motor está falhando: mande o log ao desenvolvedor. Sem erro no log, aperte F5.
 - `N oportunidades` (ou `X de N oportunidades` quando a busca esconde alguns).
 - Conexão do painel com o scanner: `Ao vivo`; `Sem conexão: tentando de novo em Ns` (a tabela fica apagada). Não é a internet das corretoras: é o scanner desligado ou o túnel caído.
 - `PAUSADO`: a tabela está parada (botão **Pausar**).

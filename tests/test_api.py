@@ -14,7 +14,7 @@ import signal
 import socket
 import time
 from dataclasses import replace
-from urllib.parse import quote, urljoin
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -26,14 +26,14 @@ from websockets.exceptions import InvalidStatus
 
 import scanner.__main__ as principal
 from scanner.api import Transmissor, conferir_painel, criar_app, servir_api
-from scanner.api import app as modulo_app
+from scanner.api import transmissor as modulo_transmissor
 from scanner.api import servidor as modulo_servidor
 from scanner.armazenamento import Banco
 from scanner.config.carregar import ErroConfig
 from scanner.filtros import Filtros
 from scanner.motor import Motor, Sessao, chave_de, texto_da_chave
 from scanner.sinais import Evento
-from tests.fabricas import banco_com_sinais, motor_falso
+from tests.fabricas import ClienteDoPainel, banco_com_sinais, basic, motor_falso
 from tests.test_motor import config_servico, exchanges_falsas
 
 # Horario do estado criado pelo motor_falso (as pontas "chegaram" em t = 10 s).
@@ -85,24 +85,11 @@ def motor(banco):
     return m
 
 
-# O endereco que o navegador usa no PC (e pelo tunel SSH). Sem senha, o painel so aceita os nomes da
-# propria maquina no cabecalho Host (o "testserver" padrao do TestClient seria recusado).
-BASE = "http://localhost:8000"
 OUTRO_SITE = "http://site-de-fora.test"
 
 
-class ClienteDoPainel(TestClient):
-    """TestClient no endereco BASE, inclusive no WebSocket (o original sempre usa ws://testserver)."""
-
-    def __init__(self, app, **opcoes):
-        super().__init__(app, base_url=BASE, **opcoes)
-
-    def websocket_connect(self, url, *argumentos, **opcoes):
-        return super().websocket_connect(urljoin(BASE.replace("http", "ws", 1), url), *argumentos, **opcoes)
-
-
 def montar_cliente(motor, banco, painel=None, relogio=lambda: AGORA, **extras) -> TestClient:
-    """TestClient da API do `motor`; `painel` troca campos do bloco painel da Config (usuario, senha...)."""
+    """TestClient da API do `motor` em http://localhost:8000; `painel` troca campos do bloco painel da Config."""
     config = replace(motor.cfg, painel={**motor.cfg.painel, **(painel or {})})
     return ClienteDoPainel(criar_app(motor, banco, config, relogio=relogio, **extras))
 
@@ -115,12 +102,6 @@ def cliente(motor, banco):
 @pytest.fixture
 def cliente_com_senha(motor, banco):
     return montar_cliente(motor, banco, painel={"usuario": "jr", "senha": "segredo"})
-
-
-def basic(usuario: str, senha: str) -> dict:
-    """O cabecalho Authorization de uma conexao WebSocket (o TestClient so monta o do HTTP sozinho)."""
-    codigo = base64.b64encode(f"{usuario}:{senha}".encode()).decode()
-    return {"Authorization": f"Basic {codigo}"}
 
 
 def publicar(cliente: TestClient, eventos: list) -> None:
@@ -503,8 +484,11 @@ def test_status_manda_os_mercados_ligados_de_cada_corretora(motor, banco, monkey
     # O painel monta as opcoes de "Corretoras 1/2" so com estes mercados (revisao final, I2).
     nomes = ["gate", "hyperliquid", "kraken", "krakenfutures", "lighter", "lighter_rh"]
     config = replace(motor.cfg, corretoras=nomes, mercados_por_corretora={
-        "hyperliquid": ("futuro",), "kraken": ("spot",), "krakenfutures": ("futuro",),
+        "hyperliquid": ("futuro",),
         "lighter_rh": ("spot", "futuro"),  # a Lighter so tem futuros, mesmo que o config diga outra coisa
+        # kraken e krakenfutures sem a linha (o dono esqueceu): a kraken so tem spot e a krakenfutures so
+        # futuros no ccxt; sem isto apareceriam "Kraken Pro spot futuros" e "Kraken Futuros spot", que nao
+        # casam com nada (re-revisao, Minor 2).
     })
     monkeypatch.setattr(motor, "status", lambda agora: {nome: {"estado": "conectada"} for nome in nomes})
     corpo = ClienteDoPainel(criar_app(motor, banco, config)).get("/api/status").json()
@@ -846,6 +830,21 @@ def test_sem_senha_recusa_outro_nome_no_host(cliente, motor, host):
     conferir_sessao_intacta(cliente, motor, antes)
 
 
+@pytest.mark.parametrize("host_do_painel, aceitos, recusados", [
+    ("127.0.0.2", ["127.0.0.2:8000", "127.0.0.2", "localhost:8000"], ["127.0.0.3:8000"]),
+    ("::1", ["[::1]:8000", "127.0.0.1:8000"], ["[::2]:8000"]),
+    ("0:0:0:0:0:0:0:1", ["[::1]:8000"], ["[::2]:8000"]),  # o navegador escreve o IPv6 na forma curta
+])
+def test_sem_senha_aceita_tambem_o_proprio_host_do_painel(motor, banco, host_do_painel, aceitos, recusados):
+    # Re-revisao, Minor 3: host 127.0.0.2 passava no conferir_painel, mas o navegador em http://127.0.0.2:8000
+    # recebia 400.
+    cliente = montar_cliente(motor, banco, painel={"host": host_do_painel})
+    for host in aceitos:
+        assert cliente.get("/api/sinais", headers={"Host": host}).status_code == 200, host
+    for host in recusados:
+        assert cliente.get("/api/sinais", headers={"Host": host}).status_code == 400, host
+
+
 def test_com_senha_o_nome_do_endereco_nao_importa(cliente_com_senha):
     # Com senha (VPS, host 0.0.0.0) o painel e aberto pelo IP ou por um nome do dono: quem protege e a senha.
     r = cliente_com_senha.get("/api/sinais", auth=("jr", "segredo"), headers={"Host": "203.0.113.5:8000"})
@@ -940,35 +939,50 @@ def test_ws_com_senha_certa_conecta(cliente_com_senha):
         assert ws.receive_json()["tipo"] == "snapshot"
 
 
-def test_ws_manda_sinal_de_vida_quando_nao_ha_eventos(motor, banco):
-    # Revisao final, Minor 9: sem sinais nao ha eventos, e a "Ultima atualizacao" do painel congelava.
-    cliente = montar_cliente(motor, banco, intervalo_vivo_s=0.05)
-    with cliente.websocket_connect("/ws/sinais") as ws:
-        assert ws.receive_json()["tipo"] == "snapshot"
-        assert ws.receive_json() == {"tipo": "vivo"}
-        assert ws.receive_json() == {"tipo": "vivo"}
+class RelogioFalso:
+    """Relogio do Transmissor (segundos) que so anda quando o teste manda."""
+
+    def __init__(self, agora: float = 0.0):
+        self.agora = agora
+
+    def __call__(self) -> float:
+        return self.agora
 
 
-def test_ws_sinal_de_vida_nao_atrapalha_os_eventos(motor, banco):
-    cliente = montar_cliente(motor, banco, intervalo_vivo_s=0.05)
+def test_ws_entrega_o_vivo_publicado_pelo_transmissor(motor, banco):
+    # Re-revisao, Minor 4: o "vivo" sai do laco do motor (Transmissor.publicar depois de um ciclo que deu
+    # certo), e nao da rota do WebSocket: motor travado = "Ultima atualizacao" parada.
+    relogio = RelogioFalso()
+    cliente = montar_cliente(motor, banco, transmissor=Transmissor(intervalo_vivo_s=5, relogio=relogio))
     with cliente:
         with cliente.websocket_connect("/ws/sinais") as ws:
             assert ws.receive_json()["tipo"] == "snapshot"
-            eventos = [Evento("novo", {"id": str(i)}, True) for i in range(3)]
-            publicar(cliente, eventos)
-            recebidos = []
-            while len(recebidos) < 3:
-                mensagem = ws.receive_json()
-                if mensagem["tipo"] != "vivo":
-                    recebidos.append(mensagem)
-    assert recebidos == [{"tipo": "novo", "sinal": {"id": str(i)}} for i in range(3)]  # nada perdido, na ordem
+            relogio.agora = 5.0
+            publicar(cliente, [])  # um ciclo sem eventos, 5 s depois da ultima mensagem
+            assert ws.receive_json() == {"tipo": "vivo"}
+            relogio.agora = 7.0
+            publicar(cliente, [])  # 2 s depois do vivo: nada
+            publicar(cliente, [Evento("novo", {"id": "x"}, True)])
+            assert ws.receive_json() == {"tipo": "novo", "sinal": {"id": "x"}}  # nada entre o vivo e o evento
 
 
-def test_sinal_de_vida_padrao_a_cada_poucos_segundos(motor, banco):
-    assert 1 <= modulo_app.INTERVALO_VIVO_S <= 10
-    assert inspect.signature(criar_app).parameters["intervalo_vivo_s"].default == modulo_app.INTERVALO_VIVO_S
-    with pytest.raises(ValueError, match="intervalo_vivo_s"):
-        criar_app(motor, banco, motor.cfg, intervalo_vivo_s=0)
+def test_ws_sem_ciclo_do_motor_nao_ha_vivo(motor, banco):
+    # A rota do WebSocket nao manda nada sozinha: so o que o laco do motor publica.
+    cliente = montar_cliente(motor, banco, transmissor=Transmissor(intervalo_vivo_s=0.01))
+    with cliente:
+        with cliente.websocket_connect("/ws/sinais") as ws:
+            assert ws.receive_json()["tipo"] == "snapshot"
+            time.sleep(0.3)  # 30 intervalos de vivo sem nenhum ciclo
+            publicar(cliente, [Evento("novo", {"id": "x"}, True)])
+            assert ws.receive_json() == {"tipo": "novo", "sinal": {"id": "x"}}
+
+
+def test_vivo_padrao_a_cada_poucos_segundos_e_intervalo_invalido_da_erro():
+    assert 1 <= modulo_transmissor.INTERVALO_VIVO_S <= 10
+    assert Transmissor().intervalo_vivo_s == modulo_transmissor.INTERVALO_VIVO_S
+    for invalido in (0, -1, float("inf"), float("nan"), True, "5"):
+        with pytest.raises(ValueError, match="intervalo_vivo_s"):
+            Transmissor(intervalo_vivo_s=invalido)
 
 
 # ---------------------------------------------------------------------------
@@ -1046,6 +1060,79 @@ def test_publicar_nao_espera_nem_levanta_erro_com_cliente_parado():
 
     asyncio.run(cenario())
     assert not inspect.iscoroutinefunction(Transmissor.publicar)  # funcao comum: o laco do motor nao espera
+
+
+def test_transmissor_manda_vivo_depois_de_intervalo_sem_eventos():
+    relogio = RelogioFalso()
+    transmissor = Transmissor(intervalo_vivo_s=5, relogio=relogio)
+    fila = transmissor.inscrever()
+    recebido = []
+
+    def ciclo(agora, eventos=()):
+        relogio.agora = agora
+        transmissor.publicar(list(eventos))
+        while not fila.empty():
+            recebido.append((agora, json.loads(fila.get_nowait())["tipo"]))
+
+    for agora in (0.5, 1.0, 4.9):
+        ciclo(agora)
+    assert recebido == []  # menos de 5 s desde o inicio: nada
+    ciclo(5.0)
+    ciclo(5.5)
+    ciclo(9.9)
+    assert recebido == [(5.0, "vivo")]  # um vivo so, e o proximo conta a partir dele
+    ciclo(10.0)
+    assert recebido[-1] == (10.0, "vivo")
+
+
+def test_ciclo_com_eventos_nao_manda_vivo_a_mais():
+    relogio = RelogioFalso()
+    transmissor = Transmissor(intervalo_vivo_s=5, relogio=relogio)
+    fila = transmissor.inscrever()
+    tipos = []
+    for agora in range(0, 30):  # 30 ciclos de 1 s, todos com evento
+        relogio.agora = float(agora)
+        transmissor.publicar([evento(agora)])
+        while not fila.empty():
+            tipos.append(json.loads(fila.get_nowait())["tipo"])
+    assert tipos == ["atualizado"] * 30  # nenhum vivo: os eventos ja mostram que o motor esta vivo
+    relogio.agora = 33.9
+    transmissor.publicar([])
+    assert fila.empty()  # 4,9 s depois do ultimo evento (29 s): ainda nao
+    relogio.agora = 34.0
+    transmissor.publicar([])
+    assert json.loads(fila.get_nowait()) == {"tipo": "vivo"} and fila.empty()
+
+
+def test_vivo_sai_do_laco_do_motor_so_depois_de_um_ciclo_que_deu_certo(monkeypatch):
+    # O __main__ chama Transmissor.publicar depois de cada ciclo bem-sucedido (com ou sem eventos) e nao
+    # chama quando o ciclo falha: com o motor falhando todo ciclo, nenhum vivo sai e o horario do painel para.
+    motor = motor_falso()
+    cfg = replace(motor.cfg, ciclo_ms=1)
+    relogio = RelogioFalso()
+    transmissor = Transmissor(intervalo_vivo_s=5, relogio=relogio)
+    fila = transmissor.inscrever()
+    falhar = {"sim": False}
+    original = motor.ciclo
+
+    def ciclo(agora):
+        relogio.agora += 2  # cada ciclo "leva" 2 s no relogio do vivo
+        if falhar["sim"]:
+            raise RuntimeError("defeito no ciclo")
+        return original(agora)
+
+    monkeypatch.setattr(motor, "ciclo", ciclo)
+
+    def rodar(ciclos):
+        asyncio.run(principal._laco_do_motor(motor, {}, cfg, lambda: AGORA, ciclos, publicar=transmissor.publicar))
+        tipos = []
+        while not fila.empty():
+            tipos.append(json.loads(fila.get_nowait())["tipo"])
+        return tipos
+
+    assert rodar(6) == ["vivo", "vivo"]  # ciclos em 2, 4, ... 12 s: vivo em 6 s e em 12 s
+    falhar["sim"] = True
+    assert rodar(10) == []  # 20 s de ciclos falhando (cada falha vai para o log): nenhum vivo
 
 
 def test_transmissor_precisa_de_fila_com_pelo_menos_um_lugar():
@@ -1189,7 +1276,9 @@ def test_uvicorn_de_verdade_recusa_outro_site_e_outro_nome_e_aceita_o_painel(mot
     # No uvicorn de verdade o WebSocket recusado chega ao navegador como HTTP 403 (nao como o codigo 1008).
     porta = porta_livre()
     config = replace(motor.cfg, painel={"host": "127.0.0.1", "porta": porta, "usuario": None, "senha": None})
-    app = criar_app(motor, banco, config, relogio=lambda: AGORA, intervalo_vivo_s=0.2)
+    relogio = RelogioFalso()
+    app = criar_app(motor, banco, config, relogio=lambda: AGORA,
+                    transmissor=Transmissor(intervalo_vivo_s=5, relogio=relogio))
     endereco = f"ws://127.0.0.1:{porta}/ws/sinais"
 
     async def cenario():
@@ -1213,6 +1302,8 @@ def test_uvicorn_de_verdade_recusa_outro_site_e_outro_nome_e_aceita_o_painel(mot
 
         async with conectar_ws(endereco, origin=f"http://127.0.0.1:{porta}", proxy=None) as ws:  # o proprio painel
             assert json.loads(await ws.recv())["tipo"] == "snapshot"
+            relogio.agora = 5.0
+            app.state.transmissor.publicar([])  # um ciclo do motor sem eventos, 5 s depois
             assert json.loads(await ws.recv()) == {"tipo": "vivo"}
         with pytest.raises(InvalidStatus) as erro:
             async with conectar_ws(endereco, origin=OUTRO_SITE, proxy=None):

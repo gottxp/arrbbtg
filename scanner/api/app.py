@@ -10,8 +10,8 @@
 - GET    /api/sessao, PUT /api/sessao   modo, filtros e comparacao em uso pelo motor
 - GET    /api/status                 saude de cada corretora
 - GET    /api/validacao?dia=AAAA-MM-DD   metricas de validacao do dia UTC (padrao: hoje), por modo e corretora
-- WS     /ws/sinais                  um retrato dos sinais ao conectar, depois cada evento do motor e, sem
-                                     evento por INTERVALO_VIVO_S, um {"tipo": "vivo"}
+- WS     /ws/sinais                  um retrato dos sinais ao conectar, depois cada evento do motor e o
+                                     {"tipo": "vivo"} do Transmissor (scanner/api/transmissor.py)
 - GET    /                           o painel web (arquivos de scanner/painel: index.html, app.js, estilo.css)
 
 Protecoes (middlewares: rotas e arquivos novos ja nascem protegidos):
@@ -35,7 +35,6 @@ import heapq
 import ipaddress
 import json
 import logging
-import math
 import mimetypes
 import secrets
 import time
@@ -73,14 +72,13 @@ registro = logging.getLogger("scanner.api")
 CODIGO_RECUSADO = 1008
 CODIGO_PAINEL_LENTO = 1013
 
-# Sem nenhum evento por tanto tempo, o WebSocket manda {"tipo": "vivo"} ao painel: a "Ultima atualizacao"
-# continua andando sem sinais, e uma conexao que morreu calada aparece (o horario para). Em segundos.
-# Detalhe interno do servidor (como o TAMANHO_FILA_PADRAO do Transmissor), nao um limite de negocio.
-INTERVALO_VIVO_S = 5
-MENSAGEM_VIVO = json.dumps({"tipo": "vivo"})
-
-# Sem senha, so estes nomes sao aceitos no cabecalho Host (com qualquer porta): os da propria maquina.
+# Sem senha, so estes nomes sao aceitos no cabecalho Host (com qualquer porta): os da propria maquina,
+# mais o proprio painel.host (veja nome_no_cabecalho_host).
 NOMES_DA_MAQUINA = ["localhost", "127.0.0.1", "[::1]"]
+
+# Corretoras que, no ccxt, so tem um mercado: a kraken so spot e a krakenfutures so futuros. Valem mesmo
+# sem a linha delas em mercados_por_corretora (sem isto, o painel mostraria opcoes que nao casam com nada).
+MERCADOS_FIXOS = {"kraken": ("spot",), "krakenfutures": ("futuro",)}
 
 # Metodos que so leem: passam mesmo com Origin de outro site (o navegador nao entrega a resposta a ele).
 METODOS_DE_LEITURA = ("GET", "HEAD")
@@ -113,6 +111,15 @@ def host_da_propria_maquina(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:  # nao e um IP (e um nome): pode apontar para fora
         return False
+
+
+def nome_no_cabecalho_host(host: str) -> str:
+    """Como o navegador escreve o `host` no cabecalho Host: IPv6 entre colchetes e na forma curta, ex.: "[::1]"."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:  # um nome (ex.: localhost)
+        return host.lower()
+    return f"[{ip.compressed}]" if ip.version == 6 else ip.compressed
 
 
 def conferir_painel(cfg: Config) -> None:
@@ -255,10 +262,12 @@ class ArquivosDoPainel(StaticFiles):
 def mercados_ligados(cfg: Config, corretora: str) -> tuple[str, ...]:
     """Os mercados da corretora que entram no scanner ("spot" e/ou "futuro").
 
-    A Lighter (lighter e lighter_rh, conector proprio) so le futuros; as outras usam os de
-    mercados_por_corretora (ou os dois, se ela nao estiver la).
+    A Lighter (lighter e lighter_rh, conector proprio) so le futuros; a kraken e a krakenfutures tem um
+    mercado so (MERCADOS_FIXOS); as outras usam os de mercados_por_corretora (ou os dois, se ela nao estiver la).
     """
-    return ("futuro",) if e_lighter(corretora) else cfg.mercados_da_corretora(corretora)
+    if e_lighter(corretora):
+        return ("futuro",)
+    return MERCADOS_FIXOS.get(corretora) or cfg.mercados_da_corretora(corretora)
 
 
 class CorpoSessao(BaseModel):
@@ -324,20 +333,15 @@ def criar_app(
     cfg: Config,
     transmissor: Transmissor | None = None,
     relogio: Callable[[], float] = time.time,
-    intervalo_vivo_s: float = INTERVALO_VIVO_S,
 ) -> FastAPI:
     """Monta a API do painel.
 
     transmissor: quem entrega os eventos aos paineis; sem ele, cria um (fica em `app.state.transmissor`,
         e o `__main__` chama `publicar` nele a cada ciclo do motor).
     relogio: hora atual em segundos desde 1970 (os testes passam um relogio fixo).
-    intervalo_vivo_s: segundos sem evento ate o WebSocket mandar {"tipo": "vivo"} (veja INTERVALO_VIVO_S).
     Levanta ErroConfig se o bloco `painel` da Config for inseguro (veja `conferir_painel`).
     """
     conferir_painel(cfg)
-    if isinstance(intervalo_vivo_s, bool) or not (isinstance(intervalo_vivo_s, (int, float)) and
-                                                  0 < intervalo_vivo_s < math.inf):
-        raise ValueError(f"intervalo_vivo_s precisa ser um numero maior que zero (recebi {intervalo_vivo_s!r})")
     transmissor = transmissor if transmissor is not None else Transmissor()
 
     # Sem /docs, /redoc e /openapi.json: a documentacao automatica ficaria aberta mesmo com senha.
@@ -348,8 +352,10 @@ def criar_app(
         app.add_middleware(ExigirSenha, usuario=cfg.painel["usuario"], senha=cfg.painel["senha"])
     app.add_middleware(RecusarOutroSite)
     if cfg.painel.get("usuario") is None:
-        # Sem senha o host e da propria maquina (conferir_painel garante): so os nomes dela valem no Host.
-        app.add_middleware(TrustedHostMiddleware, allowed_hosts=NOMES_DA_MAQUINA)
+        # Sem senha o host e da propria maquina (conferir_painel garante): so os nomes dela valem no Host,
+        # inclusive o proprio painel.host (ex.: 127.0.0.2).
+        nomes = list(dict.fromkeys(NOMES_DA_MAQUINA + [nome_no_cabecalho_host(cfg.painel["host"])]))
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=nomes)
 
     # --- Sinais e historico --------------------------------------------------
 
@@ -482,8 +488,7 @@ def criar_app(
         try:
             # Enviar e escutar ao mesmo tempo: escutar serve so para perceber quando o painel fecha a aba
             # (sem isso um painel parado ficaria na lista ate o proximo evento).
-            await _ate_um_terminar(lambda: _enviar(ws, fila, retrato, intervalo_vivo_s),
-                                   lambda: _esperar_desconexao(ws))
+            await _ate_um_terminar(lambda: _enviar(ws, fila, retrato), lambda: _esperar_desconexao(ws))
         finally:
             transmissor.remover(fila)
 
@@ -510,20 +515,16 @@ async def _ate_um_terminar(*funcoes: Callable[[], Any]) -> None:
             grupo.start_soon(executar, funcao)
 
 
-async def _enviar(ws: WebSocket, fila: asyncio.Queue, retrato: str, intervalo_vivo_s: float) -> None:
-    """Manda o retrato e depois cada mensagem da fila. `None` na fila = o Transmissor derrubou este painel.
+async def _enviar(ws: WebSocket, fila: asyncio.Queue, retrato: str) -> None:
+    """Manda o retrato e depois cada mensagem da fila (eventos e o vivo, que o Transmissor poe la).
 
-    Fila vazia por `intervalo_vivo_s`: manda {"tipo": "vivo"} (o painel atualiza a "Ultima atualizacao").
-    Nada se perde na espera: a mensagem que chegar continua na fila para a proxima volta.
+    `None` na fila = o Transmissor derrubou este painel. A rota nao manda nada sozinha: se o motor parar,
+    o painel para de receber, e o horario da "Ultima atualizacao" para.
     """
     try:
         await ws.send_text(retrato)
         while True:
-            try:
-                mensagem = await asyncio.wait_for(fila.get(), intervalo_vivo_s)
-            except TimeoutError:
-                await ws.send_text(MENSAGEM_VIVO)
-                continue
+            mensagem = await fila.get()
             if mensagem is None:
                 await ws.close(code=CODIGO_PAINEL_LENTO)
                 return

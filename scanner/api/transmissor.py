@@ -2,8 +2,11 @@
 
 O laco do motor chama `publicar(eventos)` depois de cada ciclo. Cada painel conectado tem a sua
 propria fila de mensagens (`asyncio.Queue` com tamanho maximo); a rota do WebSocket le a fila e
-manda as mensagens ao navegador (e, com a fila vazia por alguns segundos, um {"tipo": "vivo"}: veja
-INTERVALO_VIVO_S em scanner/api/app.py).
+manda as mensagens ao navegador.
+
+Sinal de vida: o laco do motor so chama `publicar` depois de um ciclo que deu certo (com ou sem eventos).
+Se passar INTERVALO_VIVO_S sem nenhuma mensagem, `publicar` manda {"tipo": "vivo"}: a "Ultima atualizacao"
+do painel continua andando sem sinais, e para quando o motor trava ou falha todo ciclo.
 
 Regra de ouro: o motor nunca espera por um painel. Por isso:
 - `publicar` e uma funcao comum (nao `async`) que so poe mensagens nas filas, sem esperar nada;
@@ -16,7 +19,9 @@ Regra de ouro: o motor nunca espera por um painel. Por isso:
 
 import asyncio
 import json
-from collections.abc import Iterable
+import math
+import time
+from collections.abc import Callable, Iterable
 
 from scanner.sinais import Evento
 
@@ -24,15 +29,31 @@ from scanner.sinais import Evento
 # sinal ativo (centenas); 2000 da alguns segundos de folga a um navegador que engasgou.
 TAMANHO_FILA_PADRAO = 2000
 
+# Segundos sem nenhuma mensagem ate `publicar` (chamado a cada ciclo do motor) mandar o sinal de vida.
+# Detalhe interno do painel (como o TAMANHO_FILA_PADRAO), nao um limite de negocio.
+INTERVALO_VIVO_S = 5
+MENSAGEM_VIVO = json.dumps({"tipo": "vivo"})
+
 
 class Transmissor:
     """Guarda a fila de cada painel conectado e distribui os eventos para elas."""
 
-    def __init__(self, tamanho_fila: int = TAMANHO_FILA_PADRAO):
+    def __init__(self, tamanho_fila: int = TAMANHO_FILA_PADRAO, intervalo_vivo_s: float = INTERVALO_VIVO_S,
+                 relogio: Callable[[], float] = time.monotonic):
+        """intervalo_vivo_s: veja INTERVALO_VIVO_S.
+
+        relogio: segundos que so andam para frente (os testes passam um relogio falso).
+        """
         if tamanho_fila < 1:
             # asyncio.Queue(maxsize=0) nao tem limite: um painel parado encheria a memoria sem ser derrubado.
             raise ValueError(f"tamanho_fila precisa ser pelo menos 1 (recebi {tamanho_fila})")
+        numero = isinstance(intervalo_vivo_s, (int, float)) and not isinstance(intervalo_vivo_s, bool)
+        if not numero or not 0 < intervalo_vivo_s < math.inf:
+            raise ValueError(f"intervalo_vivo_s precisa ser um numero maior que zero (recebi {intervalo_vivo_s!r})")
         self.tamanho_fila = tamanho_fila
+        self.intervalo_vivo_s = intervalo_vivo_s
+        self._relogio = relogio
+        self._ultima_mensagem = relogio()  # quando saiu a ultima mensagem (evento ou vivo)
         self._filas: set[asyncio.Queue] = set()
 
     @property
@@ -51,12 +72,20 @@ class Transmissor:
         self._filas.discard(fila)
 
     def publicar(self, eventos: Iterable[Evento]) -> None:
-        """Poe cada evento, como JSON {"tipo", "sinal"}, na fila de todos os paineis conectados."""
+        """Poe cada evento, como JSON {"tipo", "sinal"}, na fila de todos os paineis conectados.
+
+        O laco do motor chama a cada ciclo que deu certo. Sem eventos: so manda {"tipo": "vivo"} se ja
+        passou `intervalo_vivo_s` desde a ultima mensagem (ciclo com eventos nunca manda vivo).
+        """
+        eventos = list(eventos)
+        agora = self._relogio()
+        if not eventos and agora - self._ultima_mensagem < self.intervalo_vivo_s:
+            return
+        self._ultima_mensagem = agora
         if not self._filas:
             return
-        mensagens = [json.dumps({"tipo": e.tipo, "sinal": e.sinal}) for e in eventos]  # uma vez so, para todos
-        if not mensagens:
-            return
+        # Cada mensagem e montada uma vez so, para todos os paineis.
+        mensagens = [json.dumps({"tipo": e.tipo, "sinal": e.sinal}) for e in eventos] or [MENSAGEM_VIVO]
         for fila in list(self._filas):  # copia: derrubar um painel mexe no conjunto
             try:
                 for mensagem in mensagens:

@@ -6,7 +6,6 @@ rotas /api e o WebSocket continuam funcionando com o painel montado em /, todo c
 um controle no painel e o JavaScript nao usa o que as regras do projeto proibem.
 """
 
-import base64
 import dataclasses
 import json
 import re
@@ -25,8 +24,7 @@ from scanner.api import criar_app
 from scanner.armazenamento import Banco
 from scanner.filtros import Filtros
 from scanner.motor import chave_de, texto_da_chave
-from tests.fabricas import motor_falso
-from tests.test_api import ClienteDoPainel
+from tests.fabricas import ClienteDoPainel, basic, motor_falso
 
 # Horario do estado criado pelo motor_falso (as pontas "chegaram" em t = 10 s).
 AGORA = 10.0
@@ -76,11 +74,6 @@ def cliente(motor, banco):
 @pytest.fixture
 def cliente_com_senha(motor, banco):
     return montar_cliente(motor, banco, painel={"usuario": "jr", "senha": "segredo"})
-
-
-def basic(usuario: str, senha: str) -> dict:
-    """O cabecalho Authorization de uma conexao WebSocket (o TestClient so monta o do HTTP sozinho)."""
-    return {"Authorization": "Basic " + base64.b64encode(f"{usuario}:{senha}".encode()).decode()}
 
 
 def ler(nome: str) -> str:
