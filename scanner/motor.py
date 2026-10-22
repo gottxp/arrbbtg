@@ -36,7 +36,8 @@ thread propria, e juntadas as amostras novas da memoria quando a recarga termina
 
 Historico pelos tickers (Task 18; especificacao, secao 3, "De onde vem as amostras das metricas"): com
 `historico_tickers` ligado, todo par com ticker valido nas duas pontas (spot x futuro e futuro x futuro, nas duas
-direcoes) ganha uma amostra pelos tickers a cada `amostra_ticker_s`: A e F do melhor bid/ask, com as mesmas
+direcoes) ganha uma amostra pelos tickers a cada `amostra_ticker_s` (mais com periodo longo, para a memoria nao
+crescer com o periodo: veja _intervalo_ticker_s): A e F do melhor bid/ask, com as mesmas
 conversoes do resto do motor (spreads_pelos_tickers). Uma fonte por vez: enquanto o par e candidato (livro aberto
 nas duas pontas), a amostra vem do livro a cada `amostra_s`, como antes. As duas vao para a mesma janela; o lote
 medio vem so do livro. As amostras pelos tickers ficam so na memoria (nem banco, nem grafico, nem recarga). Os
@@ -48,6 +49,7 @@ import logging
 import math
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -517,7 +519,9 @@ class Motor:
         self._recarga: _Recarga | None = None  # recarga das janelas pelo banco em andamento
         self._periodo_h = cfg.periodo_metricas_h  # periodo em uso (a sessao pode trocar)
         self.gerenciador = GerenciadorSinais(cfg.anti_repeticao_s, self._periodo_h)
-        self._historicos: dict[tuple, _Historico] = {}  # chave do sinal -> amostras do periodo
+        # Chave do sinal -> amostras do periodo, na ordem da ultima amostra (a mais velha primeiro: cada amostra nova
+        # leva a chave para o fim). Assim o teto (_respeitar_teto) acha o mais antigo sem livro sem olhar todos.
+        self._historicos: OrderedDict[tuple, _Historico] = OrderedDict()
         self._amostras_pendentes: list[tuple] = []  # amostras novas que `ciclo` ainda vai gravar no banco
         self._ultimo_visto: float | None = None  # quando o motor anotou no banco pela ultima vez os sinais vistos
         self._ultima_vez_acima: dict[tuple, float] = {}  # etapa 2: combo -> ultima vez acima do spread minimo
@@ -927,18 +931,31 @@ class Motor:
         historico = self._historicos.get(chave) or self._novo_historico()
         historico.adicionar(ts, a, f, lote_long, lote_short)
         self._historicos[chave] = historico
+        self._historicos.move_to_end(chave)
 
     def _novo_historico(self) -> _Historico:
         """Historico vazio com o periodo em uso e o peso das amostras pelos tickers."""
         return _Historico(self._periodo_h * SEGUNDOS_POR_HORA, self._peso_ticker())
 
+    def _intervalo_ticker_s(self) -> float:
+        """De quanto em quanto tempo cada par sem livro ganha uma amostra pelos tickers, com o periodo em uso.
+
+        max(amostra_ticker_s, periodo / amostras_ticker_por_periodo): com periodo de 4 h, 120 s; com 24 h, 720 s.
+        Assim a janela de um par sem livro guarda no maximo amostras_ticker_por_periodo amostras pelos tickers e a
+        memoria dos historicos nao cresce com o periodo escolhido no painel (so a resolucao do ticker diminui).
+        O rodizio e o peso (_peso_ticker) usam este mesmo intervalo. Os pesos de dois periodos nunca se misturam
+        numa janela: trocar o periodo recomeca todas as janelas (_ajustar_sessao) e a recarga usa o periodo novo.
+        """
+        periodo_s = self._periodo_h * SEGUNDOS_POR_HORA
+        return max(self.cfg.amostra_ticker_s, periodo_s / self.cfg.amostras_ticker_por_periodo)
+
     def _peso_ticker(self) -> float:
         """Quantas amostras do livro uma amostra pelos tickers vale nas medias: o tempo que ela cobre.
 
-        O livro amostra a cada amostra_s e o ticker a cada amostra_ticker_s (ex.: 120 / 5 = 24). Assim uma hora sem
-        livro pesa o mesmo que uma hora com livro, e o F medio e o do periodo inteiro (especificacao, secao 3).
+        O livro amostra a cada amostra_s e o ticker a cada _intervalo_ticker_s (ex.: 120 / 5 = 24 com 4 h). Assim uma
+        hora sem livro pesa o mesmo que uma hora com livro, e o F medio e o do periodo inteiro (especificacao, secao 3).
         """
-        return self.cfg.amostra_ticker_s / self.cfg.amostra_s
+        return self._intervalo_ticker_s() / self.cfg.amostra_s
 
     # --- Sessao --------------------------------------------------------------
 
@@ -1013,6 +1030,10 @@ class Motor:
                     else:
                         carregado.adicionar(ts, a, f, lote_long, lote_short)
             self._historicos[chave] = carregado
+        if recarga.historicos:  # as do banco entraram fora da ordem da ultima amostra: arruma uma vez (rapido)
+            self._historicos = OrderedDict(sorted(
+                self._historicos.items(),
+                key=lambda item: item[1].ultima_amostra if item[1].ultima_amostra is not None else -math.inf))
         registro.info("janelas do periodo (%gh) recarregadas do banco: %d combinacoes, %d amostras, em %.1f s",
                       self._periodo_h, len(recarga.historicos), recarga.amostras, recarga.duracao_s())
 
@@ -1256,6 +1277,7 @@ class Motor:
         ultima = historico.ultima_amostra
         if ultima is None or agora - ultima >= self.cfg.amostra_s or (historico.ultima_pelo_ticker and agora > ultima):
             historico.adicionar(agora, a, f, lote_long, lote_short)
+            self._historicos.move_to_end(chave)
             self._amostras_pendentes.append((chave, agora, a, f, preco_long, preco_short, lote_long, lote_short))
         return historico
 
@@ -1271,10 +1293,11 @@ class Motor:
         """Rodizio: as amostras pelos tickers do pedaco de agora. Devolve que fracao da volta o rodizio andou.
 
         A lista de combinacoes (todas as dos mercados com ticker guardado, como na etapa 2) e percorrida em ordem,
-        no ritmo de uma volta inteira a cada `amostra_ticker_s`: cada ciclo visita so as que cabem no tempo que
-        passou desde o anterior (ex.: 76 mil pares, 120 s e ciclo de 0,5 s = ~320 por ciclo). Assim cada par e
-        visitado uma vez por `amostra_ticker_s`, sem pico. Depois de um laco parado (ex.: PC suspenso), o rodizio
-        anda no maximo `amostra_s` de uma vez: os pares que ficaram para tras sao amostrados na volta seguinte.
+        no ritmo de uma volta inteira a cada _intervalo_ticker_s (amostra_ticker_s, ou mais com periodo longo): cada
+        ciclo visita so as que cabem no tempo que passou desde o anterior (ex.: 76 mil pares, 120 s e ciclo de 0,5 s
+        = ~320 por ciclo). Assim cada par e visitado uma vez por intervalo, sem pico. Depois de um laco parado (ex.:
+        PC suspenso), o rodizio anda no maximo `amostra_s` de uma vez: os que ficaram para tras sao amostrados na volta
+        seguinte.
         mercados: os de estado.mercados() deste ciclo (lidos uma vez so em `candidatos`).
         Em cada par visitado:
         - candidato agora (`vistas`, livro aberto): pula, a amostra vem do livro;
@@ -1288,7 +1311,7 @@ class Motor:
         ultimo, self._rodizio_ultimo = self._rodizio_ultimo, agora
         passo = self.cfg.ciclo_ms / 1000 if ultimo is None else agora - ultimo
         passo = min(max(passo, 0.0), self.cfg.amostra_s)  # relogio para tras: nao anda; laco parado: amostra_s
-        fracao = passo / self.cfg.amostra_ticker_s
+        fracao = passo / self._intervalo_ticker_s()  # o mesmo intervalo do peso
         if not n:
             return fracao
         inicio = self._rodizio_posicao % n  # a lista pode ter mudado de tamanho desde o ciclo anterior
@@ -1328,19 +1351,26 @@ class Motor:
         if historico.ultima_amostra is not None and agora - historico.ultima_amostra < self.cfg.amostra_s:
             return
         historico.adicionar_pelo_ticker(agora, *spreads)
+        self._historicos.move_to_end(chave)
 
     def _respeitar_teto(self, vistas: set) -> None:
         """Acima de `max_historicos` (so acontece com candidatos novos): saem os mais antigos sem livro.
 
         "Mais antigo" = a ultima amostra mais velha (ex.: par cujo ticker parou de chegar). Os candidatos de agora
-        (`vistas`) nunca saem: o sinal precisa do historico deles.
+        (`vistas`) nunca saem: o sinal precisa do historico deles. `_historicos` ja esta nessa ordem (a mais velha
+        primeiro), entao basta andar do comeco ate juntar `excesso` chaves sem livro (no teto de 80 mil, com
+        candidatos novos chegando, isto custava ~11 ms por ciclo olhando todos; agora so os primeiros).
         """
         excesso = len(self._historicos) - self.cfg.max_historicos
         if excesso <= 0:
             return
-        sem_livro = ((h.ultima_amostra if h.ultima_amostra is not None else -math.inf, chave)
-                     for chave, h in self._historicos.items() if chave not in vistas)
-        for _, chave in heapq.nsmallest(excesso, sem_livro):
+        saem = []
+        for chave in self._historicos:
+            if chave not in vistas:
+                saem.append(chave)
+                if len(saem) == excesso:
+                    break
+        for chave in saem:
             del self._historicos[chave]
         self._avisar_teto()
 
@@ -1356,7 +1386,7 @@ class Motor:
         conferir todos a cada ciclo custaria dezenas de ms.
 
         Anda no ritmo do rodizio (`fracao` da volta por ciclo) sobre uma copia das chaves, refeita a cada volta: o
-        historico de um par que sumiu sai no maximo ~2 x `amostra_ticker_s` depois de ficar vazio (o que nasceu
+        historico de um par que sumiu sai no maximo ~2 intervalos do rodizio depois de ficar vazio (o que nasceu
         depois da copia espera a volta seguinte). Com ate VARREDURA_MINIMA historicos, confere todos a cada ciclo,
         como antes.
         """

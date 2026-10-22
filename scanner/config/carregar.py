@@ -61,8 +61,12 @@ class Config:
     # bid/ask) a cada amostra_ticker_s, so na memoria, na mesma janela das amostras do livro. Desligado: como antes
     # (metricas so do tempo com livro aberto).
     historico_tickers: bool = True
-    # Intervalo das amostras pelos tickers de cada par, em segundos (no minimo amostra_s).
+    # Intervalo das amostras pelos tickers de cada par, em segundos (no minimo amostra_s). Com periodo maior, o
+    # intervalo cresce para a janela guardar no maximo amostras_ticker_por_periodo amostras pelos tickers.
     amostra_ticker_s: float = 120
+    # Quantas amostras pelos tickers cabem numa janela do periodo: intervalo = max(amostra_ticker_s, periodo / isto).
+    # Assim a memoria dos historicos e a mesma em qualquer periodo (4 h: 120 s; 24 h: 720 s).
+    amostras_ticker_por_periodo: int = 120
     # Maximo de historicos (combinacoes com amostras na memoria). No teto, par novo nao ganha historico pelos
     # tickers; o par que abre livro sempre ganha, e sai o mais antigo sem livro.
     max_historicos: int = 80_000
@@ -418,7 +422,8 @@ def _validar_campo(campo: str, valor):
             raise ErroConfig(f"historico_tickers: use true (ligado) ou false (desligado); valor recebido: {valor!r}")
         return valor
     if campo in ("dias_logs", "mensagens_sem_bid_ask", "livros_reservados_limite_mercado",
-                 "max_livros_farm_por_mercado", "max_historicos", *CAMPOS_INTEIROS_LIGHTER):
+                 "max_livros_farm_por_mercado", "max_historicos", "amostras_ticker_por_periodo",
+                 *CAMPOS_INTEIROS_LIGHTER):
         if not _inteiro_positivo(valor):
             raise ErroConfig(f"{campo}: precisa ser um numero inteiro maior que zero (valor recebido: {valor!r})")
         return valor
@@ -492,9 +497,10 @@ def _conferir_amostra_ticker(config: Config) -> None:
     """A amostra pelos tickers cobre amostra_ticker_s; com menos que amostra_s ela seria mais densa que a do livro.
 
     O motor nunca poe duas amostras do mesmo par a menos de amostra_s uma da outra, e cada amostra pelo ticker pesa
-    amostra_ticker_s / amostra_s amostras do livro nas medias: abaixo de 1, o peso nao bateria com o tempo coberto.
+    o intervalo dela / amostra_s amostras do livro nas medias: abaixo de 1, o peso nao bateria com o tempo coberto.
+    So vale com historico_tickers ligado (desligado, amostra_ticker_s nao e usado).
     """
-    if config.amostra_ticker_s < config.amostra_s:
+    if config.historico_tickers and config.amostra_ticker_s < config.amostra_s:
         raise ErroConfig(f"amostra_ticker_s ({config.amostra_ticker_s}) precisa ser maior ou igual a amostra_s "
                          f"({config.amostra_s}): a amostra pelos tickers e a mais espacada das duas")
 

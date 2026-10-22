@@ -1279,7 +1279,10 @@ def _cenario_de_escala(modo: str, farm=("c7", "c8"), ativos_farm=400, ciclos=8) 
         motor.ciclo(agora)
         motor.selecao_livros(agora)
         tempos.append((time.perf_counter() - inicio) * 1000)
-    return {"livros": len(com_livro), "calculadas": motor.quantidade_historicos(),
+    # "calculadas" = combinacoes calculadas pelo livro neste ciclo (os candidatos). Nao e quantidade_historicos():
+    # com o historico pelos tickers (Task 18), ela conta tambem os pares amostrados pelo rodizio, e com mais ciclos
+    # chegaria perto de todos os pares nos dois modos, escondendo a volta do N1.
+    return {"livros": len(com_livro), "calculadas": len(motor.candidatos(agora)),
             "mediana_ms": statistics.median(tempos)}
 
 

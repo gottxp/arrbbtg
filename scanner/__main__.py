@@ -34,6 +34,7 @@ Com --validar, so confere o config.yaml e sai (nao conecta em nada).
 import argparse
 import asyncio
 import functools
+import gc
 import logging
 import sys
 import time
@@ -68,6 +69,9 @@ registro = logging.getLogger("scanner.principal")
 INTERVALO_LOG_SINAIS_S = 60
 # Quanto o resumo do dia espera o escritor gravar a ultima leitura das corretoras antes de ler o banco (segundos).
 ESPERA_ESCRITOR_RESUMO_S = 10
+# Coletor de lixo do Python (gc), com o historico pelos tickers ligado: de quanto em quanto tempo o laco do motor
+# recolhe o lixo de uma vez e congela o que sobrou (veja _recolher_e_congelar_lixo). Detalhe tecnico, em segundos.
+INTERVALO_CONGELAR_GC_S = 300
 
 
 def configurar_log(cfg: Config) -> None:
@@ -391,6 +395,21 @@ async def _servir_painel(app, cfg: Config) -> None:
         registro.error("o painel parou (%s: %s); o scanner segue sem painel ate reiniciar", type(erro).__name__, erro)
 
 
+def _recolher_e_congelar_lixo() -> None:
+    """Recolhe todo o lixo do Python de uma vez e congela os objetos que sobraram (gc.freeze).
+
+    Por que: com o historico pelos tickers o motor guarda dezenas de milhares de janelas que vivem horas (~500 mil
+    objetos). A coleta completa do gc percorre todos os objetos e, assim, parava o laco ~150 ms a cada poucos
+    segundos. Congelados, eles ficam fora das coletas seguintes, que so olham os objetos novos (~17 ms, medido).
+    Descongelar antes de recolher faz o lixo em ciclo que ficou entre os congelados ser apagado tambem (ele so
+    espera ate a proxima vez, nunca fica para sempre). Esta chamada custa uma coleta completa (~110-150 ms) a cada
+    INTERVALO_CONGELAR_GC_S. Objeto congelado que deixa de ser usado continua sendo apagado na hora, como sempre.
+    """
+    gc.unfreeze()
+    gc.collect()
+    gc.freeze()
+
+
 async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorDoScanner], cfg: Config,
                          relogio: Callable[[], float], ciclos: int | None,
                          publicar: Callable[[list[Evento]], None] | None = None,
@@ -405,6 +424,8 @@ async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorDoScanner], c
     tempos: anota quanto cada ciclo levou (calculo + etapa 2), para a linha "recursos:" do log.
     Erro no ciclo (sinais) e erro na etapa 2 (escolha dos livros) sao separados: um nao impede o
     outro; vai para o log e o proximo ciclo tenta de novo.
+    Com o historico pelos tickers ligado, a cada INTERVALO_CONGELAR_GC_S o laco tambem recolhe e congela o lixo
+    do Python (_recolher_e_congelar_lixo); esse tempo entra no tempo do ciclo. Ao sair, descongela.
     """
     intervalo_s = cfg.ciclo_ms / 1000
     relogio_do_laco = asyncio.get_running_loop().time  # relogio que nao pula (so para marcar o ritmo)
@@ -413,6 +434,8 @@ async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorDoScanner], c
     ajustes: dict[str, asyncio.Task] = {}  # corretora -> ajuste de livros em andamento
     com_traceback: set[str] = set()  # corretoras cujo erro de ajuste ja saiu com traceback no log
     feitos = 0
+    congelar_gc = bool(motor.cfg.historico_tickers)
+    ultimo_gc: float | None = None  # quando o laco recolheu e congelou o lixo pela ultima vez (relogio do laco)
     try:
         while ciclos is None or feitos < ciclos:
             await asyncio.sleep(max(0.0, proximo - relogio_do_laco()))
@@ -432,6 +455,15 @@ async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorDoScanner], c
                 registro.exception("erro na etapa 2 (escolha dos livros); tentando de novo no proximo ciclo")
             else:
                 _iniciar_ajustes(coletores, selecao, ajustes, com_traceback)
+            if congelar_gc:
+                if ultimo_gc is None:
+                    ultimo_gc = relogio_do_laco()  # o primeiro so depois de um intervalo: as janelas ja existem
+                elif relogio_do_laco() - ultimo_gc >= INTERVALO_CONGELAR_GC_S:
+                    ultimo_gc = relogio_do_laco()
+                    try:
+                        _recolher_e_congelar_lixo()
+                    except Exception:
+                        registro.exception("erro ao recolher o lixo do Python; o motor segue")
             if tempos is not None:
                 tempos.registrar((time.perf_counter() - inicio_do_ciclo) * 1000)
             feitos += 1
@@ -439,6 +471,8 @@ async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorDoScanner], c
                 ultimo_log = agora
                 registro.info("sinais ativos: %d", len(motor.sinais_ativos()))
     finally:
+        if congelar_gc:
+            gc.unfreeze()  # os objetos congelados voltam para o coletor normal
         for tarefa in ajustes.values():
             tarefa.cancel()
         await asyncio.gather(*ajustes.values(), return_exceptions=True)

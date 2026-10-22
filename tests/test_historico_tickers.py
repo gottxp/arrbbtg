@@ -7,8 +7,11 @@ fontes vao para a mesma janela; o lote medio vem so do livro; as amostras pelos 
 Nenhum teste acessa a internet.
 """
 
+import asyncio
+import gc
 import logging
 import math
+import weakref
 import os
 import subprocess
 import sys
@@ -17,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+import scanner.__main__ as principal
 import scanner.motor as modulo_motor
 from scanner.armazenamento import Banco
 from scanner.calculo import spread_abertura, spread_fechamento
@@ -62,6 +66,15 @@ def abrir_livro(estado, corretora, mercado, ativo, bid, ask, agora, lote_usd=100
     """O livro da ponta (um nivel por lado, `lote_usd` em cada um), como o coletor poria na etapa 2."""
     estado.atualizar_livro(Livro(corretora, mercado, simbolo_de(mercado, ativo), [(bid, lote_usd / bid)],
                                  [(ask, lote_usd / ask)], agora, None), ativo=ativo)
+
+
+def cfg_ticker(amostra_ticker_s, **campos):
+    """Config de teste com uma amostra pelo ticker a cada `amostra_ticker_s` em qualquer periodo.
+
+    amostras_ticker_por_periodo bem grande: o intervalo nao aumenta com o periodo (veja
+    test_intervalo_pelo_ticker_acompanha_o_periodo para essa regra).
+    """
+    return cfg_com(amostra_ticker_s=amostra_ticker_s, amostras_ticker_por_periodo=10**9, **campos)
 
 
 def novo_motor(config=None, cotacoes=None, banco=None):
@@ -169,7 +182,7 @@ def combos_de_todos(corretoras=SEIS, ativos=DOIS_ATIVOS):
 
 
 def test_rodizio_amostra_cada_par_uma_vez_por_amostra_ticker_s_sem_pico():
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=60))
+    m, estado = novo_motor(cfg_ticker(60))
     combos = combos_de_todos()  # 2 ativos x 6 corretoras x 5 = 60 pares futuro x futuro, sem livro
     assert len(combos) == 60
     antes, por_ciclo = 0, []
@@ -190,13 +203,55 @@ def test_rodizio_amostra_cada_par_uma_vez_por_amostra_ticker_s_sem_pico():
 def test_rodizio_depois_de_um_laco_parado_nao_faz_tudo_de_uma_vez():
     # O laco parou 1000 s (PC suspenso): o ciclo seguinte so anda amostra_s de rodizio (60 x 5 / 60 = 5 pares),
     # em vez de amostrar todos os 60 de uma vez. Os que ficaram para tras sao amostrados na volta seguinte.
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=60))
+    m, estado = novo_motor(cfg_ticker(60))
     tickers_de_todos(estado, 1000.0)
     m.ciclo(1000.0)
     antes = total_pelo_ticker(m)
     tickers_de_todos(estado, 2000.0)
     m.ciclo(2000.0)
     assert total_pelo_ticker(m) - antes <= 5
+
+
+def intervalos_pelo_ticker(m, estado, periodo_h, duracao_s, config=None):
+    """Roda `duracao_s` so com tickers (gate x mexc), com o periodo `periodo_h` na sessao; devolve os horarios."""
+    m.sessao = Sessao(filtros=Filtros(periodo_metricas_h=periodo_h))
+    rodar_fases(m, estado, [(duracao_s, False)])
+    return pelo_ticker(amostras_de(m, GATE_MEXC))
+
+
+@pytest.mark.parametrize("periodo_h, intervalo_s", [
+    (0.02, 10),   # 72 s / 12 = 6 s, menos que amostra_ticker_s: vale amostra_ticker_s (10 s)
+    (0.1, 30),    # 360 s / 12 = 30 s
+    (0.2, 60),    # 720 s / 12 = 60 s
+])
+def test_intervalo_pelo_ticker_acompanha_o_periodo(periodo_h, intervalo_s):
+    # intervalo = max(amostra_ticker_s, periodo / amostras_ticker_por_periodo): a janela de um par sem livro guarda
+    # sempre ~amostras_ticker_por_periodo amostras, qualquer que seja o periodo (a memoria nao cresce com ele).
+    m, estado = novo_motor(cfg_com(amostra_ticker_s=10, amostras_ticker_por_periodo=12))
+    horarios = intervalos_pelo_ticker(m, estado, periodo_h, 4 * intervalo_s + 1)
+    assert len(horarios) == 4
+    assert all(abs(depois - antes - intervalo_s) <= 0.5 for antes, depois in zip(horarios, horarios[1:])), horarios
+
+
+@pytest.mark.parametrize("periodo_h", [0.1, 0.2, 0.4])
+def test_janela_pelo_ticker_tem_o_mesmo_numero_de_amostras_em_qualquer_periodo(periodo_h):
+    m, estado = novo_motor(cfg_com(amostra_ticker_s=10, amostras_ticker_por_periodo=12))
+    horarios = intervalos_pelo_ticker(m, estado, periodo_h, 2 * periodo_h * 3600)  # dois periodos: janela cheia
+    assert 11 <= len(horarios) <= 13
+
+
+def test_peso_da_amostra_pelo_ticker_e_o_intervalo_do_periodo():
+    # Periodo de 0,1 h com 12 amostras por periodo: intervalo de 30 s, cada amostra pelo ticker pesa 30 / 5 = 6
+    # amostras do livro na media.
+    m, estado = novo_motor(cfg_com(amostra_ticker_s=10, amostras_ticker_por_periodo=12))
+    m.sessao = Sessao(filtros=Filtros(periodo_metricas_h=0.1))
+    agora = rodar_fases(m, estado, [(200, False), (20, True)])
+    c = next(c for c in m.candidatos(agora - 0.5) if c.ponta_long.corretora == "gate")
+    amostras = [x for x in amostras_de(m, GATE_MEXC) if x[0] >= agora - 0.5 - 360]
+    pesos = [6.0 if x[3] is None else 1.0 for x in amostras]
+    esperado = sum(p * x[2] for p, x in zip(pesos, amostras)) / sum(pesos)
+    assert pelo_ticker(amostras) and do_livro(amostras)
+    assert c.metricas_periodo.fechamento_medio == pytest.approx(esperado)
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +277,7 @@ def rodar_fases(m, estado, fases, ciclo_s=0.5, inicio=1000.0):
 
 
 def test_uma_fonte_por_vez_com_o_livro_tendo_prioridade():
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=60))
+    m, estado = novo_motor(cfg_ticker(60))
     rodar_fases(m, estado, [(300, False), (300, True), (300, False)])  # sem livro, com livro, sem livro
     for combo in (GATE_MEXC, MEXC_GATE):
         amostras = amostras_de(m, combo)
@@ -238,7 +293,7 @@ def test_uma_fonte_por_vez_com_o_livro_tendo_prioridade():
 def test_troca_entre_livro_e_ticker_mantem_a_ordem_de_horario(caplog):
     # O livro abre e fecha a cada 7 s por 10 min, com amostra pelo ticker a cada 10 s: as duas fontes se alternam
     # o tempo todo e a janela nunca recebe amostra fora de ordem (a janela recusaria com ValueError e o log avisaria).
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=10))
+    m, estado = novo_motor(cfg_ticker(10))
     with caplog.at_level(logging.WARNING, logger="scanner"):
         rodar_fases(m, estado, [(7, i % 2 == 1) for i in range(86)])
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -252,7 +307,7 @@ def test_primeira_amostra_do_livro_e_na_hora_em_que_o_livro_abre():
     # Um par so (spot x futuro) com amostra pelo ticker a cada 5 s. O livro abre meio segundo depois de uma amostra
     # pelo ticker: a primeira do livro e na hora (como quando o par aparece), sem esperar amostra_s, e o lote medio
     # do sinal ja existe.
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=5))
+    m, estado = novo_motor(cfg_ticker(5))
     combo = ("BTC", "gate", "spot", "bitget", "futuro")
     for i in range(40):  # no maximo 20 s: com 5 s de rodizio, uma amostra pelo ticker entra antes
         agora = 1000.0 + i * 0.5
@@ -273,7 +328,7 @@ def test_primeira_amostra_do_livro_e_na_hora_em_que_o_livro_abre():
 
 
 def test_lote_medio_vem_so_das_amostras_do_livro():
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=60))
+    m, estado = novo_motor(cfg_ticker(60))
     agora = rodar_fases(m, estado, [(600, False), (20, True)])
     c = next(c for c in m.candidatos(agora - 0.5) if c.ponta_long.corretora == "gate")
     assert len(pelo_ticker(amostras_de(m, GATE_MEXC))) >= 9  # 10 min de amostras pelo ticker, sem lote
@@ -287,7 +342,7 @@ def test_lote_medio_vem_so_das_amostras_do_livro():
 
 
 def test_par_com_ticker_so_de_um_lado_nao_e_amostrado():
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=10))
+    m, estado = novo_motor(cfg_ticker(10))
     for i in range(61):
         agora = 1000.0 + i * 0.5
         por_ticker(estado, "gate", "futuro", "BTC", 99.95, 100.05, agora)  # BTC so na gate
@@ -299,7 +354,7 @@ def test_par_com_ticker_so_de_um_lado_nao_e_amostrado():
 
 @pytest.mark.parametrize("bid", [None, 0.0, -1.0, math.nan, math.inf, "99.9"])
 def test_ticker_com_preco_invalido_de_um_lado_nao_e_amostrado(bid, caplog):
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=10))
+    m, estado = novo_motor(cfg_ticker(10))
     with caplog.at_level(logging.WARNING, logger="scanner"):
         for i in range(61):
             agora = 1000.0 + i * 0.5
@@ -313,7 +368,7 @@ def test_ticker_com_preco_invalido_de_um_lado_nao_e_amostrado(bid, caplog):
 def test_ticker_velho_nao_e_amostrado():
     # O ticker da gate para de chegar em t=1010 (a conexao segue viva): passou de max_idade_livro_s (30 s), o par
     # nao e amostrado; quando ele volta, o par volta a ser amostrado.
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=60))
+    m, estado = novo_motor(cfg_ticker(60))
     for i in range(401):
         agora = 1000.0 + i * 0.5
         if agora <= 1010 or agora >= 1150:
@@ -329,7 +384,7 @@ def test_ticker_velho_nao_e_amostrado():
 
 def test_amostra_pelo_ticker_usa_a_cotacao_e_o_preco_por_unidade_do_motor():
     # Ponta em USDC com cotacao 0,99: o A e o F da amostra saem dos precos em USDT, como no candidato.
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=10), cotacoes={"USDC": 0.99})
+    m, estado = novo_motor(cfg_ticker(10), cotacoes={"USDC": 0.99})
     for i in range(41):
         agora = 1000.0 + i * 0.5
         por_ticker(estado, "hyperliquid", "futuro", "BTC", 101.0, 101.2, agora, cotacao="USDC")
@@ -341,7 +396,7 @@ def test_amostra_pelo_ticker_usa_a_cotacao_e_o_preco_por_unidade_do_motor():
 
 
 def test_amostra_pelo_ticker_sem_cotacao_usa_1_para_1_como_o_motor():
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=10))
+    m, estado = novo_motor(cfg_ticker(10))
     for i in range(41):
         agora = 1000.0 + i * 0.5
         por_ticker(estado, "hyperliquid", "futuro", "BTC", 101.0, 101.2, agora, cotacao="USDC")
@@ -352,7 +407,7 @@ def test_amostra_pelo_ticker_sem_cotacao_usa_1_para_1_como_o_motor():
 
 
 def test_spot_x_futuro_tambem_e_amostrado_pelos_tickers():
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=10))
+    m, estado = novo_motor(cfg_ticker(10))
     for i in range(41):
         agora = 1000.0 + i * 0.5
         por_ticker(estado, "gate", "spot", "BTC", 99.9, 100.0, agora)
@@ -370,7 +425,7 @@ def test_spot_x_futuro_tambem_e_amostrado_pelos_tickers():
 def test_amostras_pelos_tickers_nao_vao_ao_banco(tmp_path):
     banco = Banco(str(tmp_path / "t.db"))
     try:
-        m, estado = novo_motor(cfg_com(amostra_ticker_s=60), banco=banco)
+        m, estado = novo_motor(cfg_ticker(60), banco=banco)
         rodar_fases(m, estado, [(300, False), (30, True)])
         gravadas = {texto: [ts for ts, *_ in linhas] for texto, linhas in banco.amostras_por_combinacao(0)}
         for combo in (GATE_MEXC, MEXC_GATE):
@@ -391,7 +446,7 @@ def test_recarga_ao_trocar_o_periodo_traz_as_do_livro_e_as_dos_tickers_recomecam
     try:
         agora = 50_000.0
         gravar_do_livro(banco, GATE_MEXC, [agora - 3 * 3600, agora - 1800])
-        m, estado = novo_motor(cfg_com(amostra_ticker_s=60), banco=banco)
+        m, estado = novo_motor(cfg_ticker(60), banco=banco)
         rodar_fases(m, estado, [(600, False)], inicio=agora - 600)  # 10 min pelos tickers, na memoria
         assert len(pelo_ticker(amostras_de(m, GATE_MEXC))) >= 9
         m.sessao = Sessao(filtros=Filtros(periodo_metricas_h=1))
@@ -413,7 +468,7 @@ def test_recarga_demorada_junta_as_amostras_pelos_tickers_feitas_enquanto_ela_li
     try:
         agora = 50_000.0
         gravar_do_livro(banco, GATE_MEXC, [agora - 1800])
-        m, estado = novo_motor(cfg_com(amostra_ticker_s=60), banco=banco)
+        m, estado = novo_motor(cfg_ticker(60), banco=banco)
         soltar = threading.Event()
         segurando = threading.Event()
 
@@ -448,7 +503,7 @@ def test_recarga_ao_ligar_junta_as_do_banco_com_as_novas_pelos_tickers(tmp_path)
     try:
         agora = 50_000.0
         gravar_do_livro(banco, GATE_MEXC, [agora - 3600, agora - 1800], f=-2.0)
-        m, estado = novo_motor(cfg_com(amostra_ticker_s=60), banco=banco)
+        m, estado = novo_motor(cfg_ticker(60), banco=banco)
         m.recarregar_do_banco(agora)
         assert m.esperar_recarga(timeout=5)
         rodar_fases(m, estado, [(150, False)], inicio=agora)
@@ -465,7 +520,7 @@ def test_recarga_ao_ligar_junta_as_do_banco_com_as_novas_pelos_tickers(tmp_path)
 
 
 def test_historico_tickers_desligado_nao_amostra_pelos_tickers():
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=60, historico_tickers=False))
+    m, estado = novo_motor(cfg_ticker(60, historico_tickers=False))
     rodar_fases(m, estado, [(300, False)])
     assert m.quantidade_historicos() == 0  # como antes: sem livro, sem historico
     rodar_fases(m, estado, [(60, True), (60, False)], inicio=1300.0)
@@ -487,7 +542,7 @@ def test_testes_antigos_do_motor_passam_com_o_historico_pelos_tickers_desligado(
 
 def test_teto_de_historicos_avisa_uma_vez_e_os_mais_antigos_sem_livro_saem(caplog):
     combos = combos_de_todos(corretoras=["c0", "c1", "c2"])  # 12 pares
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=60, max_historicos=4))
+    m, estado = novo_motor(cfg_ticker(60, max_historicos=4))
     corretoras = ["c0", "c1", "c2"]
     with caplog.at_level(logging.WARNING, logger="scanner.motor"):
         primeira_volta = None
@@ -522,11 +577,64 @@ def test_teto_de_historicos_avisa_uma_vez_e_os_mais_antigos_sem_livro_saem(caplo
     assert m.quantidade_historicos() <= 4 + len(candidatos)
 
 
+def test_no_teto_sai_primeiro_o_historico_recarregado_do_banco_que_parou(tmp_path):
+    # ETH so existe no banco (amostra do livro de 1 h atras, sem ticker agora); BTC e amostrado pelos tickers. No
+    # teto, quando entram candidatos novos (SOL), sai primeiro o ETH (a ultima amostra mais velha), e nao o BTC,
+    # mesmo o ETH tendo entrado depois na memoria (pela recarga).
+    banco = Banco(str(tmp_path / "t.db"))
+    try:
+        agora = 50_000.0
+        eth = ("ETH", "gate", "futuro", "mexc", "futuro")
+        gravar_do_livro(banco, eth, [agora - 3600])
+        m, estado = novo_motor(cfg_ticker(10, max_historicos=3), banco=banco)
+        rodar_fases(m, estado, [(30, False)], inicio=agora - 30)  # BTC: 2 historicos pelos tickers
+        m.recarregar_do_banco(agora)
+        assert m.esperar_recarga(timeout=5)
+        tickers_gate_mexc(estado, agora)
+        m.ciclo(agora)  # junta a recarga: BTC x 2 + ETH = 3, o teto
+        assert chave_de(eth) in m._historicos and m.quantidade_historicos() == 3
+        for corretora in ("gate", "mexc"):
+            por_ticker(estado, corretora, "futuro", "SOL", 9.995, 10.005, agora + 1)
+            abrir_livro(estado, corretora, "futuro", "SOL", 9.995, 10.005, agora + 1)
+        tickers_gate_mexc(estado, agora + 1)
+        m.ciclo(agora + 1)  # 2 candidatos novos (SOL nas duas direcoes): saem 2 sem livro
+        assert chave_de(eth) not in m._historicos
+        assert chave_de(("SOL", "gate", "futuro", "mexc", "futuro")) in m._historicos
+        assert m.quantidade_historicos() == 3
+    finally:
+        banco.fechar()
+
+
+def test_no_teto_o_par_que_acabou_de_ter_livro_fica_e_sai_o_amostrado_ha_mais_tempo():
+    # Teto de 4: BTC e ETH (gate x mexc, duas direcoes) pelos tickers a cada 60 s. O BTC tem livro por 20 s (amostras
+    # do livro ate t=85) e fecha; em t=90 abre o livro do SOL (2 candidatos novos). Saem os 2 ETH, amostrados ha
+    # mais tempo (ultima pelo ticker antes de t=70), e nao os BTC, que acabaram de ter amostra do livro.
+    m, estado = novo_motor(cfg_ticker(60, max_historicos=4))
+    btc = [("BTC", "gate", "futuro", "mexc", "futuro"), ("BTC", "mexc", "futuro", "gate", "futuro")]
+    eth = [("ETH", "gate", "futuro", "mexc", "futuro"), ("ETH", "mexc", "futuro", "gate", "futuro")]
+    for i in range(181):  # 0 a 90 s
+        agora = 1000.0 + i * 0.5
+        for corretora, meio in (("gate", 100.0), ("mexc", 100.05)):
+            por_ticker(estado, corretora, "futuro", "BTC", meio * (1 - MEIO), meio * (1 + MEIO), agora)
+            por_ticker(estado, corretora, "futuro", "ETH", meio * (1 - MEIO) / 10, meio * (1 + MEIO) / 10, agora)
+            if 1070 <= agora < 1090:
+                abrir_livro(estado, corretora, "futuro", "BTC", meio * (1 - MEIO), meio * (1 + MEIO), agora)
+            else:
+                estado.remover_livro(corretora, "futuro", "BTC")
+            if agora >= 1090:
+                por_ticker(estado, corretora, "futuro", "SOL", 9.995, 10.005, agora)
+                abrir_livro(estado, corretora, "futuro", "SOL", 9.995, 10.005, agora)
+        m.ciclo(agora)
+    assert all(chave_de(c) in m._historicos for c in btc)
+    assert not any(chave_de(c) in m._historicos for c in eth)
+    assert all(do_livro(amostras_de(m, c)) for c in btc)
+
+
 def test_historico_do_par_que_some_e_apagado_depois_do_periodo(monkeypatch):
     # Com muitos historicos a limpeza anda aos poucos (um pedaco por ciclo); aqui o pedaco minimo fica em 1 para
     # o teste passar por esse caminho com poucos pares.
     monkeypatch.setattr(modulo_motor, "VARREDURA_MINIMA", 1)
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=60, periodo_metricas_h=0.1))  # periodo de 6 min
+    m, estado = novo_motor(cfg_ticker(60, periodo_metricas_h=0.1))  # periodo de 6 min
     corretoras = ["c0", "c1", "c2"]
     agora = 1000.0
     for i in range(240):  # 2 min com os tickers chegando
@@ -545,7 +653,7 @@ def test_historico_do_par_que_some_e_apagado_depois_do_periodo(monkeypatch):
 def test_modo_farm_continua_aquecendo_as_combinacoes_sem_ponta_de_farm_pelos_tickers():
     # No Farm o calculo so passa pelas combinacoes com ponta de farm; as outras, mesmo com livro aberto, nao sao
     # candidatas e seguem amostradas pelos tickers (o F medio delas fica pronto para quando o modo voltar).
-    m, estado = novo_motor(cfg_com(amostra_ticker_s=10, corretoras_farm=["lighter"]))
+    m, estado = novo_motor(cfg_ticker(10, corretoras_farm=["lighter"]))
     m.sessao = Sessao(modo="farm")
     for i in range(61):
         agora = 1000.0 + i * 0.5
@@ -561,6 +669,61 @@ def test_modo_farm_continua_aquecendo_as_combinacoes_sem_ponta_de_farm_pelos_tic
 
 
 # ---------------------------------------------------------------------------
+# Coletor de lixo do Python (revisao, M1): dezenas de milhares de janelas que vivem horas
+# ---------------------------------------------------------------------------
+
+
+class _NoDeCiclo:
+    """Objeto que aponta para si mesmo: so o coletor de lixo (gc) consegue apagar."""
+
+    def __init__(self):
+        self.eu = self
+
+
+def test_recolher_e_congelar_lixo_apaga_o_lixo_em_ciclo_e_congela_o_resto():
+    lixo = _NoDeCiclo()
+    morto = weakref.ref(lixo)
+    vivo = _NoDeCiclo()
+    del lixo
+    gc.freeze()  # o lixo ja estava congelado (de uma vez anterior): descongelar antes de recolher e o que o apaga
+    try:
+        principal._recolher_e_congelar_lixo()
+        assert morto() is None
+        assert gc.get_freeze_count() > 0 and vivo.eu is vivo
+    finally:
+        gc.unfreeze()
+
+
+def laco_com_gc(monkeypatch, config, ciclos=4):
+    chamadas = []
+    monkeypatch.setattr(principal, "INTERVALO_CONGELAR_GC_S", 0)
+    monkeypatch.setattr(principal, "_recolher_e_congelar_lixo", lambda: chamadas.append(1))
+    m, _ = novo_motor(config)
+    asyncio.run(principal._laco_do_motor(m, {}, config, lambda: 10.0, ciclos=ciclos))
+    return chamadas
+
+
+def test_laco_do_motor_recolhe_e_congela_o_lixo_de_tempos_em_tempos(monkeypatch):
+    # O primeiro ciclo so marca o horario; depois, a cada INTERVALO_CONGELAR_GC_S (aqui 0: todo ciclo).
+    assert len(laco_com_gc(monkeypatch, cfg_com(ciclo_ms=10))) == 3
+
+
+def test_laco_do_motor_sem_historico_pelos_tickers_nao_mexe_no_gc(monkeypatch):
+    assert laco_com_gc(monkeypatch, cfg_com(ciclo_ms=10, historico_tickers=False)) == []
+
+
+def test_laco_do_motor_descongela_ao_terminar(monkeypatch):
+    monkeypatch.setattr(principal, "INTERVALO_CONGELAR_GC_S", 0)
+    config = cfg_com(ciclo_ms=10)
+    m, _ = novo_motor(config)
+    try:
+        asyncio.run(principal._laco_do_motor(m, {}, config, lambda: 10.0, ciclos=3))
+        assert gc.get_freeze_count() == 0
+    finally:
+        gc.unfreeze()
+
+
+# ---------------------------------------------------------------------------
 # Config, README e config.yaml
 # ---------------------------------------------------------------------------
 
@@ -570,13 +733,23 @@ def test_campos_novos_com_os_padroes():
     assert padrao.historico_tickers is True
     assert padrao.amostra_ticker_s == 120
     assert padrao.max_historicos == 80_000
+    assert padrao.amostras_ticker_por_periodo == 120
+
+
+def test_com_o_historico_desligado_amostra_ticker_s_menor_que_amostra_s_nao_e_erro(tmp_path):
+    # A conferencia amostra_ticker_s >= amostra_s so vale com historico_tickers ligado (M5 da revisao).
+    caminho = tmp_path / "config.yaml"
+    caminho.write_text("historico_tickers: false\namostra_ticker_s: 2\n", encoding="utf-8")
+    assert carregar_config(str(caminho)).amostra_ticker_s == 2
 
 
 def test_campos_novos_lidos_do_yaml(tmp_path):
     caminho = tmp_path / "config.yaml"
-    caminho.write_text("historico_tickers: false\namostra_ticker_s: 60\nmax_historicos: 5000\n", encoding="utf-8")
+    caminho.write_text("historico_tickers: false\namostra_ticker_s: 60\nmax_historicos: 5000\n"
+                       "amostras_ticker_por_periodo: 240\n", encoding="utf-8")
     lida = carregar_config(str(caminho))
-    assert (lida.historico_tickers, lida.amostra_ticker_s, lida.max_historicos) == (False, 60, 5000)
+    assert (lida.historico_tickers, lida.amostra_ticker_s, lida.max_historicos, lida.amostras_ticker_por_periodo) == (
+        False, 60, 5000, 240)
 
 
 @pytest.mark.parametrize("texto, campo", [
@@ -586,6 +759,9 @@ def test_campos_novos_lidos_do_yaml(tmp_path):
     ("amostra_ticker_s: -60", "amostra_ticker_s"),
     ("max_historicos: 0", "max_historicos"),
     ("max_historicos: 10.5", "max_historicos"),
+    ("amostras_ticker_por_periodo: 0", "amostras_ticker_por_periodo"),
+    ("amostras_ticker_por_periodo: 12.5", "amostras_ticker_por_periodo"),
+    ("amostras_ticker_por_periodo: true", "amostras_ticker_por_periodo"),
     ("amostra_ticker_s: 2", "amostra_ticker_s"),  # menor que amostra_s (5): o ticker amostraria mais que o livro
 ])
 def test_campos_novos_invalidos_dao_erro_claro(tmp_path, texto, campo):
@@ -602,3 +778,7 @@ def test_readme_explica_as_metricas_pelos_tickers_e_os_historicos_da_linha_de_re
     assert "pelos tickers" in painel and "melhor bid/ask" in painel
     assert "o gráfico só mostra as amostras do livro" in painel
     assert "historicos N" in texto and "max_historicos" in texto
+    # Revisao: a memoria nao cresce com o periodo; trocar o periodo refaz as metricas aos poucos; resolucao do ticker.
+    assert "qualquer período" in texto
+    assert "levam até um período inteiro para se refazer" in painel
+    assert "média dos 10 maiores" in painel and "duração mínima" in painel

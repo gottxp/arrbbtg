@@ -326,7 +326,7 @@ Faça os marcos nesta ordem. Os comandos são do Windows (PowerShell, na pasta `
    | `lighter: N perpetuos ativos; M inativos ficam de fora` | ao ligar |
    | `painel em http://127.0.0.1:8000` | ao ligar |
    | `sinais ativos: N` | a cada minuto, sem buracos |
-   | `recursos: memoria ... MB (atual), CPU ...%, ..., ciclo medio N ms (maior M ms), banco N MB, fila do banco N` e `descartes nos ultimos 300s: ...` | a cada 5 minutos. O `maior` do ciclo tem que ficar abaixo de 500 e a `fila do banco` perto de 0 |
+   | `recursos: memoria ... MB (atual), CPU ...%, ..., ciclo medio N ms (maior M ms), banco N MB, fila do banco N` e `descartes nos ultimos 300s: ...` | a cada 5 minutos. O `maior` do ciclo tem que ficar abaixo de 500 (a cada 5 minutos um ciclo leva ~0,2 s a mais: é a limpeza da memória do Python) e a `fila do banco` perto de 0 |
    | `mexc: limite de 30 assinaturas no spot (limites_assinatura_mercado), 10 delas para os livros: N de M pares ficaram fora dos tickers` | ao ligar (é o esperado; veja o [aviso A](#aviso-a-mexc-futuros-um-par-por-assinatura)) |
    | `kraken: N pares cotados em outras moedas ficam de fora (EUR ..., GBP ...)` | ao ligar (é o esperado: o scanner só compara preços em USDT, USDC, USDG e USD) |
    | `janelas do periodo (4h) recarregadas do banco: N combinacoes, M amostras, em X s` | ao ligar, depois de alguns segundos (na primeira vez, 0 combinações) |
@@ -408,7 +408,7 @@ Com o scanner ligado, abra <http://localhost:8000> e confira:
    INFO scanner.principal: recursos: memoria 282.4 MB (atual), CPU 9.1%, sinais ativos 4, historicos 21350
    ```
 
-   `historicos N` = pares com amostras do período na memória (pelos tickers e pelo livro); no máximo `max_historicos` (80000, ~400 MB). Cada par sem livro ocupa ~5 KB (4 h de amostras a cada 120 s).
+   `historicos N` = pares com amostras do período na memória (pelos tickers e pelo livro); no máximo `max_historicos` (80000, ~400 MB em qualquer período). Cada par sem livro ocupa ~5 KB: guarda no máximo 120 amostras pelos tickers (`amostras_ticker_por_periodo`), a cada 120 s com o período de 4 h e mais espaçadas com período maior (24 h: a cada 12 min).
 
    Esperado: uma linha a cada 5 minutos, sem buraco; a memória e o `historicos N` sobem nas primeiras 4 horas e depois ficam estáveis (não crescem o dia todo). `memoria indisponivel`: veja o [aviso F](#aviso-f-memória-no-windows).
 
@@ -652,7 +652,7 @@ Verde = positivo; vermelho = negativo. Linha com faixa amarela à esquerda = fix
   - modo Farm: `Custo a cada $1.000` de volume (vermelho = você gasta; verde = você ganha).
 - **Histórico (4h)**:
   - `N invertidas` no período;
-  - `A` e `F` médios do período. Contam o período inteiro: o tempo com livro aberto (amostra do livro a cada 5 s) e o tempo sem livro, pelos tickers (melhor bid/ask, amostra a cada 120 s, `amostra_ticker_s`). Cada amostra pesa o tempo que cobre;
+  - `A` e `F` médios do período. Contam o período inteiro: o tempo com livro aberto (amostra do livro a cada 5 s) e o tempo sem livro, pelos tickers (melhor bid/ask, amostra a cada 120 s com o período de 4 h; com período maior, a cada período / 120). Cada amostra pesa o tempo que cobre;
   - botão de gráfico: abre o gráfico do par.
 - **Fixar** (alfinete, última coluna): leva o sinal para o topo; fica salvo no grupo.
 
@@ -688,8 +688,9 @@ Verde = positivo; vermelho = negativo. Linha com faixa amarela à esquerda = fix
 - `Funding sincronizado` só confere se as pontas têm o mesmo intervalo de cobrança (não o horário da próxima cobrança).
 - O gráfico do histórico mostra as amostras até uns 10 s atrás: o banco grava as amostras em lotes de 10 s (escreve menos no disco). A tabela ao vivo não tem esse atraso.
 - No modo Farm o scanner só calcula as combinações com uma ponta numa corretora de farm (e as moedas do **Sempre mostrar**). Abaixo do spread mínimo normal (0,3%), cada mercado de farm (ex.: os futuros da Lighter) abre no máximo 50 combinações, as de maior spread (`max_livros_farm_por_mercado`). As métricas do período das outras combinações continuam sendo feitas pelos tickers: ao voltar para o Lucro, elas já estão prontas.
-- As amostras pelos tickers ficam só na memória: ao religar o scanner ou mudar o `Período das métricas`, as métricas voltam com as amostras do livro gravadas no banco e as dos tickers recomeçam do zero (o tempo sem livro volta a contar aos poucos, até completar o período).
-- A memória das métricas cresce com o período: com `Período das métricas` de 24 h, cada par sem livro guarda 6 vezes mais amostras que com 4 h (~20 KB em vez de ~5 KB). Com muitas corretoras, confira `memoria` na linha `recursos:` do log depois de mudar o período.
+- As amostras pelos tickers ficam só na memória: ao religar o scanner ou mudar o `Período das métricas`, as métricas voltam com as amostras do livro gravadas no banco e as dos tickers recomeçam do zero. Depois de trocar o período (ou de religar), as métricas levam até um período inteiro para se refazer: nesse tempo, o F médio de um spread que acabou de abrir conta só o tempo desde a troca.
+- A memória das métricas não cresce com o período: com `Período das métricas` maior, as amostras pelos tickers ficam mais espaçadas (período / 120: 24 h = a cada 12 min; 168 h = a cada 84 min), sempre ~120 por par.
+- No tempo sem livro, a `média dos 10 maiores` e a `duração mínima` de invertida ficam na resolução do ticker (uma amostra a cada 120 s com 4 h): a média dos 10 maiores sai menos extrema do que com amostras de 5 s, e uma invertida vista por uma amostra só pelo ticker conta com duração 0. O maior A/F e as invertidas pelo ticker usam o melhor bid/ask (sem comer o livro). O F médio (a métrica padrão) não é afetado.
 
 ---
 
@@ -832,8 +833,9 @@ O padrão vale quando a linha não está no `config.yaml`.
 | `validade_funding_s` | `900` | s | funding mais velho que isto fica desconhecido no cálculo |
 | `max_livros_farm_por_mercado` | `50` | combinações | no modo Farm, quantas combinações abaixo de `spread_min_livro_pct` cada mercado de farm abre |
 | `historico_tickers` | `true` | — | métricas do período também com o tempo sem livro, pelos tickers (melhor bid/ask), só na memória; `false` = só o tempo com livro aberto |
-| `amostra_ticker_s` | `120` | s | intervalo das amostras pelos tickers de cada par sem livro (no mínimo `amostra_s`) |
-| `max_historicos` | `80000` | históricos | máximo de pares com amostras na memória (o `historicos N` da linha `recursos:`); no teto, o log avisa uma vez |
+| `amostra_ticker_s` | `120` | s | intervalo das amostras pelos tickers de cada par sem livro (no mínimo `amostra_s`); com período longo vale período / `amostras_ticker_por_periodo`, se for maior |
+| `amostras_ticker_por_periodo` | `120` | amostras | quantas amostras pelos tickers cabem na janela de um par: a memória não cresce com o período |
+| `max_historicos` | `80000` | históricos | máximo de pares com amostras na memória (o `historicos N` da linha `recursos:`; ~400 MB em qualquer período); no teto, o log avisa uma vez |
 
 ---
 
