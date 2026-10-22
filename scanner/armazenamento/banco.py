@@ -1,6 +1,6 @@
 """Banco de dados SQLite do scanner (especificacao, secoes de armazenamento e do painel).
 
-Um arquivo so guarda tres coisas:
+Um arquivo so guarda quatro coisas:
 
 - `sinais`: o historico de oportunidades. Um registro por sinal, aberto quando o sinal nasce
   (`encerrado_em` vazio) e fechado quando ele some. O sinal completo (formato JSON da spec,
@@ -9,6 +9,8 @@ Um arquivo so guarda tres coisas:
   fechamento `f`, precos e lotes). Alimentam o grafico de historico e sao apagadas depois de
   alguns dias (`limpar_antigos`).
 - `grupos`: os grupos de filtros salvos pelo usuario (ex.: "Farm"), como JSON.
+- `corretoras_dia`: por dia (UTC) e corretora, as reconexoes do dia e o atraso medio das leituras do dia
+  (metricas de validacao, especificacao secao 9; veja `registrar_corretoras`).
 
 Tempo: `ts` das amostras e `agora` sao segundos desde 1970. As datas dos sinais sao texto ISO 8601
 em UTC terminando em `Z` (ex.: "2026-10-20T15:04:12.345Z"), como no JSON da spec; nesse formato
@@ -25,6 +27,7 @@ import json
 import math
 import sqlite3
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 
 from scanner.sinais import Evento
@@ -59,7 +62,33 @@ CREATE TABLE IF NOT EXISTS grupos (
     nome         TEXT PRIMARY KEY,
     filtros_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS corretoras_dia (
+    dia             TEXT NOT NULL,     -- AAAA-MM-DD, dia UTC
+    corretora       TEXT NOT NULL,
+    reconexoes      INTEGER NOT NULL,  -- reconexoes no dia, somadas leitura a leitura
+    soma_atraso_ms  REAL NOT NULL,     -- soma das leituras do atraso medio (para a media do dia)
+    leituras_atraso INTEGER NOT NULL,  -- quantas leituras de atraso entraram na soma
+    PRIMARY KEY (dia, corretora)
+);
 """
+
+# Soma uma leitura ao dia da corretora (cria a linha na primeira leitura do dia).
+_SOMAR_CORRETORA = """
+INSERT INTO corretoras_dia (dia, corretora, reconexoes, soma_atraso_ms, leituras_atraso)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT (dia, corretora) DO UPDATE SET
+    reconexoes = reconexoes + excluded.reconexoes,
+    soma_atraso_ms = soma_atraso_ms + excluded.soma_atraso_ms,
+    leituras_atraso = leituras_atraso + excluded.leituras_atraso
+"""
+
+# A limpeza apaga em lotes de LOTE_LIMPEZA rowids (o numero de cada linha), um lote por transacao, soltando a
+# trava entre um lote e outro: o motor, que grava a cada ciclo, espera no maximo um lote (dezenas de ms), e nao
+# a limpeza inteira (mais de 1 s com 2 milhoes de amostras). Detalhe tecnico, nao um ajuste do dono.
+LOTE_LIMPEZA = 2000
+# Pausa entre um lote e outro, sem a trava, para quem estiver esperando por ela entrar (veja _apagar_em_lotes).
+PAUSA_ENTRE_LOTES_S = 0.005
 
 
 # Insere o sinal; se o id ja existe, atualiza tudo menos `detectado_em` (que nunca muda).
@@ -89,10 +118,25 @@ def _json(valor) -> str:
     return json.dumps(valor, allow_nan=False)
 
 
+_EPOCA = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
 def _iso_utc(segundos: float) -> str:
     """Segundos desde 1970 -> "2026-10-20T15:04:12.345Z" (mesmo formato das datas dos sinais)."""
-    momento = datetime.fromtimestamp(segundos, tz=timezone.utc)
+    # 1970 + segundos (e nao datetime.fromtimestamp, que no Windows recusa horario antes de 1970: o limite da
+    # limpeza fica antes de 1970 com o relogio falso dos testes).
+    momento = _EPOCA + timedelta(seconds=segundos)
     return momento.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _dia(dia: str) -> str:
+    """Confere o dia "AAAA-MM-DD" e devolve sempre nesse formato ("20261020" vira "2026-10-20"). ValueError se invalido."""
+    return date.fromisoformat(dia).isoformat()
+
+
+def _numero_real(valor) -> bool:
+    """True para int ou float de verdade (nem bool, nem NaN, nem infinito)."""
+    return isinstance(valor, (int, float)) and not isinstance(valor, bool) and math.isfinite(valor)
 
 
 class Banco:
@@ -101,6 +145,10 @@ class Banco:
     def __init__(self, caminho: str):
         # check_same_thread=False: o motor e a API podem ficar em threads diferentes.
         self._conn = sqlite3.connect(caminho, check_same_thread=False)
+        self._fechado = False  # `fechar` ja foi chamado (a limpeza em outra thread para no proximo lote)
+        # Ultimo valor do contador de reconexoes de cada corretora gravado por ESTE Banco (esta execucao do
+        # scanner). Comeca vazio = zero, como o contador do scanner que acabou de ligar (veja registrar_corretoras).
+        self._contador_gravado: dict[str, int] = {}
         try:
             self._conn.row_factory = sqlite3.Row  # linhas acessiveis pelo nome da coluna
             self._trava = threading.Lock()
@@ -121,6 +169,7 @@ class Banco:
     def fechar(self) -> None:
         """Fecha a conexao. Depois disso o `Banco` nao pode mais ser usado."""
         with self._trava:
+            self._fechado = True
             self._conn.close()
 
     # --- Sinais ----------------------------------------------------------------
@@ -278,19 +327,136 @@ class Banco:
             ).fetchall()
         return [dict(linha) for linha in linhas]
 
-    def limpar_antigos(self, agora: float, dias: float) -> int:
+    def limpar_antigos(self, agora: float, dias: float, lote: int = LOTE_LIMPEZA) -> int:
         """Apaga o que e mais velho que `agora - dias` dias e devolve quantas amostras foram apagadas.
 
-        Alem das amostras, apaga os sinais ja encerrados antes desse limite. Sinais ainda abertos
-        nunca sao apagados.
+        Alem das amostras, apaga os sinais ja encerrados antes desse limite (sinais ainda abertos nunca
+        sao apagados) e as metricas das corretoras dos dias que terminaram antes dele.
+
+        Apaga em lotes de `lote` rowids, uma transacao por lote, soltando a trava entre eles (veja
+        LOTE_LIMPEZA): rodando em outra thread (o __main__ faz assim), o motor espera no maximo um lote.
+        Se o banco for fechado no meio (scanner encerrando), para no proximo lote, sem erro.
         """
+        if not isinstance(lote, int) or isinstance(lote, bool) or lote < 1:
+            raise ValueError(f"lote precisa ser um inteiro maior que zero (recebi {lote!r})")
         corte = agora - dias * 86400
-        with self._trava, self._conn:
-            apagadas = self._conn.execute("DELETE FROM amostras WHERE ts < ?", (corte,)).rowcount
-            self._conn.execute(
-                "DELETE FROM sinais WHERE encerrado_em IS NOT NULL AND encerrado_em < ?", (_iso_utc(corte),)
-            )
+        apagadas = self._apagar_em_lotes("amostras", "ts < ?", (corte,), lote)
+        self._apagar_em_lotes("sinais", "encerrado_em IS NOT NULL AND encerrado_em < ?", (_iso_utc(corte),), lote)
+        with self._trava:
+            if not self._fechado:
+                with self._conn:  # tabela pequena (uma linha por corretora por dia): de uma vez
+                    self._conn.execute("DELETE FROM corretoras_dia WHERE dia < ?", (_iso_utc(corte)[:10],))
         return apagadas
+
+    def _apagar_em_lotes(self, tabela: str, condicao: str, parametros: tuple, lote: int) -> int:
+        """Apaga as linhas de `tabela` que atendem `condicao`, andando pelo rowid de `lote` em `lote`. Devolve quantas.
+
+        Andar pelo rowid (o numero da linha, que e a chave da tabela) passa por todas as linhas que existiam no
+        comeco, mesmo as fora de ordem de horario (relogio que voltou), e cada lote le no maximo `lote` linhas.
+        `tabela` e `condicao` sao textos fixos deste arquivo (nunca vem de fora).
+        """
+        with self._trava:
+            if self._fechado:
+                return 0
+            # Duas subconsultas (e nao "SELECT min(rowid), max(rowid)"): assim o SQLite le so as duas pontas da
+            # tabela; com os dois juntos ele varre a tabela inteira (~0,2 s com 2 milhoes de amostras).
+            menor, maior = self._conn.execute(
+                f"SELECT (SELECT min(rowid) FROM {tabela}), (SELECT max(rowid) FROM {tabela})"
+            ).fetchone()
+        apagadas = 0
+        inicio = menor
+        while menor is not None and inicio <= maior:
+            resultado = self._apagar_lote(tabela, condicao, parametros, inicio, inicio + lote)
+            if resultado is None:  # o banco foi fechado no meio: para aqui
+                break
+            apagadas += resultado
+            inicio += lote
+            if inicio <= maior:
+                # Sem a trava por um instante: quem estava esperando (o motor) entra agora. Sem a pausa, esta
+                # thread pegaria a trava de novo na hora e o motor podia esperar mais de 1 s.
+                time.sleep(PAUSA_ENTRE_LOTES_S)
+        return apagadas
+
+    def _apagar_lote(self, tabela: str, condicao: str, parametros: tuple, inicio: int, fim: int) -> int | None:
+        """Um lote da limpeza: apaga as linhas com rowid em [inicio, fim) que atendem `condicao`.
+
+        Devolve quantas apagou, ou None se o banco ja foi fechado.
+        """
+        with self._trava:
+            if self._fechado:
+                return None
+            with self._conn:
+                return self._conn.execute(
+                    f"DELETE FROM {tabela} WHERE rowid >= ? AND rowid < ? AND {condicao}", (inicio, fim, *parametros)
+                ).rowcount
+
+    # --- Corretoras por dia (metricas de validacao, especificacao secao 9) -----
+
+    def registrar_corretoras(self, dia: str, status: dict[str, dict]) -> None:
+        """Grava uma leitura do status das corretoras (o que `Motor.status` devolve) no dia UTC `dia` ("AAAA-MM-DD").
+
+        status: {corretora: {"atraso_medio_ms": numero ou None, "reconexoes": inteiro, ...}} (o resto e ignorado).
+        - reconexoes: o scanner informa o total desde que ligou. Entra no dia so o quanto o total cresceu desde
+          a ultima leitura gravada por este Banco (que comeca em zero, como o scanner que acabou de ligar). Se o
+          total ficou menor, o contador recomecou do zero e o total inteiro e novo. Assim o scanner reiniciado
+          no meio do dia nao perde reconexoes nem conta as mesmas duas vezes.
+        - atraso_medio_ms: cada leitura que nao e None entra na media do dia.
+        Valor invalido levanta ValueError (dizendo qual corretora) e nada e gravado.
+        """
+        dia = _dia(dia)
+        with self._trava:
+            totais, linhas = {}, []
+            for corretora, dados in status.items():  # confere tudo antes de gravar qualquer coisa
+                totais[corretora], atraso = self._ler_status(corretora, dados)
+                novas = self._reconexoes_novas(corretora, totais[corretora])
+                linhas.append((dia, corretora, novas, 0.0 if atraso is None else atraso, 0 if atraso is None else 1))
+            with self._conn:
+                self._conn.executemany(_SOMAR_CORRETORA, linhas)
+            self._contador_gravado.update(totais)  # so depois de gravado
+
+    def corretoras_do_dia(self, dia: str, status_atual: dict[str, dict] | None = None) -> dict[str, dict]:
+        """Atraso medio e reconexoes de cada corretora no dia UTC `dia`: {corretora: {"atraso_medio_ms", "reconexoes"}}.
+
+        atraso_medio_ms: media das leituras do dia, em ms (None se a corretora nao informou o horario).
+        status_atual: o `Motor.status` de agora, para completar o dia de HOJE com o que ainda nao foi gravado
+            (passe so quando `dia` e hoje). Conta como mais uma leitura, sem gravar nada.
+        Levanta ValueError se `dia` nao for uma data valida.
+        """
+        dia = _dia(dia)
+        with self._trava:
+            linhas = self._conn.execute(
+                "SELECT corretora, reconexoes, soma_atraso_ms, leituras_atraso FROM corretoras_dia WHERE dia = ?",
+                (dia,),
+            ).fetchall()
+            somas = {linha["corretora"]: [linha["reconexoes"], linha["soma_atraso_ms"], linha["leituras_atraso"]]
+                     for linha in linhas}
+            for corretora, dados in (status_atual or {}).items():
+                total, atraso = self._ler_status(corretora, dados)
+                soma = somas.setdefault(corretora, [0, 0.0, 0])
+                soma[0] += self._reconexoes_novas(corretora, total)
+                if atraso is not None:
+                    soma[1] += atraso
+                    soma[2] += 1
+        return {
+            corretora: {"atraso_medio_ms": round(soma_atraso / leituras, 1) if leituras else None,
+                        "reconexoes": reconexoes}
+            for corretora, (reconexoes, soma_atraso, leituras) in sorted(somas.items())
+        }
+
+    def _reconexoes_novas(self, corretora: str, total: int) -> int:
+        """Quantas reconexoes o `total` do scanner tem a mais que a ultima leitura gravada (veja registrar_corretoras)."""
+        anterior = self._contador_gravado.get(corretora, 0)
+        return total - anterior if total >= anterior else total  # menor = o contador recomecou do zero
+
+    @staticmethod
+    def _ler_status(corretora: str, dados: dict) -> tuple[int, float | None]:
+        """(reconexoes, atraso_medio_ms) do status de uma corretora. ValueError se algum dos dois for invalido."""
+        reconexoes, atraso = dados.get("reconexoes", 0), dados.get("atraso_medio_ms")
+        if not isinstance(reconexoes, int) or isinstance(reconexoes, bool) or reconexoes < 0:
+            raise ValueError(f"{corretora}: reconexoes precisa ser um inteiro >= 0 (recebi {reconexoes!r})")
+        if atraso is not None and not _numero_real(atraso):
+            raise ValueError(f"{corretora}: atraso_medio_ms precisa ser um numero ou None (recebi {atraso!r})")
+        return reconexoes, atraso
 
     # --- Grupos de filtros ------------------------------------------------------
 

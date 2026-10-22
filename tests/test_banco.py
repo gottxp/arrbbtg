@@ -456,3 +456,178 @@ def test_lote_que_falha_no_sqlite_e_refeito_linha_a_linha(banco, monkeypatch):
     assert isinstance(recusados[0][1], sqlite3.IntegrityError)
     assert _ids(banco, "2026-10-20") == ["a", "c"]
     assert comandos.count("COMMIT") == 1  # a nova tentativa, linha a linha, ainda e uma transacao so
+
+
+# ---------------------------------------------------------------------------
+# Limpeza em lotes (Task 17): o motor nunca espera a limpeza inteira
+# ---------------------------------------------------------------------------
+
+
+def test_limpar_antigos_em_lotes_pequenos_da_o_mesmo_resultado(banco):
+    # Amostras fora de ordem de horario (relogio que voltou, banco reaberto): os lotes andam pelo rowid,
+    # entao nenhuma escapa.
+    horarios = [5 * DIA, 0, 8 * DIA, 0.5 * DIA, 2 * DIA, DIA - 1, 7.5 * DIA, 0.1, 3 * DIA, 0.9 * DIA]
+    for ts in horarios:
+        banco.gravar_amostra("k", ts, 1, -1, 1, 1, 1, 1)
+    comandos = []
+    banco._conn.set_trace_callback(comandos.append)
+    assert banco.limpar_antigos(agora=8 * DIA, dias=7, lote=3) == 5  # limite = 1 dia
+    banco._conn.set_trace_callback(None)
+    assert sorted(x["ts"] for x in banco.amostras("k", desde=0)) == [2 * DIA, 3 * DIA, 5 * DIA, 7.5 * DIA, 8 * DIA]
+    apagar_amostras = [c for c in comandos if c.startswith("DELETE FROM amostras")]
+    assert len(apagar_amostras) == 4  # 10 linhas em lotes de 3 rowids: um comando (e uma transacao) por lote
+
+
+def test_limpar_antigos_em_lotes_apaga_os_sinais_encerrados_antigos(banco):
+    agora = INICIO_20 + 10 * DIA  # limite de 7 dias = 2026-10-23 00:00 UTC
+    for i in range(7):
+        banco.gravar_evento(Evento("encerrado", _sinal(id=f"velho{i}", encerrado_em="2026-10-22T10:00:00.000Z"), True))
+        banco.gravar_evento(Evento("novo", _sinal(id=f"aberto{i}"), True))
+    banco.limpar_antigos(agora=agora, dias=7, lote=2)
+    assert _ids(banco, "2026-10-20") == [f"aberto{i}" for i in range(7)]
+
+
+def test_limpar_antigos_com_banco_vazio(banco):
+    assert banco.limpar_antigos(agora=8 * DIA, dias=7) == 0
+
+
+def test_limpar_antigos_para_se_o_banco_for_fechado_no_meio(tmp_path):
+    # O scanner encerrando (Ctrl+C) fecha o banco enquanto a limpeza roda em outra thread: ela para no proximo
+    # lote, sem erro.
+    b = Banco(str(tmp_path / "s.db"))
+    for ts in range(10):
+        b.gravar_amostra("k", ts, 1, -1, 1, 1, 1, 1)
+    original = b._apagar_lote
+    lotes = []
+
+    def fechar_depois_do_primeiro(*argumentos):
+        resultado = original(*argumentos)
+        lotes.append(resultado)
+        if len(lotes) == 1:
+            b.fechar()  # fora da trava: o lote ja terminou
+        return resultado
+
+    b._apagar_lote = fechar_depois_do_primeiro
+    assert b.limpar_antigos(agora=8 * DIA, dias=7, lote=2) == 2  # so o primeiro lote
+    assert lotes == [2, None]  # o segundo lote viu o banco fechado e parou ali
+
+
+def test_limpar_antigos_lote_invalido(banco):
+    with pytest.raises(ValueError):
+        banco.limpar_antigos(agora=8 * DIA, dias=7, lote=0)
+
+
+# ---------------------------------------------------------------------------
+# Atraso medio e reconexoes de cada corretora, por dia (Task 17)
+# ---------------------------------------------------------------------------
+
+
+def _status(reconexoes, atraso_ms=None, corretora="gate"):
+    return {corretora: {"estado": "conectada", "atraso_medio_ms": atraso_ms, "reconexoes": reconexoes}}
+
+
+def test_reconexoes_do_dia_pela_diferenca_do_contador(banco):
+    # O contador do scanner so cresce: 3 e depois 5 = 5 reconexoes no dia (e nao 3 + 5).
+    banco.registrar_corretoras("2026-10-20", _status(3))
+    banco.registrar_corretoras("2026-10-20", _status(5))
+    banco.registrar_corretoras("2026-10-20", _status(5))
+    assert banco.corretoras_do_dia("2026-10-20")["gate"]["reconexoes"] == 5
+
+
+def test_reconexoes_com_o_scanner_reiniciado_no_meio_do_dia(tmp_path):
+    caminho = str(tmp_path / "s.db")
+    primeiro = Banco(caminho)
+    primeiro.registrar_corretoras("2026-10-20", _status(3))
+    primeiro.registrar_corretoras("2026-10-20", _status(5))
+    primeiro.fechar()
+    # Scanner religado: o contador recomeca do zero (1 e depois 2 = mais 2 reconexoes).
+    segundo = Banco(caminho)
+    segundo.registrar_corretoras("2026-10-20", _status(1))
+    segundo.registrar_corretoras("2026-10-20", _status(2))
+    assert segundo.corretoras_do_dia("2026-10-20")["gate"]["reconexoes"] == 7
+    segundo.fechar()
+
+
+def test_contador_que_volta_para_tras_conta_como_recomeco(banco):
+    banco.registrar_corretoras("2026-10-20", _status(5))
+    banco.registrar_corretoras("2026-10-20", _status(2))  # o estado recomecou do zero e ja contou 2
+    assert banco.corretoras_do_dia("2026-10-20")["gate"]["reconexoes"] == 7
+
+
+def test_reconexoes_depois_da_meia_noite_vao_para_o_dia_novo(banco):
+    banco.registrar_corretoras("2026-10-20", _status(3))
+    banco.registrar_corretoras("2026-10-21", _status(5))  # o mesmo scanner, ja no dia seguinte
+    assert banco.corretoras_do_dia("2026-10-20")["gate"]["reconexoes"] == 3
+    assert banco.corretoras_do_dia("2026-10-21")["gate"]["reconexoes"] == 2
+
+
+def test_atraso_medio_do_dia_e_a_media_das_leituras(banco):
+    for atraso in (100.0, None, 200.0, 360.0):  # None = a corretora nao informou o horario: fica fora
+        banco.registrar_corretoras("2026-10-20", _status(0, atraso))
+    banco.registrar_corretoras("2026-10-20", _status(0, corretora="mexc"))
+    assert banco.corretoras_do_dia("2026-10-20") == {
+        "gate": {"atraso_medio_ms": 220.0, "reconexoes": 0},
+        "mexc": {"atraso_medio_ms": None, "reconexoes": 0},
+    }
+
+
+def test_corretoras_do_dia_com_o_status_atual_nao_grava_nada(banco):
+    banco.registrar_corretoras("2026-10-20", _status(2, 100.0))
+    atual = {**_status(6, 300.0), **_status(1, corretora="bitget")}
+    assert banco.corretoras_do_dia("2026-10-20", atual) == {
+        "bitget": {"atraso_medio_ms": None, "reconexoes": 1},
+        "gate": {"atraso_medio_ms": 200.0, "reconexoes": 6},
+    }
+    assert banco.corretoras_do_dia("2026-10-20") == {"gate": {"atraso_medio_ms": 100.0, "reconexoes": 2}}
+    # E a proxima leitura gravada continua contando a partir do 2 (o status atual nao mexeu no contador).
+    banco.registrar_corretoras("2026-10-20", _status(6, 300.0))
+    assert banco.corretoras_do_dia("2026-10-20")["gate"]["reconexoes"] == 6
+
+
+def test_corretoras_do_dia_vazio_e_dia_em_formato_curto(banco):
+    assert banco.corretoras_do_dia("2026-10-20") == {}
+    banco.registrar_corretoras("20261020", _status(1))  # o mesmo dia escrito sem tracos
+    assert banco.corretoras_do_dia("2026-10-20")["gate"]["reconexoes"] == 1
+
+
+@pytest.mark.parametrize("dia", ["2026-13-01", "ontem", ""])
+def test_corretoras_dia_invalido(banco, dia):
+    with pytest.raises(ValueError):
+        banco.registrar_corretoras(dia, _status(1))
+    with pytest.raises(ValueError):
+        banco.corretoras_do_dia(dia)
+
+
+@pytest.mark.parametrize("dados", [
+    {"atraso_medio_ms": 10.0, "reconexoes": -1},
+    {"atraso_medio_ms": 10.0, "reconexoes": 1.5},
+    {"atraso_medio_ms": 10.0, "reconexoes": True},
+    {"atraso_medio_ms": float("nan"), "reconexoes": 1},
+    {"atraso_medio_ms": "10", "reconexoes": 1},
+])
+def test_registrar_corretoras_recusa_valor_invalido_e_nao_grava_nada(banco, dados):
+    status = {"bitget": {"atraso_medio_ms": 50.0, "reconexoes": 1}, "gate": dados}
+    with pytest.raises(ValueError, match="gate"):
+        banco.registrar_corretoras("2026-10-20", status)
+    assert banco.corretoras_do_dia("2026-10-20") == {}
+
+
+def test_registrar_corretoras_sem_reconexoes_conta_zero(banco):
+    banco.registrar_corretoras("2026-10-20", {"gate": {"estado": "atrasada", "atraso_medio_ms": None}})
+    assert banco.corretoras_do_dia("2026-10-20") == {"gate": {"atraso_medio_ms": None, "reconexoes": 0}}
+
+
+def test_limpar_antigos_apaga_as_metricas_das_corretoras_dos_dias_antigos(banco):
+    for dia in ("2026-10-21", "2026-10-22", "2026-10-23", "2026-10-29"):
+        banco.registrar_corretoras(dia, _status(0, 10.0))
+    banco.limpar_antigos(agora=INICIO_20 + 10 * DIA, dias=7)  # limite = 2026-10-23 00:00 UTC
+    assert banco.corretoras_do_dia("2026-10-22") == {}
+    assert banco.corretoras_do_dia("2026-10-23") != {} and banco.corretoras_do_dia("2026-10-29") != {}
+
+
+def test_limpar_antigos_com_o_limite_antes_de_1970(banco):
+    # Relogio falso dos testes (t = 1000 s) com 7 dias de retencao: o limite cai antes de 1970. Nada a apagar e
+    # nenhum erro (no Windows, datetime.fromtimestamp recusaria esse horario).
+    banco.gravar_amostra("k", 500, 1, -1, 1, 1, 1, 1)
+    assert banco.limpar_antigos(agora=1000, dias=7) == 0
+    assert len(banco.amostras("k", desde=0)) == 1

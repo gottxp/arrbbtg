@@ -9,6 +9,7 @@
 - DELETE /api/filtros/{nome}         apaga um grupo
 - GET    /api/sessao, PUT /api/sessao   modo, filtros e comparacao em uso pelo motor
 - GET    /api/status                 saude de cada corretora
+- GET    /api/validacao?dia=AAAA-MM-DD   metricas de validacao do dia UTC (padrao: hoje), por modo e corretora
 - WS     /ws/sinais                  um retrato dos sinais ao conectar e depois cada evento do motor
 - GET    /                           o painel web (arquivos de scanner/painel: index.html, app.js, estilo.css)
 
@@ -29,6 +30,7 @@ import mimetypes
 import secrets
 import time
 from collections.abc import Callable
+from datetime import date
 from pathlib import Path
 from typing import Any, Literal
 
@@ -45,6 +47,7 @@ from scanner.config.carregar import Config, ErroConfig
 from scanner.filtros import Filtros
 from scanner.metricas.janela import MAIORES_N
 from scanner.motor import MODOS, SEGUNDOS_POR_HORA, Motor, Sessao
+from scanner.validacao import dia_utc, resumo_do_dia
 
 registro = logging.getLogger("scanner.api")
 
@@ -319,6 +322,29 @@ def criar_app(
             }
             for corretora, dados in motor.status(relogio()).items()
         }
+
+    # --- Metricas de validacao (especificacao, secao 9) ---------------------------
+
+    @app.get("/api/validacao")
+    def validacao(dia: str | None = Query(default=None, pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")) -> dict:
+        """Metricas de validacao do dia UTC `dia` ("AAAA-MM-DD"; padrao: hoje). Formato em scanner/validacao.
+
+        Data em outro formato, ou que nao existe (ex.: 2026-02-30), da 422. Para hoje, o atraso e as reconexoes
+        gravados sao completados com o status atual das corretoras.
+        """
+        agora = relogio()
+        hoje = dia_utc(agora)
+        dia = hoje if dia is None else dia
+        try:
+            date.fromisoformat(dia)
+        except ValueError:
+            raise HTTPException(422, f"dia invalido: {dia!r} (use AAAA-MM-DD, ex.: 2026-10-20)") from None
+        status_atual = None
+        if dia == hoje:
+            # Esta rota roda numa thread (a consulta ao banco nao para o motor), mas o estado do motor so pode
+            # ser lido no laco do asyncio, o mesmo do motor: from_thread.run_sync chama motor.status la.
+            status_atual = anyio.from_thread.run_sync(motor.status, agora)
+        return resumo_do_dia(banco, dia, status_atual)
 
     # --- WebSocket -----------------------------------------------------------
 

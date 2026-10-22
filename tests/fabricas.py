@@ -2,7 +2,9 @@
 
 import asyncio
 from dataclasses import replace
+from datetime import datetime, timezone
 
+from scanner.armazenamento import Banco
 from scanner.coletores.ccxt_coletor import mercado_do_simbolo
 from scanner.coletores.dados_lentos import TaxaDesconhecida
 from scanner.config.carregar import Config
@@ -10,6 +12,7 @@ from scanner.estado.mercados import EstadoMercados
 from scanner.metricas.janela import Metricas
 from scanner.modelos import Candidato, Livro, Ponta
 from scanner.motor import Motor, chave_de
+from scanner.sinais import Evento
 
 
 def livro(
@@ -558,3 +561,53 @@ class ClienteLighterFalso:
 
     async def close(self) -> None:
         self.fechado = True
+
+
+# ---------------------------------------------------------------------------
+# Historico de sinais pronto no banco (Task 17: metricas de validacao)
+# ---------------------------------------------------------------------------
+
+# 2026-10-20 00:00:00 UTC, em segundos desde 1970.
+INICIO_20_OUT = 1792454400
+# Os sinais de `banco_com_sinais` nascem a partir das 10:00 UTC de 2026-10-20, um por minuto.
+NASCIMENTO_PADRAO = INICIO_20_OUT + 10 * 3600
+
+
+def iso_utc(segundos: float) -> str:
+    """Segundos desde 1970 -> "2026-10-20T10:00:00.000Z" (o formato das datas dos sinais)."""
+    return datetime.fromtimestamp(segundos, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def banco_com_sinais(
+    tmp_path,
+    duracoes_s: list,
+    rp_liquido: list,
+    modo: str = "lucro",
+    nascimento: float = NASCIMENTO_PADRAO,
+    banco: Banco | None = None,
+) -> Banco:
+    """Banco (arquivo `validacao.db` em `tmp_path`) com um sinal por item de `duracoes_s`, ja gravado como o motor grava.
+
+    O sinal i nasce em `nascimento + 60*i` (segundos desde 1970; padrao 2026-10-20 10:00 UTC), tem RP liquido
+    `rp_liquido[i]` e se encerra `duracoes_s[i]` segundos depois. Duracao None = o sinal ainda esta aberto.
+    banco: acrescenta os sinais num Banco que ja existe (ex.: os dois modos no mesmo banco).
+    """
+    if len(duracoes_s) != len(rp_liquido):
+        raise ValueError("duracoes_s e rp_liquido precisam ter o mesmo tamanho")
+    banco = Banco(str(tmp_path / "validacao.db")) if banco is None else banco
+    for i, (duracao, rp) in enumerate(zip(duracoes_s, rp_liquido)):
+        nasceu = nascimento + 60 * i
+        sinal = {
+            "id": f"T17-{modo}-{int(nasceu)}-{i}",
+            "par": "BTC/USDT",
+            "tipo": "futuro_futuro",
+            "modo": modo,
+            "rp_liquido_pct": rp,
+            "detectado_em": iso_utc(nasceu),
+            "encerrado_em": None,
+        }
+        banco.gravar_evento(Evento("novo", sinal, registrar_historico=True))
+        if duracao is not None:
+            encerrado = {**sinal, "encerrado_em": iso_utc(nasceu + duracao)}
+            banco.gravar_evento(Evento("encerrado", encerrado, registrar_historico=True))
+    return banco

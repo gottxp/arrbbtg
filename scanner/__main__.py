@@ -18,6 +18,10 @@ registra memoria, CPU e o resumo dos descartes. Log no terminal e num arquivo po
 Lighter (Task 16): lighter e lighter_rh usam o conector proprio (scanner/coletores/lighter.py) no lugar do
 ccxt; o funding e a taxa delas chegam ao DadosLentos pelo proprio coletor (fora do laco REST dele).
 
+Validacao (especificacao, secao 9): no mesmo intervalo o banco guarda o atraso e as reconexoes de cada
+corretora no dia; quando o dia UTC vira, o resumo do dia anterior vai para o log. O banco apaga o que passou
+de `retencao_dias` ao ligar e a cada virada do dia (_validacao_diaria).
+
 Com --validar, so confere o config.yaml e sai (nao conecta em nada).
 """
 
@@ -42,6 +46,7 @@ from scanner.estado import EstadoMercados
 from scanner.logs import MedidorCpu, configurar_logs, linha_de_recursos, memoria_do_processo
 from scanner.motor import Motor, simbolos_para_tickers
 from scanner.sinais import Evento
+from scanner.validacao import dia_utc, linhas_do_resumo, resumo_do_dia
 
 # Nome fixo (e nao __name__, que vira "__main__" com python -m): fica debaixo do logger "scanner".
 registro = logging.getLogger("scanner.principal")
@@ -400,6 +405,77 @@ async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorDoScanner], c
         await asyncio.gather(*ajustes.values(), return_exceptions=True)
 
 
+# ---------------------------------------------------------------------------
+# Metricas de validacao e limpeza do banco (especificacao, secoes 8 e 9)
+# ---------------------------------------------------------------------------
+
+SEGUNDOS_POR_DIA = 86400
+
+
+def _ate_a_meia_noite_utc(agora: float) -> float:
+    """Quantos segundos faltam para a proxima meia-noite UTC (onde o dia das metricas vira)."""
+    return SEGUNDOS_POR_DIA - agora % SEGUNDOS_POR_DIA
+
+
+async def _limpar_banco(banco: Banco, cfg: Config, agora: float) -> None:
+    """Apaga do banco o que passou de `retencao_dias`. Erro vai para o log e o scanner segue.
+
+    Roda em outra thread: com o banco grande a limpeza leva segundos, e assim o motor espera no maximo um
+    lote dela por vez (veja Banco.limpar_antigos), em vez de o laco inteiro parar.
+    """
+    try:
+        apagadas = await asyncio.to_thread(banco.limpar_antigos, agora, cfg.retencao_dias)
+    except Exception:
+        registro.exception("erro ao limpar os dados antigos do banco; tento de novo na proxima virada do dia")
+    else:
+        registro.info("limpeza do banco: %d amostras com mais de %g dias apagadas", apagadas, cfg.retencao_dias)
+
+
+def _gravar_corretoras(motor: Motor, banco: Banco, dia: str, agora: float) -> None:
+    """Grava no dia `dia` o atraso medio e as reconexoes de cada corretora (Motor.status). Erro vai para o log."""
+    try:
+        banco.registrar_corretoras(dia, motor.status(agora))
+    except Exception:
+        registro.exception("erro ao gravar o atraso e as reconexoes das corretoras no banco")
+
+
+async def _escrever_resumo(banco: Banco, dia: str) -> None:
+    """Escreve no log o resumo do dia `dia`: uma linha por modo e uma das corretoras. Erro vai para o log."""
+    try:
+        resumo = await asyncio.to_thread(resumo_do_dia, banco, dia)  # le o dia inteiro do banco: fora do laco
+    except Exception:
+        registro.exception("erro ao montar o resumo do dia %s", dia)
+        return
+    for linha in linhas_do_resumo(resumo):
+        registro.info(linha)
+
+
+async def _validacao_diaria(motor: Motor, banco: Banco, cfg: Config, relogio: Callable[[], float],
+                            esperar: Callable[[float], Awaitable] = asyncio.sleep) -> None:
+    """Metricas de validacao por dia (especificacao, secao 9) e limpeza do banco (secao 8).
+
+    - ao ligar: apaga do banco o que passou de `retencao_dias`;
+    - a cada `intervalo_log_recursos_s`: grava o atraso medio e as reconexoes de cada corretora no dia UTC;
+    - quando o dia UTC vira (a espera e encurtada para acordar na meia-noite): essa leitura fecha o dia que
+      acabou, o resumo dele vai para o log e a limpeza roda de novo;
+    - ao sair (Ctrl+C): grava a ultima leitura.
+    Nenhum erro aqui para o scanner: vai para o log e o laco segue.
+    """
+    dia = dia_utc(relogio())  # o dia que esta correndo
+    try:
+        await _limpar_banco(banco, cfg, relogio())
+        while True:
+            await esperar(min(cfg.intervalo_log_recursos_s, _ate_a_meia_noite_utc(relogio())))
+            agora = relogio()
+            _gravar_corretoras(motor, banco, dia, agora)  # na virada, a leitura ainda e do dia que acabou
+            if dia_utc(agora) != dia:
+                await _escrever_resumo(banco, dia)
+                dia = dia_utc(agora)
+                await _limpar_banco(banco, cfg, agora)
+    finally:
+        _gravar_corretoras(motor, banco, dia_utc(relogio()), relogio())
+
+
 async def _encerrar(tarefas: list[asyncio.Task], coletores: dict[str, ColetorDoScanner], exchanges: dict,
                     banco: Banco | None) -> None:
     """Para tudo e libera as conexoes e o banco. Um erro ao fechar uma coisa nao impede fechar as outras."""
@@ -507,6 +583,10 @@ async def rodar(
             name="recarga dos mercados"))
         tarefas.append(asyncio.create_task(
             _registrar_recursos(motor, coletores, cfg.intervalo_log_recursos_s), name="recursos"))
+
+        # Metricas de validacao por dia e limpeza do banco (ao ligar e a cada virada do dia UTC).
+        tarefas.append(asyncio.create_task(_validacao_diaria(motor, banco, cfg, relogio), name="validacao"))
+
         await _laco_do_motor(motor, coletores, cfg, relogio, ciclos, publicar=app.state.transmissor.publicar)
     finally:
         # A recarga dos mercados (em `tarefas`) e cancelada junto: ela nao comeca tickers novos depois disto.

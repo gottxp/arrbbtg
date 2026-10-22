@@ -29,7 +29,7 @@ from scanner.config.carregar import ErroConfig
 from scanner.filtros import Filtros
 from scanner.motor import Motor, Sessao, chave_de, texto_da_chave
 from scanner.sinais import Evento
-from tests.fabricas import motor_falso
+from tests.fabricas import banco_com_sinais, motor_falso
 from tests.test_motor import config_servico, exchanges_falsas
 
 # Horario do estado criado pelo motor_falso (as pontas "chegaram" em t = 10 s).
@@ -479,6 +479,69 @@ def test_status_repassa_o_que_o_motor_informar(cliente, motor, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/validacao (Task 17)
+# ---------------------------------------------------------------------------
+
+
+def test_validacao_sem_dia_e_hoje_utc_completado_com_o_status_atual(cliente, motor):
+    r = cliente.get("/api/validacao")
+    assert r.status_code == 200
+    corpo = r.json()
+    assert corpo["dia"] == "1970-01-01"  # o relogio da API esta em t = 10 s
+    # O ciclo do fixture gravou um sinal de lucro, ainda aberto.
+    assert corpo["lucro"]["quantidade_sinais"] == 1 and corpo["lucro"]["abertos"] == 1
+    assert corpo["lucro"]["duracao_media_s"] is None
+    assert corpo["farm"]["quantidade_sinais"] == 0
+    # Nada gravado ainda das corretoras: o status atual completa o dia de hoje.
+    assert corpo["corretoras"] == {nome: {"atraso_medio_ms": None, "reconexoes": 0} for nome in motor.cfg.corretoras}
+
+
+def test_validacao_com_dia_le_o_banco_e_nao_o_motor(cliente, motor, banco, tmp_path, monkeypatch):
+    banco_com_sinais(tmp_path, duracoes_s=[2, 10, 40], rp_liquido=[0.3, 0.4, 0.5], banco=banco)
+    banco.registrar_corretoras("2026-10-20", {"gate": {"atraso_medio_ms": 180.0, "reconexoes": 2}})
+
+    def status_proibido(agora):
+        raise AssertionError("um dia que ja passou nao usa o status atual")
+
+    monkeypatch.setattr(motor, "status", status_proibido)
+    r = cliente.get("/api/validacao", params={"dia": "2026-10-20"})
+    assert r.status_code == 200
+    corpo = r.json()
+    assert corpo["dia"] == "2026-10-20" and corpo["lucro"]["quantidade_sinais"] == 3
+    assert corpo["lucro"]["duracao_media_s"] == pytest.approx(17.33, abs=0.01)
+    assert corpo["corretoras"] == {"gate": {"atraso_medio_ms": 180.0, "reconexoes": 2}}
+
+
+def test_validacao_le_o_status_do_motor_no_laco_e_o_banco_fora_dele(cliente, motor, monkeypatch):
+    # O estado do motor so pode ser lido no laco do asyncio (o mesmo do motor); a consulta ao banco roda numa
+    # thread da API, para uma consulta demorada nao parar o motor.
+    vistos = {}
+    status_original = motor.status
+
+    def status_espiao(agora):
+        vistos["status_no_laco"] = asyncio._get_running_loop() is not None
+        return status_original(agora)
+
+    monkeypatch.setattr(motor, "status", status_espiao)
+    rota = next(r for r in cliente.app.routes if getattr(r, "path", None) == "/api/validacao")
+    assert not inspect.iscoroutinefunction(rota.endpoint)  # def comum: roda fora do laco
+    assert cliente.get("/api/validacao").status_code == 200
+    assert vistos == {"status_no_laco": True}
+
+
+@pytest.mark.parametrize("dia", ["2026-13-01", "2026-02-30", "20261020", "2026-10-2", "ontem", "",
+                                 "2026-10-20T00:00:00", "٢٠٢٦-١٠-٢٠"])
+def test_validacao_dia_em_formato_errado_da_422(cliente, dia):
+    assert cliente.get("/api/validacao", params={"dia": dia}).status_code == 422
+
+
+def test_validacao_exige_senha_quando_configurada(cliente_com_senha):
+    assert cliente_com_senha.get("/api/validacao").status_code == 401
+    assert cliente_com_senha.get("/api/validacao", params={"dia": "2026-10-20"}).status_code == 401
+    assert cliente_com_senha.get("/api/validacao", auth=("jr", "segredo")).status_code == 200
+
+
+# ---------------------------------------------------------------------------
 # Senha (HTTP Basic)
 # ---------------------------------------------------------------------------
 
@@ -491,6 +554,8 @@ ROTAS = [
     ("GET", "/api/sessao"),
     ("PUT", "/api/sessao"),
     ("GET", "/api/status"),
+    ("GET", "/api/validacao"),
+    ("GET", "/api/validacao?dia=2026-10-20"),
     ("GET", "/api/nao-existe"),
 ]
 
@@ -524,6 +589,7 @@ def test_senha_certa_libera_todas_as_rotas(cliente_com_senha):
     assert cliente_com_senha.get("/api/sessao", auth=auth).status_code == 200
     assert cliente_com_senha.get("/api/status", auth=auth).status_code == 200
     assert cliente_com_senha.get("/api/historico/x", auth=auth).status_code == 200
+    assert cliente_com_senha.get("/api/validacao", auth=auth).status_code == 200
 
 
 def test_senha_com_acento_e_dois_pontos(motor, banco):
