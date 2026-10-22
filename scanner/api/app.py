@@ -33,7 +33,7 @@ from typing import Any, Literal
 import anyio
 from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, StrictBool
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from scanner.api.transmissor import Transmissor
@@ -121,11 +121,17 @@ class ExigirSenha:
 
 
 class CorpoSessao(BaseModel):
-    """O corpo do PUT /api/sessao. Campos que faltam ficam com o padrao da Sessao (lucro, sem filtros, sem comparacao)."""
+    """O corpo do PUT /api/sessao: a sessao INTEIRA (o PUT troca tudo), entao os tres campos sao obrigatorios.
 
-    modo: str = "lucro"
-    filtros: Any = Field(default_factory=dict)  # quem confere e o Filtros.de_dict (erro 400 com a mensagem)
-    comparacao: StrictBool = False
+    Chave desconhecida ou campo faltando da 422 e a sessao em uso nao muda: um erro de digitacao no
+    painel (ex.: "mode") nao pode apagar em silencio os filtros que o motor esta usando.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    modo: str
+    filtros: Any  # quem confere e o Filtros.de_dict (erro 400 com a mensagem)
+    comparacao: StrictBool
 
 
 def _filtros_validos(dados: Any) -> Filtros:

@@ -377,9 +377,47 @@ def test_sessao_trocada_vale_no_proximo_ciclo(cliente, motor):
     assert cliente.get("/api/sinais").json() == []
 
 
-def test_sessao_com_campos_que_faltam_usa_os_padroes(cliente, motor):
-    cliente.put("/api/sessao", json={"modo": "farm"})
-    assert (motor.sessao.modo, motor.sessao.filtros, motor.sessao.comparacao) == ("farm", Filtros(), False)
+def sessao_em_uso(motor) -> Sessao:
+    """Poe no motor uma sessao bem diferente do padrao (farm, filtros, comparacao) e a devolve."""
+    motor.sessao = Sessao(modo="farm", filtros=Filtros(volume_min_usd=500, tipos=["spot_futuro"]), comparacao=True)
+    return motor.sessao
+
+
+def conferir_sessao_intacta(cliente, motor, antes: Sessao) -> None:
+    assert motor.sessao is antes
+    assert (antes.modo, antes.filtros, antes.comparacao) == (
+        "farm", Filtros(volume_min_usd=500, tipos=["spot_futuro"]), True)
+    assert cliente.get("/api/sessao").json() == {"modo": "farm", "filtros": antes.filtros.para_dict(),
+                                                 "comparacao": True}
+
+
+def test_sessao_com_chave_desconhecida_da_422_e_nao_muda_nada(cliente, motor):
+    # Erro de digitacao no painel (ex.: "mode" em vez de "modo") nao pode apagar os filtros em uso.
+    antes = sessao_em_uso(motor)
+    r = cliente.put("/api/sessao", json={"mode": "farm", "filters": {"volume_min_usd": 500}, "comparison": True})
+    assert r.status_code == 422
+    conferir_sessao_intacta(cliente, motor, antes)
+    r = cliente.put("/api/sessao", json={"modo": "lucro", "filtros": {}, "comparacao": False, "extra": 1})
+    assert r.status_code == 422  # uma chave a mais, com os tres campos certos, tambem recusa
+    conferir_sessao_intacta(cliente, motor, antes)
+
+
+def test_sessao_com_corpo_vazio_da_422_e_nao_muda_nada(cliente, motor):
+    antes = sessao_em_uso(motor)
+    assert cliente.put("/api/sessao", json={}).status_code == 422
+    assert cliente.put("/api/sessao").status_code == 422  # sem corpo nenhum
+    conferir_sessao_intacta(cliente, motor, antes)
+
+
+@pytest.mark.parametrize("faltando", ["modo", "filtros", "comparacao"])
+def test_sessao_com_campo_faltando_da_422_e_nao_muda_nada(cliente, motor, faltando):
+    # PUT troca a sessao inteira: os tres campos sao obrigatorios (nada de "completar com o padrao").
+    antes = sessao_em_uso(motor)
+    corpo = {"modo": "lucro", "filtros": {}, "comparacao": False}
+    del corpo[faltando]
+    r = cliente.put("/api/sessao", json=corpo)
+    assert r.status_code == 422 and faltando in json.dumps(r.json())
+    conferir_sessao_intacta(cliente, motor, antes)
 
 
 @pytest.mark.parametrize("modo", ["", "Lucro", "arbitragem", "farm "])
