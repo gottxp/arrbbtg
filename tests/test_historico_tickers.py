@@ -842,7 +842,7 @@ def test_campos_novos_invalidos_dao_erro_claro(tmp_path, texto, campo):
 
 def test_readme_explica_as_metricas_pelos_tickers_e_os_historicos_da_linha_de_recursos():
     texto = (RAIZ / "README.md").read_text(encoding="utf-8")
-    painel = texto[texto.index("\n## 5. "):texto.index("\n## 6. ")]
+    painel = texto[texto.index("\n## 4. "):texto.index("\n## 6. ")]
     assert "pelos tickers" in painel and "melhor bid/ask" in painel
     assert "o gráfico só mostra as amostras do livro" in painel
     assert "historicos N" in texto and "max_historicos" in texto

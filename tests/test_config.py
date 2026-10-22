@@ -167,6 +167,18 @@ def test_main_com_config_invalida_mostra_erro_e_sai_com_1(tmp_path, capsys):
     assert "ciclo_ms" in capsys.readouterr().err
 
 
+def test_periodo_das_metricas_acima_da_retencao_da_erro_claro(tmp_path, capsys):
+    # O motor so aceita periodo ate retencao_dias x 24 (o banco so guarda isso de amostras): o --validar confere.
+    with pytest.raises(ErroConfig, match="periodo_metricas_h.*168"):
+        carregar_config(escrever(tmp_path, "periodo_metricas_h: 200\n"))  # retencao padrao: 7 dias = 168 h
+    with pytest.raises(ErroConfig, match="periodo_metricas_h"):
+        carregar_config(escrever(tmp_path, "periodo_metricas_h: 49\nretencao_dias: 2\n"))
+    assert carregar_config(escrever(tmp_path, "periodo_metricas_h: 168\n")).periodo_metricas_h == 168
+    assert carregar_config(escrever(tmp_path, "periodo_metricas_h: 200\nretencao_dias: 10\n")).periodo_metricas_h == 200
+    assert main(["--config", escrever(tmp_path, "periodo_metricas_h: 169\n"), "--validar"]) == 1
+    assert "periodo_metricas_h" in capsys.readouterr().err
+
+
 def test_timeout_desassinar_padrao_5s_e_precisa_ser_positivo(tmp_path):
     # Revisao da Task 10: tempo maximo esperando a corretora confirmar o cancelamento de um livro.
     assert carregar_config(escrever(tmp_path, "corretoras: [bitget]\n")).timeout_desassinar_s == 5

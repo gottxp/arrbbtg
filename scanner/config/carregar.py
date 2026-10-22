@@ -490,7 +490,20 @@ def carregar_config(caminho: str) -> Config:
     _conferir_reserva_dos_livros(config)
     _conferir_validade_do_funding(config)
     _conferir_amostra_ticker(config)
+    _conferir_periodo_das_metricas(config)
     return config
+
+
+def _conferir_periodo_das_metricas(config: Config) -> None:
+    """O periodo das metricas vai no maximo ate retencao_dias x 24 horas: o banco so guarda isso de amostras.
+
+    E o mesmo limite que o motor aplica ao periodo do painel (Motor._periodo_max_h); acima dele a sessao cairia no
+    periodo da config, que tambem seria invalido.
+    """
+    maximo_h = config.retencao_dias * 24
+    if config.periodo_metricas_h > maximo_h:
+        raise ErroConfig(f"periodo_metricas_h ({config.periodo_metricas_h:g} h) passa de retencao_dias x 24 "
+                         f"({maximo_h:g} h): diminua o periodo ou aumente retencao_dias")
 
 
 def _conferir_amostra_ticker(config: Config) -> None:

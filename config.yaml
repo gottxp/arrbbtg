@@ -6,25 +6,9 @@
 #   VPS (terminal):        .venv/bin/python -m scanner --validar
 #   Tem que aparecer "config ok".
 #
-# Linhas deste exemplo que NAO sao o padrao do codigo (apagar muda o comportamento):
-#   corretoras: o padrao e so a fase 1 [mexc, gate, bitget]; aqui entram tambem bingx, xt e hyperliquid
-#     (fase 2), kraken e lighter (fase 3). krakenfutures e lighter_rh ficam comentadas: confirme antes de
-#     ativar (especificacao, secao 11).
-#   corretoras_farm: o padrao e vazio (modo Farm sem sinais); aqui lighter, lighter_rh, kraken e krakenfutures.
-#   mercados_por_corretora: o padrao e spot e futuro em todas. Aqui: hyperliquid so futuro (especificacao,
-#     secao 2; sem a linha o spot dela entraria); kraken so spot (os futuros dela sao a krakenfutures); xt so
-#     futuro, porque o ccxt 4.5.89 nao traz bid/ask no spot da XT. XT so futuro e um desvio da secao 2 (XT spot
-#     e futuros) ainda sem aprovacao: confirme com o dono.
-#   metodo_ticker: o padrao e tentar watch_tickers primeiro; hyperliquid usa watch_ticker porque o lote dela
-#     (allMids) nao traz bid/ask; kraken usa watch_bids_asks (o ticker dela so muda a cada negocio; o
-#     watch_bids_asks muda a cada mudanca do melhor bid/ask e continua trazendo o volume); mexc usa watch_ticker
-#     (no spot, o watch_bids_asks do ccxt 4.5.89 nunca entrega o bookTicker, que chega em protobuf).
-#   fontes_cotacao: o padrao e vazio; aqui USD: kraken (os futuros da Kraken cotam em USD e a cotacao vem do
-#     par spot USDT/USD da propria Kraken).
-#   intervalo_funding_h: o padrao e o intervalo que o ccxt informa (ou 8h); aqui hyperliquid: 1 e lighter: 1
-#     (as duas cobram de hora em hora).
-#   limites_assinatura_mercado: o padrao e vazio (sem limite por mercado); aqui mexc spot: 30, o limite que a
-#     MEXC documenta para o spot ("One ws connection supports a maximum of 30 subscriptions").
+# Fora do padrao neste exemplo: corretoras, corretoras_farm, mercados_por_corretora, metodo_ticker, fontes_cotacao,
+#   intervalo_funding_h, limites_assinatura_mercado (o motivo esta no comentario de cada um).
+#   xt: [futuro] e desvio da especificacao: confirme com o dono.
 
 # Corretoras ligadas, uma por linha com "- ". Nomes aceitos: mexc, gate, bitget, bingx, xt, hyperliquid,
 #   kraken (Kraken Pro spot), krakenfutures (Kraken Pro futuros, perpetuos em USD), lighter (Lighter principal,
@@ -72,7 +56,7 @@ manter_livro_s: 60
 # Janela das metricas do periodo (A e F medios, maiores, media dos 10 maiores, invertidas, lote medio). O campo
 #   "Periodo das metricas" do painel vale por cima deste. Unidade: horas. Padrao: 4. Quando mexer: para comparar
 #   com outro periodo do Arbimax. Mudar o periodo (ou religar o scanner) recarrega as janelas com as amostras
-#   gravadas no banco. Maximo no painel: retencao_dias x 24 horas.
+#   gravadas no banco. Use no maximo retencao_dias x 24 (168 com o padrao): acima disso o --validar da erro.
 periodo_metricas_h: 4
 # Modo Lucro: RP liquido minimo para virar sinal (com o modo comparacao ligado, vale para o RP bruto). O campo
 #   "Resultado projetado min. (Lucro)" do painel vale por cima deste. Unidade: %. Padrao: 0.2.
@@ -112,13 +96,11 @@ margem_slippage_pct: 0.0
 metrica_spread: medio
 # Modo Farm: combinacao com ponta numa corretora de corretoras_farm abre o livro completo (etapa 2) a partir deste
 #   spread de abertura pelos tickers, em vez de spread_min_livro_pct (vale o menor dos dois), ate o teto de
-#   max_livros_farm_por_mercado. As operacoes de farm baratas tem spread perto de zero: sem isto o livro delas
-#   nunca abria e elas nunca apareciam. Unidade: %. Padrao: -0.1. Quando mexer: suba (ex.: 0) se uma corretora de
+#   max_livros_farm_por_mercado. Unidade: %. Padrao: -0.1. Quando mexer: suba (ex.: 0) se uma corretora de
 #   farm limitar assinaturas; abaixe para ver farm mais caro.
 spread_min_livro_farm_pct: -0.1
 # Modo Farm: no maximo tantas combinacoes abaixo de spread_min_livro_pct abrem livro em cada mercado de farm
-#   (corretora de farm + spot ou futuro, ex.: os futuros da Lighter): as de maior spread pelos tickers. Sem teto,
-#   quase toda combinacao com ponta de farm abriria livro (milhares de assinaturas e o ciclo passando de 500 ms).
+#   (corretora de farm + spot ou futuro, ex.: os futuros da Lighter): as de maior spread pelos tickers.
 #   As acima de spread_min_livro_pct abrem como no modo Lucro, fora do teto. Unidade: combinacoes (inteiro).
 #   Padrao: 50. Quando mexer: abaixe se uma corretora de farm limitar assinaturas; suba para ver mais farm.
 max_livros_farm_por_mercado: 50
@@ -134,8 +116,9 @@ historico_tickers: true
 # De quanto em quanto tempo cada par sem livro aberto ganha uma amostra pelos tickers. Com periodo longo vale
 #   periodo / amostras_ticker_por_periodo, se for maior (24 h: 720 s). Nas medias, cada uma pesa o tempo que cobre
 #   (120 s = 24 amostras do livro de 5 s). Os pares sao visitados em rodizio, um pedaco por ciclo.
-#   Unidade: segundos (no minimo amostra_s). Padrao: 120. Quando mexer: menor = metricas mais finas e mais memoria
-#   (60 s: ~1,5 vez a memoria dos historicos); maior = menos memoria.
+#   Unidade: segundos (no minimo amostra_s). Padrao: 120. Quando mexer: raramente. Com periodo de 4 h ou mais,
+#   baixar so este nao muda nada; para amostras mais finas, baixe este e suba amostras_ticker_por_periodo junto
+#   (ex.: 60 e 240, ~1,5 vez a memoria).
 amostra_ticker_s: 120
 # Quantas amostras pelos tickers cabem na janela do periodo de cada par: o intervalo vira o maior entre
 #   amostra_ticker_s e periodo / isto. Assim a memoria dos historicos e a mesma em qualquer "Periodo das metricas"
@@ -260,8 +243,8 @@ intervalo_funding_h:
 espera_max_reconexao_s: 60
 # Maximo de assinaturas por corretora (livros abertos; e tickers, se a corretora so assina um par por vez, como
 #   a bingx e a hyperliquid com watch_ticker). Ficam os pares de maior volume 24h. Unidade: assinaturas
-#   (inteiro). Padrao: {} (sem limite). Quando mexer: se o log disser que a mensagem "parece de limite de
-#   assinaturas" daquela corretora. Na Lighter (que nao documenta o limite) o limite vale para os livros; com a
+#   (inteiro). Padrao: {} (sem limite). Quando mexer: se o log mostrar "parece de limite de assinaturas" para
+#   aquela corretora. Na Lighter (que nao documenta o limite) o limite vale para os livros; com a
 #   etapa 1 pelos livros (quando o market_stats nao traz bid/ask), ele vale para todos os livros, os da etapa 1
 #   e os da etapa 2. Para preencher, troque a linha "limites_assinatura: {}" por, por exemplo:
 #   limites_assinatura:
@@ -366,10 +349,11 @@ painel:
   # Porta do painel (http://localhost:8000). Unidade: numero inteiro de 1 a 65535. Padrao: 8000.
   #   Quando mexer: se o log disser que a porta ja esta em uso.
   porta: 8000
-  # Usuario do painel (o navegador pede ao abrir). Unidade: texto, sem ":"; null = sem senha. Padrao: null.
-  #   Quando mexer: na VPS. Usuario sem senha (ou senha sem usuario) impede o scanner de ligar.
+  # Usuario do painel (o navegador pede ao abrir). Unidade: texto, sem ":", sempre entre aspas, ex.:
+  #   usuario: "dono"; null = sem senha. Padrao: null. Quando mexer: na VPS. Usuario sem senha (ou senha sem
+  #   usuario) impede o scanner de ligar.
   usuario: null
-  # Senha do painel. Unidade: texto (entre aspas se tiver simbolos); null = sem senha. Padrao: null.
+  # Senha do painel. Unidade: texto, sempre entre aspas, ex.: senha: "123456"; null = sem senha. Padrao: null.
   #   Quando mexer: na VPS (sempre junto com o usuario).
   senha: null
 

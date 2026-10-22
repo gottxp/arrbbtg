@@ -9,14 +9,14 @@
 7. [Atualizar para uma versão nova](#7-atualizar-para-uma-versão-nova)
 8. [Quando algo dá erro](#8-quando-algo-dá-erro)
 
-Regra para todos os comandos: rode sempre **dentro da pasta do projeto** (a que tem o `config.yaml`). O log, o banco e a configuração são procurados na pasta onde o comando roda.
+Regra para todos os comandos: rode sempre **dentro da pasta do projeto** (a que tem o `config.yaml`).
 
 ---
 
 ## 1. Instalar no Windows
 
 1. Instale o Python 3.12:
-   - Abra <https://www.python.org/downloads/windows/> e baixe o **Windows installer (64-bit)** da versão 3.12 mais nova.
+   - Abra <https://www.python.org/downloads/release/python-31210/> e baixe o **Windows installer (64-bit)** (o 3.12.10 é o último 3.12 com instalador).
    - Na primeira tela do instalador, marque **Add python.exe to PATH** e clique em **Install Now**.
 2. Copie a pasta do projeto para `C:\scanner-arbitragem`. Se veio em zip: clique com o botão direito no zip, **Extrair tudo...**, e mova a pasta para que o caminho fique `C:\scanner-arbitragem\config.yaml`.
 3. Abra o PowerShell (menu Iniciar, digite `PowerShell`, Enter) e entre na pasta:
@@ -42,9 +42,7 @@ Regra para todos os comandos: rode sempre **dentro da pasta do projeto** (a que 
    .venv\Scripts\python -m pip install -r requirements-dev.txt
    ```
 
-   A primeira linha apaga uma `.venv` que tenha vindo de outro computador. Perto do fim aparece `Successfully installed ...`. Entre as bibliotecas vem o `protobuf`: sem ele o spot da MEXC não chega (as mensagens dele vêm nesse formato).
-
-   As versões das bibliotecas são fixas no `requirements.txt` e no `requirements-dev.txt` (as que foram testadas: `ccxt==4.5.89` e as outras). O scanner depende de detalhes dessa versão do ccxt (formato dos tickers, dos livros e do funding de cada corretora). Não troque nem atualize essas versões por conta própria.
+   A primeira linha apaga uma `.venv` que tenha vindo de outro computador. Perto do fim aparece `Successfully installed ...`. Não atualize as bibliotecas por conta própria.
 6. Confira a configuração:
 
    ```powershell
@@ -52,17 +50,17 @@ Regra para todos os comandos: rode sempre **dentro da pasta do projeto** (a que 
    ```
 
    Tem que aparecer `config ok`.
-7. Rode os testes automáticos (não acessam a internet, levam menos de 1 minuto):
+7. Rode os testes automáticos (não acessam a internet, levam 1 a 2 minutos):
 
    ```powershell
    .venv\Scripts\python -m pytest -q
    ```
 
-   A última linha tem que ser parecida com `1159 passed in 21.00s` (versões novas têm mais testes). Pode vir junto `N skipped` (testes que só rodam no Linux ou com o Node instalado). Não pode aparecer `failed` nem `error`.
+   A última linha mostra `NNNN passed` (1477 nesta versão). Pode vir junto `N skipped` (testes que só rodam no Linux ou com o Node instalado). Não pode aparecer `failed` nem `error`.
 
 ## 2. Rodar no Windows
 
-1. Ligar (PowerShell):
+1. Ligar (PowerShell). Antes de ligar pela primeira vez, faça o [aviso I](#aviso-i-edição-rápida-do-console-windows):
 
    ```powershell
    cd C:\scanner-arbitragem
@@ -70,10 +68,8 @@ Regra para todos os comandos: rode sempre **dentro da pasta do projeto** (a que 
    ```
 
    Em até 1 minuto aparecem linhas como `INFO scanner.principal: mexc: acompanhando 812 pares` e `INFO scanner.api: painel em http://127.0.0.1:8000`. Deixe essa janela aberta: fechar a janela desliga o scanner.
-
-   Não clique nem selecione texto dentro dessa janela com o scanner ligado. A **Edição Rápida** do console do Windows congela a saída da janela até você apertar `Enter` ou `Esc`. O scanner não para e o arquivo de log continua sendo gravado; só a janela fica parada (ao apertar `Enter` ou `Esc`, as linhas que estavam esperando aparecem; se ela ficar parada por muito tempo, as mais novas só ficam no arquivo). Para desligar a Edição Rápida: clique com o botão direito na barra de título da janela > **Propriedades** > aba **Opções** > desmarque **Modo de Edição Rápida** > **OK**.
 2. Abrir o painel: no navegador, abra <http://localhost:8000>.
-3. Parar: clique na janela do PowerShell e aperte `Ctrl+C`. Aparece `Encerrado.`.
+3. Parar: clique na **barra de título** da janela do PowerShell e aperte `Ctrl+C`. Aparece `Encerrado.`.
 4. Logs: um arquivo por dia em `C:\scanner-arbitragem\logs\scanner-AAAA-MM-DD.log`, no horário do PC. Ficam o de hoje e os 30 dias anteriores. Para acompanhar o log de hoje numa segunda janela do PowerShell:
 
    ```powershell
@@ -81,14 +77,19 @@ Regra para todos os comandos: rode sempre **dentro da pasta do projeto** (a que 
    Get-Content "logs\scanner-$(Get-Date -Format yyyy-MM-dd).log" -Wait -Tail 50
    ```
 
+   Depois da meia-noite, aperte `Ctrl+C` e rode de novo.
+
    Para procurar um texto em todos os logs (troque o texto entre aspas):
 
    ```powershell
    Select-String -Path "logs\scanner-*.log" -Pattern "sinais ativos"
    ```
 
-5. Banco: `C:\scanner-arbitragem\scanner.db` (histórico dos sinais, amostras do gráfico, grupos de filtros, métricas da validação e a última sessão do painel). O scanner apaga sozinho as amostras do gráfico com mais de 7 dias (`retencao_dias`); o histórico dos sinais e as métricas da validação ficam. Para começar do zero: pare o scanner e apague `scanner.db`, `scanner.db-wal` e `scanner.db-shm`.
-6. Ao ligar de novo, o scanner volta na última sessão do painel (modo, filtros e modo comparação), recarrega as amostras do livro do período (4 h) do banco para o F médio e o lote médio não começarem do zero (as amostras pelos tickers ficam só na memória e recomeçam do zero), e fecha os sinais que ficaram abertos se ele tiver caído (com a última vez em que cada um foi visto). Ao parar com `Ctrl+C`, os sinais ativos são encerrados com o horário da parada.
+5. Banco: `C:\scanner-arbitragem\scanner.db` (histórico dos sinais, amostras do gráfico, grupos de filtros, métricas da validação e a última sessão do painel). O scanner apaga sozinho as amostras do gráfico com mais de 7 dias (`retencao_dias`). Para começar do zero, pare o scanner e rode (PowerShell, na pasta):
+
+   ```powershell
+   Remove-Item scanner.db, scanner.db-wal, scanner.db-shm -ErrorAction SilentlyContinue
+   ```
 
 ## 3. Instalar e rodar na VPS (Ubuntu)
 
@@ -104,6 +105,7 @@ Use uma VPS com **Ubuntu 24.04** (já vem com o Python 3.12). Nos comandos, troq
    scp "$HOME\scanner-arbitragem.tgz" usuario@IP:~/
    ```
 
+   Na primeira vez aparece `Are you sure you want to continue connecting (yes/no/[fingerprint])?`: digite `yes` e Enter; depois a senha da VPS (nada aparece enquanto digita).
 2. Entre na VPS (PowerShell do PC):
 
    ```powershell
@@ -138,7 +140,7 @@ Use uma VPS com **Ubuntu 24.04** (já vem com o Python 3.12). Nos comandos, troq
    .venv/bin/python -m pytest -q
    ```
 
-   A última linha tem que mostrar `passed` (pode ter `skipped`), sem `failed` nem `error`.
+   A última linha mostra `NNNN passed` (1477 nesta versão; pode vir `skipped`), sem `failed` nem `error`.
 5. Deixe o relógio da VPS no horário de Brasília (o log usa o horário da máquina):
 
    ```bash
@@ -154,13 +156,13 @@ Use uma VPS com **Ubuntu 24.04** (já vem com o Python 3.12). Nos comandos, troq
    nano config.yaml
    ```
 
-2. No bloco `painel:` (perto do fim do arquivo), troque `usuario: null` e `senha: null` pelo seu usuário e senha. Use só letras e números, ou ponha a senha entre aspas. Deixe `host: 127.0.0.1` para usar o túnel SSH (recomendado, parte 3.5); só troque para `host: 0.0.0.0` se for abrir a porta na internet (parte 3.5, opção B). Com `host: 0.0.0.0` sem usuário e senha, o scanner não liga. Fica assim (as linhas de comentário com `#` entre os itens podem ficar):
+2. No bloco `painel:` (perto do fim do arquivo), troque `usuario: null` e `senha: null` pelo seu usuário e senha, sempre entre aspas (ex.: `senha: "123456"`). Deixe `host: 127.0.0.1` para usar o túnel SSH (recomendado, parte 3.5); só troque para `host: 0.0.0.0` se for abrir a porta na internet (parte 3.5, opção B). Com `host: 0.0.0.0` sem usuário e senha, o scanner não liga. Fica assim (as linhas de comentário com `#` entre os itens podem ficar):
 
 ```yaml
 painel:
   host: 127.0.0.1
   porta: 8000
-  usuario: dono
+  usuario: "dono"
   senha: "troque-por-uma-senha-forte"
 ```
 
@@ -247,7 +249,7 @@ grep -h "sinais ativos" ~/scanner-arbitragem/logs/scanner-*.log
 
 ### 3.5 Abrir o painel da VPS no seu PC
 
-O painel usa HTTP sem HTTPS: pela internet, a senha viaja em texto aberto. Por isso o túnel SSH é o caminho recomendado.
+Use a opção A; na B a senha vai sem criptografia.
 
 **Opção A, túnel SSH (recomendada).** Com `host: 127.0.0.1` no `config.yaml`:
 
@@ -278,7 +280,7 @@ O painel usa HTTP sem HTTPS: pela internet, a senha viaja em texto aberto. Por i
 
 ## 4. Conferir cada marco
 
-Faça os marcos nesta ordem. Os comandos são do Windows (PowerShell, na pasta `C:\scanner-arbitragem`); na VPS troque `.venv\Scripts\python` por `.venv/bin/python`.
+Faça os marcos nesta ordem. Os comandos são do Windows (PowerShell, na pasta `C:\scanner-arbitragem`). Na VPS: troque `.venv\Scripts\python` por `.venv/bin/python`; cada `Select-String -Path "logs\scanner-*.log" -Pattern "TEXTO"` vira `grep -h -E "TEXTO" ~/scanner-arbitragem/logs/scanner-*.log`; os endereços `http://localhost:8000/...` abrem com o túnel da parte 3.5 ligado.
 
 ### Marco 1: preços de cada corretora
 
@@ -326,9 +328,9 @@ Faça os marcos nesta ordem. Os comandos são do Windows (PowerShell, na pasta `
    | `lighter: N perpetuos ativos; M inativos ficam de fora` | ao ligar |
    | `painel em http://127.0.0.1:8000` | ao ligar |
    | `sinais ativos: N` | a cada minuto, sem buracos |
-   | `recursos: memoria ... MB (atual), CPU ...%, ..., ciclo medio N ms (maior M ms), banco N MB, fila do banco N` e `descartes nos ultimos 300s: ...` | a cada 5 minutos. O `maior` do ciclo tem que ficar abaixo de 500 (a limpeza da memória do Python, a cada 5 minutos, roda entre dois ciclos e não entra nesse número) e a `fila do banco` perto de 0 |
-   | `mexc: limite de 30 assinaturas no spot (limites_assinatura_mercado), 10 delas para os livros: N de M pares ficaram fora dos tickers` | ao ligar (é o esperado; veja o [aviso A](#aviso-a-mexc-futuros-um-par-por-assinatura)) |
-   | `kraken: N pares cotados em outras moedas ficam de fora (EUR ..., GBP ...)` | ao ligar (é o esperado: o scanner só compara preços em USDT, USDC, USDG e USD) |
+   | `recursos: memoria ... MB (atual), CPU ...%, ..., ciclo medio N ms (maior M ms), banco N MB, fila do banco N` e `descartes nos ultimos 300s: ...` | a cada 5 minutos. O `maior` do ciclo tem que ficar abaixo de 500 e a `fila do banco` perto de 0 |
+   | `mexc: limite de 30 assinaturas no spot (limites_assinatura_mercado), 10 delas para os livros: N de M pares ficaram fora dos tickers` | ao ligar (é o esperado; veja o [aviso A](#aviso-a-mexc-assinaturas-spot-com-limite-de-30-e-protobuf)) |
+   | `kraken: N pares cotados em outras moedas ficam de fora (EUR ..., GBP ...)` | ao ligar (é o esperado) |
    | `janelas do periodo (4h) recarregadas do banco: N combinacoes, M amostras, em X s` | ao ligar, depois de alguns segundos (na primeira vez, 0 combinações) |
 
 3. Procure as linhas que **não** deveriam aparecer:
@@ -340,7 +342,7 @@ Faça os marcos nesta ordem. Os comandos são do Windows (PowerShell, na pasta `
    | Se aparecer | O que fazer |
    | --- | --- |
    | `nenhum metodo de ticker traz bid/ask` | anote a corretora e o mercado e avise (não pode aparecer para BingX, XT futuro e Hyperliquid) |
-   | `parece de limite de assinaturas` | preencha `limites_assinatura` daquela corretora ([aviso A](#aviso-a-mexc-futuros-um-par-por-assinatura) mostra como) |
+   | `parece de limite de assinaturas` | preencha `limites_assinatura` daquela corretora ([aviso A](#aviso-a-mexc-assinaturas-spot-com-limite-de-30-e-protobuf) mostra como) |
    | `mercado inativo` com muitos pares da XT | avise (a XT pode estar marcando pares bons como inativos) |
    | `difere do relogio do PC` | acerte o relógio do PC (Windows: Configurações > Hora e idioma > Data e hora > Sincronizar agora); se continuar só com a bingx, avise |
    | `fora da faixa de seguranca` | avise (cotação USDC ou USD estranha) |
@@ -360,7 +362,7 @@ Faça os marcos nesta ordem. Os comandos são do Windows (PowerShell, na pasta `
 
 Com o scanner ligado, abra <http://localhost:8000> e confira:
 
-1. **Sinal novo em até 1 s:** quando uma linha nova aparece, o horário `desde HH:MM:SS` dela é o horário do relógio do PC (no máximo 1 s de diferença). (O log não escreve cada sinal: só `sinais ativos: N` a cada minuto.)
+1. **Sinal novo em até 1 s:** quando uma linha nova aparece, o horário `desde HH:MM:SS` dela é o horário do relógio do PC (no máximo 1 s de diferença).
 2. **Filtro sem recarregar:** digite `1` em **Spread mín. (A atual)**. A tabela muda sozinha, sem apertar F5. Apague o `1` e ela volta.
 3. **Pausar:** clique em **Pausar**. Aparece `PAUSADO` no rodapé e a tabela para. Clique em **Continuar** e ela volta a mudar.
 4. **Gráfico das últimas 4 h:** clique no botão de gráfico da coluna Histórico de um sinal. A janela mostra `Período: 4h` e o eixo do tempo cobre as últimas 4 horas (com o scanner ligado há pelo menos 4 h; antes disso, desde que o par apareceu).
@@ -393,11 +395,11 @@ Com o scanner ligado, abra <http://localhost:8000> e confira:
    Select-String -Path "logs\scanner-*.log" -Pattern "caiu|de volta depois"
    ```
 
-4. Depois da volta: todas as corretoras verdes de novo e o scanner continua rodando (nenhuma linha `Erro:` na janela). Passando o mouse numa corretora que caiu, aparece `1 reconexões` (ou mais).
+4. Depois da volta: todas as corretoras verdes de novo e o scanner continua rodando (nenhuma linha `Erro:` na janela). Passando o mouse numa corretora que caiu, aparece `1 reconexão` (ou `N reconexões`).
 
 **24 horas seguidas:**
 
-1. No PC, desligue a suspensão (Configurações > Sistema > Energia > Quando conectado, colocar o dispositivo em suspensão após: Nunca). Na VPS não precisa.
+1. No PC, desligue a suspensão (Configurações > Sistema > Energia > Quando conectado, colocar o dispositivo em suspensão após: Nunca; no Windows 11: Sistema > Energia e bateria > Tela e suspensão). Na VPS não precisa.
 2. Deixe 24 h ligado e veja as linhas `recursos:`:
 
    ```powershell
@@ -405,20 +407,18 @@ Com o scanner ligado, abra <http://localhost:8000> e confira:
    ```
 
    ```text
-   INFO scanner.principal: recursos: memoria 282.4 MB (atual), CPU 9.1%, sinais ativos 4, historicos 21350
+   INFO scanner.principal: recursos: memoria 282.4 MB (atual), CPU 9.1%, sinais ativos 4, historicos 21350, ciclo medio 95.2 ms (maior 310.4 ms), banco 120.5 MB, fila do banco 0
    ```
 
-   `historicos N` = pares com amostras do período na memória (pelos tickers e pelo livro); no máximo `max_historicos` (80000, ~400 MB em qualquer período). Cada par sem livro ocupa ~5 KB: guarda no máximo 120 amostras pelos tickers (`amostras_ticker_por_periodo`), a cada 120 s com o período de 4 h e mais espaçadas com período maior (24 h: a cada 12 min).
-
-   Esperado: uma linha a cada 5 minutos, sem buraco; a memória e o `historicos N` sobem nas primeiras 4 horas e depois ficam estáveis (não crescem o dia todo). `memoria indisponivel`: veja o [aviso F](#aviso-f-memória-no-windows).
+   Esperado: uma linha a cada 5 minutos, sem buraco; o `historicos N` fica estável depois dos primeiros minutos; a memória sobe nas primeiras 4 horas e depois fica estável (não cresce o dia todo; veja o [aviso H](#aviso-h-métricas-pelos-tickers)). `memoria indisponivel`: veja o [aviso F](#aviso-f-memória-no-windows).
 
 Os outros dois testes da seção 9 (corretora com dado atrasado e par sem liquidez) são conferidos pelos testes automáticos (`tests/test_estado.py` e `tests/test_motor.py`).
 
 ### Marco 5: validação de 3 dias
 
-1. Deixe o scanner ligado 3 dias seguidos (VPS, ou PC que não dorme).
-2. No painel, ligue **Modo comparação** e use os mesmos filtros e as mesmas corretoras do Arbimax (crie um grupo, por exemplo `Validacao`; [parte 5](#52-filtros-e-grupos)). Com o modo comparação, o mínimo do modo Lucro vale para o RP bruto, como no Arbimax.
-3. Várias vezes por dia, com o Arbimax aberto ao lado, anote:
+1. Antes de começar, faça o [aviso G](#aviso-g-taxas-da-sua-conta). Deixe o scanner ligado 3 dias seguidos (VPS, ou PC que não dorme).
+2. No painel, ligue **Modo comparação** e use os mesmos filtros e as mesmas corretoras do Arbimax (crie um grupo, por exemplo `Validacao`; [parte 5](#52-filtros-e-grupos)).
+3. Comece a anotar só 4 h depois de ligar o scanner e 4 h depois de trocar o `Período das métricas`. Não religue nem troque o período durante os 3 dias. Várias vezes por dia, com o Arbimax aberto ao lado, anote:
    - para cada sinal do Arbimax: se aparece no scanner em até 5 s;
    - para os que aparecem nos dois: A, F e RP bruto do Arbimax e do scanner;
    - em alguns sinais: o preço de uma ponta no scanner e no site da corretora, no mesmo instante.
@@ -428,7 +428,7 @@ Os outros dois testes da seção 9 (corretora com dado atrasado e par sem liquid
    http://localhost:8000/api/validacao?dia=2026-10-23
    ```
 
-   Vem um JSON com, para `lucro` e `farm`: `quantidade_sinais`, `abertos`, `rp_liquido_medio_pct`, `duracao_media_s`, `pct_sumiu_5s`, `pct_sumiu_30s`; e em `corretoras`: `atraso_medio_ms` e `reconexoes` de cada uma. Os sinais que apareceram com o **Modo comparação** ligado (decididos pelo RP bruto) ficam fora de `lucro` e `farm`, no bloco `comparacao`, com as mesmas métricas. O mesmo resumo vai para o log:
+   Vem um JSON com os blocos `lucro`, `farm`, `comparacao` e `corretoras`. O mesmo resumo vai para o log:
 
    ```powershell
    Select-String -Path "logs\scanner-*.log" -Pattern "resumo do dia"
@@ -452,32 +452,46 @@ Os outros dois testes da seção 9 (corretora com dado atrasado e par sem liquid
 
 ### Avisos específicos
 
-#### Aviso A: MEXC futuros (um par por assinatura)
+#### Aviso A: MEXC (assinaturas, spot com limite de 30 e protobuf)
 
-1. A MEXC usa `watch_ticker` (`metodo_ticker: mexc: watch_ticker` no `config.yaml`): uma assinatura por par, no spot e no futuro (centenas no futuro). Não apague essa linha: sem ela o spot da MEXC fica sem nenhum ticker.
-2. Procure se a MEXC reclamou de limite:
+1. Não apague a linha `mexc: watch_ticker` de `metodo_ticker` no `config.yaml` (a MEXC assina um par por vez, no spot e no futuro).
+2. Confira que o `protobuf` (usado pelo spot da MEXC) está instalado:
+
+   ```powershell
+   .venv\Scripts\python -m pip show protobuf
+   ```
+
+   Tem que aparecer `Name: protobuf`. Se aparecer `WARNING: Package(s) not found: protobuf`, refaça o passo 5 da [parte 1](#1-instalar-no-windows).
+3. Procure se a MEXC reclamou de limite:
 
    ```powershell
    Select-String -Path "logs\scanner-*.log" -Pattern "mexc.*parece de limite de assinaturas"
    ```
 
-3. Se aparecer, troque no `config.yaml` a linha `limites_assinatura: {}` por:
+4. Se aparecer, troque no `config.yaml` a linha `limites_assinatura: {}` por:
 
 ```yaml
 limites_assinatura:
   mexc: 200
 ```
 
-4. Rode `--validar` e religue. O log passa a dizer `... 200 assinaturas ... N de M pares ficaram de fora (os de menor volume 24h)`: é o esperado. Se o aviso de limite continuar, baixe para `100`.
-5. MEXC spot: a MEXC aceita 30 assinaturas por conexão no spot. Com `limites_assinatura_mercado: mexc: spot: 30`, só os 20 pares de maior volume da MEXC spot entram na etapa 1 e sobram 10 para os livros. É o esperado (decisão pendente: a etapa 1 da MEXC spot pela API REST, que precisa da sua aprovação). O ticker da MEXC spot não traz o volume 24h: o `VOL` dela vem pela API REST (ao ligar e a cada `intervalo_dados_lentos_s`).
-6. MEXC futuros e XT: a cada 15 minutos (`intervalo_reassinar_livros_s`) cada livro é assinado de novo, porque o ccxt delas não confere a sequência do livro. Por alguns segundos o par fica sem livro: um sinal com MEXC futuros ou XT pode sumir e voltar (o histórico continua no mesmo registro se voltar em até 60 s).
+5. Faça a [parte 6](#6-mudar-a-configuração), passos 3 e 4. O log passa a dizer `... 200 assinaturas ... N de M pares ficaram de fora (os de menor volume 24h)`: é o esperado. Se o aviso de limite continuar, troque `200` por `100`.
+6. MEXC spot: com `limites_assinatura_mercado: mexc: spot: 30`, só os 20 pares de maior volume da MEXC spot entram na etapa 1 e sobram 10 para os livros (é a linha `mexc: limite de 30 assinaturas no spot ...` do marco 2). Decida: (1) aceitar só os 20 pares de maior volume; (2) aprovar a etapa 1 da MEXC spot pela API REST. Avise o desenvolvedor.
 
 #### Aviso B: XT só futuros (decisão pendente)
 
 O `config.yaml` de exemplo usa só o futuro da XT (`xt: [futuro]` em `mercados_por_corretora`), porque o ccxt 4.5.89 não traz bid/ask no spot da XT. A especificação (seção 2) pede spot e futuros. Decida:
 
 1. Aceitar só futuros: não faça nada.
-2. Seguir a especificação: apague a linha `  xt: [futuro]` do `config.yaml`, rode `--validar` e religue. Esperado no log: `ERROR ... xt: nenhum metodo de ticker traz bid/ask no spot (...)`, e o futuro da XT continua. O spot só geraria sinal com a taxa preenchida em `taxas: xt: spot:`.
+2. Seguir a especificação: apague a linha `  xt: [futuro]` do `config.yaml` e troque a linha `taxas: {}` por (use a taxa spot da sua conta; se `taxas` já estiver preenchido, acrescente só as linhas da `xt`):
+
+```yaml
+taxas:
+  xt:
+    spot: 0.2
+```
+
+Depois, faça a [parte 6](#6-mudar-a-configuração), passos 3 e 4. Esperado no log: `ERROR ... xt: nenhum metodo de ticker traz bid/ask no spot (...)`, e o futuro da XT continua.
 
 Avise o desenvolvedor da decisão.
 
@@ -584,6 +598,33 @@ Select-String -Path "logs\scanner-*.log" -Pattern "recursos:"
 
 Tem que aparecer `recursos: memoria NNN.N MB (atual), ...`. Se aparecer `memoria indisponivel`, avise (o scanner continua funcionando).
 
+#### Aviso G: taxas da sua conta
+
+1. No site de cada corretora ligada, anote a sua taxa taker de spot e de futuros.
+2. No painel, passe o mouse na linha 1 de uma ponta: aparece `taxa taker X%`, a taxa que o scanner está usando.
+3. Se for diferente, preencha `taxas` ([parte 6](#6-mudar-a-configuração), ajuste 1) e faça a parte 6, passos 3 e 4. Faça isso antes do marco 5.
+
+#### Aviso H: métricas pelos tickers
+
+As métricas do período (A e F médios, maiores, média dos 10 maiores e invertidas) contam também o tempo sem livro, pelos tickers (melhor bid/ask, uma amostra a cada 120 s com o período de 4 h). Essas amostras ficam só na memória.
+
+1. Depois de ligar o scanner ou de trocar o `Período das métricas`, as métricas levam até um período inteiro para se refazer: espere 4 h antes de comparar com o Arbimax (marco 5, passo 3).
+2. Na linha `recursos:` (marco 4), a `memoria` fica estável depois das primeiras 4 h. O `historicos N` vai no máximo até `max_historicos` (80000, ~400 MB em qualquer período). Se a `memoria` passar de 1/3 da memória do PC, avise.
+3. No tempo sem livro, o maior A/F, a `média dos 10 maiores` e a `duração mínima` das invertidas ficam na resolução de 120 s: anote quando só eles divergirem do Arbimax (o F médio não é afetado).
+
+#### Aviso I: Edição Rápida do console (Windows)
+
+1. Desligue: clique com o botão direito na barra de título da janela do PowerShell > **Propriedades** > aba **Opções** > desmarque **Modo de Edição Rápida** > **OK**. Se a janela não tiver **Propriedades** (Terminal do Windows, padrão do Windows 11), pule para o passo 2.
+2. Confira uma vez: com o scanner ligado, selecione um texto na janela dele e espere 2 minutos. Numa segunda janela do PowerShell, rode:
+
+   ```powershell
+   cd C:\scanner-arbitragem
+   Select-String -Path "logs\scanner-*.log" -Pattern "sinais ativos" | Select-Object -Last 3
+   ```
+
+   Os horários têm que continuar andando (o arquivo de log continua sendo gravado). Volte à janela do scanner e aperte `Esc`.
+3. Se o log parou junto, avise.
+
 ---
 
 ## 5. Ler o painel
@@ -606,7 +647,7 @@ Tem que aparecer `recursos: memoria NNN.N MB (atual), ...`. Se aparecer `memoria
 
 | Bloco | Campo | O que faz |
 | --- | --- | --- |
-| Corretoras | Corretoras 1 (ponta long) | só sinais com a ponta long nessas corretoras (`Gate spot` = só o spot; `Gate (todos)` = spot e futuro). A lista mostra só os mercados ligados de cada corretora. Marcado com `(desligado)` (ex.: `kraken:futuro (desligado)`, de um grupo antigo) não pega nenhum sinal: desmarque. Vazio = todas |
+| Corretoras | Corretoras 1 (ponta long) | só sinais com a ponta long nessas corretoras (`Gate spot` = só o spot; `Gate futuros` = só o futuro; marque os dois para a Gate inteira). A lista mostra só os mercados ligados de cada corretora. Marcado com `(desligado)` (ex.: `kraken:futuro (desligado)`, de um grupo antigo) não pega nenhum sinal: desmarque. Vazio = todas |
 | Corretoras | Corretoras 2 (ponta short) | o mesmo para a ponta short |
 | Corretoras | Tipos de oportunidade | Spot — Futuros e/ou Futuros — Futuros |
 | Geral | Período das métricas (h) | janela do Histórico e das métricas. Vazio = o do `config.yaml` (4 h). Mudar recarrega as janelas com as amostras do banco (alguns segundos). Máximo: `retencao_dias` × 24 (168 h) |
@@ -614,13 +655,13 @@ Tem que aparecer `recursos: memoria NNN.N MB (atual), ...`. Se aparecer `memoria
 | Geral | Spread mín. (A atual) (%) | spread de abertura mínimo agora |
 | Geral | Lote mín. ($) | lote mínimo agora nas duas pontas; nunca fica abaixo do tamanho de referência ($100) |
 | Geral | Lote médio mín. ($) | lote médio do período, nas duas pontas |
-| Geral | Limite de ordem mín. ($) | tamanho máximo de ordem da corretora; na v1 ele é desconhecido (coluna MAX vazia) e passa |
+| Geral | Limite de ordem mín. ($) | tamanho máximo de ordem da corretora; na v1 sempre passa |
 | Geral | Invertidas mín. | quantas vezes o F ficou ≥ 0 no período |
 | Geral | Invertidas: duração mín. (s) | quanto tempo o F precisa ficar ≥ 0 para contar uma invertida |
 | Geral | Funding mín. / Funding máx. (%) | funding de cada ponta futura |
-| Geral | FR Yield mín. (%) | funding líquido (recebido na short menos pago na long), normalizado para 8h |
+| Geral | FR Yield mín. (%) | mínimo do `FR Yield` (coluna Resultado, 5.3) |
 | Geral | Intervalo de funding | só pontas futuras que cobram em 1h, 4h e/ou 8h |
-| Geral | Funding sincronizado | as duas pontas futuras com o mesmo intervalo de cobrança |
+| Geral | Funding sincronizado | as duas pontas futuras com o mesmo intervalo de cobrança (não confere o horário da próxima cobrança) |
 | Geral | Maior spread de abertura / de fechamento mín., Média de spread de abertura / de fechamento mín. (%) | métricas do período |
 | Geral | Métrica de spread | qual F entra no RP bruto: médio, maior ou média dos 10 maiores. Vazio = o do `config.yaml` |
 | Geral | Resultado projetado mín. (Lucro) (%) | RP mínimo do modo Lucro. Vazio = o do `config.yaml` (0,2%) |
@@ -638,31 +679,31 @@ Verde = positivo; vermelho = negativo. Linha com faixa amarela à esquerda = fix
 
 - **Moeda**:
   - a moeda e a cotação (ex.: `AKAM USDT`);
-  - etiquetas: `SUSPEITO` (spread de abertura acima de 30%: pode ser outro token com o mesmo nome), `COTAÇÃO 1:1` (sem cotação USDC/USDG/USD, preço convertido 1:1), `STOCK` (ação tokenizada; vazia na v1);
+  - etiquetas: `SUSPEITO` (preços das duas pontas com mais de 30% de diferença: pode ser outro token com o mesmo nome), `COTAÇÃO 1:1` (sem cotação USDC/USDG/USD, preço convertido 1:1), `STOCK` (ação tokenizada);
   - o tipo: `SPOT — FUTUROS` ou `FUTUROS — FUTUROS`;
   - `desde HH:MM:SS`: quando o sinal apareceu (Brasília; passe o mouse para ver o dia).
 - **Ponta long / Ponta short**:
   - linha 1: corretora, mercado (`spot` ou `futuros`), preço (já em USDT), `(Long)` ou `(Short)`, lote agora em $ e, entre parênteses, o lote médio do período. Passe o mouse para ver o símbolo na corretora e a taxa taker usada;
-  - linha 2: `VOL` volume 24h; `FR` funding com o intervalo e 4 casas, ex.: `+0,0100% (8h)` (`—` no spot); `MAX` limite de ordem (`—` na v1); `VAR` variação 24h;
+  - linha 2: `VOL` volume 24h; `FR` funding com o intervalo e 4 casas, ex.: `+0,0100% (8h)` (`—` no spot); `MAX` limite de ordem; `VAR` variação 24h;
   - nomes: `Kraken Pro spot` = a kraken; `Kraken Futuros` = a krakenfutures; `Lighter Robinhood` = a lighter_rh.
 - **Resultado**:
   - `A` spread de abertura agora; `F` spread de fechamento agora;
   - `FR Yield`: funding líquido (recebido na short menos pago na long), normalizado para 8h, com 4 casas;
-  - destaque `RP líq.` (RP bruto − taxas − slippage extra + funding esperado), com o `bruto` ao lado. No modo comparação o destaque é o `RP bruto`, com o `líq.` ao lado. Passe o mouse para ver as taxas, a margem de slippage e o funding esperado;
+  - destaque `RP líq.` (RP bruto − taxas − slippage extra + funding esperado), com o `bruto` ao lado. Passe o mouse para ver as taxas, a margem de slippage e o funding esperado;
   - modo Farm: `Custo a cada $1.000` de volume (vermelho = você gasta; verde = você ganha).
 - **Histórico (4h)**:
   - `N invertidas` no período;
-  - `A` e `F` médios do período. Contam o período inteiro: o tempo com livro aberto (amostra do livro a cada 5 s) e o tempo sem livro, pelos tickers (melhor bid/ask, amostra a cada 120 s com o período de 4 h; com período maior, a cada período / 120). Cada amostra pesa o tempo que cobre;
+  - `A` e `F` médios do período (incluem o tempo sem livro: [aviso H](#aviso-h-métricas-pelos-tickers));
   - botão de gráfico: abre o gráfico do par.
 - **Fixar** (alfinete, última coluna): leva o sinal para o topo; fica salvo no grupo.
 
 ### 5.4 Barra de status (rodapé)
 
-- `Última atualização`: horário de Brasília, com milissegundos, da última mensagem que o painel recebeu do scanner. Sem sinais, o motor manda um sinal de vida a cada 5 s (só depois de um ciclo que deu certo), então o horário continua andando. `Ao vivo` com o horário parado há mais de 10 s: veja o log. Com `erro no ciclo do motor`, o motor está falhando: mande o log ao desenvolvedor. Sem erro no log, aperte F5.
+- `Última atualização`: horário de Brasília, com milissegundos, da última mensagem do scanner; anda a cada 5 s mesmo sem sinais. `Ao vivo` com o horário parado há mais de 10 s: procure `erro no ciclo do motor` no log; se tiver, mande o log ao desenvolvedor; se não, aperte F5.
 - `N oportunidades` (ou `X de N oportunidades` quando a busca esconde alguns).
 - Conexão do painel com o scanner: `Ao vivo`; `Sem conexão: tentando de novo em Ns` (a tabela fica apagada). Não é a internet das corretoras: é o scanner desligado ou o túnel caído.
 - `PAUSADO`: a tabela está parada (botão **Pausar**).
-- Uma bolinha por corretora: verde = conectada; laranja = reconectando; vermelha = atrasada (sem mensagem há mais de 2 s). Passe o mouse para ver o atraso médio em ms e as reconexões. `Kraken Pro spot` e `Kraken Futuros` são bolinhas separadas.
+- Uma bolinha por corretora: verde = conectada; laranja = reconectando; vermelha = atrasada (sem mensagem há mais de 2 s). Passe o mouse para ver o atraso médio em ms e as reconexões.
 - **Buscar moeda**: filtra só a tela, pela moeda (`BTC` acha `BTC/USDT`).
 - **Pausar / Continuar**: congela a tabela; os dados continuam chegando por trás.
 
@@ -673,24 +714,22 @@ Verde = positivo; vermelho = negativo. Linha com faixa amarela à esquerda = fix
 - `Período: 4h`: o período dos filtros.
 - Resumo no topo: `Maior spread`, `Média dos 10 maiores`, `Spread médio` e o lote médio de cada ponta.
 - Duas linhas: preço da ponta long (azul) e da short (vermelha).
-- As métricas do período da tabela (A/F médios, maiores, invertidas) incluem o tempo sem livro, pelos tickers (melhor bid/ask); o gráfico só mostra as amostras do livro (o tempo com livro aberto). Por isso o `Spread médio` do gráfico pode ser diferente do A médio da tabela. O lote médio vem só do livro nos dois.
+- As métricas da tabela incluem o tempo pelos tickers ([aviso H](#aviso-h-métricas-pelos-tickers)); o gráfico só mostra as amostras do livro (o tempo com livro aberto): o `Spread médio` do gráfico pode ser diferente do A médio da tabela.
 - Mouse em cima: horário, preço e lote de cada ponta, spread naquele ponto e `Spread médio HH:MM – HH:MM` (daquele ponto até agora).
 - `Esc` ou o X fecha.
-- `Não deu para carregar a biblioteca do gráfico`: o gráfico vem da internet (unpkg.com); o resto do painel funciona. O navegador só aceita o arquivo exato da versão 4.2.3 (conferido pelo hash); se o arquivo do unpkg mudar, o gráfico fica desligado (veja a parte 8).
+- `Não deu para carregar a biblioteca do gráfico`: veja a [parte 8](#8-quando-algo-dá-erro); o resto do painel funciona.
 
 ### 5.6 Limitações conhecidas (o que você vê e é assim mesmo)
 
-- As linhas de preço do gráfico são as de abertura (ask do long e bid do short) também na intenção Fechamento; o que muda entre as duas é o spread.
-- O resumo do dia no log (`resumo do dia ... UTC`) é provisório para os sinais que ainda estavam abertos na virada (`N ainda aberto(s)`): eles entram na quantidade e no RP médio, mas não nas durações nem nos `%`. A `/api/validacao` do mesmo dia, aberta depois, já conta o que encerrou.
-- O "dia" da validação é o dia UTC de quando o sinal apareceu: vira às 21:00 de Brasília. Sinal das 22:00 de Brasília conta no dia seguinte.
-- Várias abas com o mesmo grupo de filtros: a aba aberta há mais tempo, ao mudar um filtro, grava o formulário velho dela no grupo inteiro. Use o painel numa aba só. O último navegador aberto define os filtros do scanner.
+- As linhas de preço do gráfico são as de abertura (ask do long e bid do short) também na intenção Fechamento; muda só o spread.
+- O gráfico mostra as amostras até uns 10 s atrás (a tabela não).
+- O `resumo do dia ... UTC` do log é provisório para os sinais ainda abertos na virada (`N ainda aberto(s)`); a `/api/validacao` do mesmo dia, aberta depois, já conta o que encerrou.
+- O dia da validação é o dia UTC: vira às 21:00 de Brasília.
+- Use o painel numa aba só: uma aba antiga, ao mudar um filtro, regrava o grupo inteiro com o formulário velho dela.
 - As colunas `MAX` e a etiqueta `STOCK` ficam vazias na v1.
-- `Funding sincronizado` só confere se as pontas têm o mesmo intervalo de cobrança (não o horário da próxima cobrança).
-- O gráfico do histórico mostra as amostras até uns 10 s atrás: o banco grava as amostras em lotes de 10 s (escreve menos no disco). A tabela ao vivo não tem esse atraso.
-- No modo Farm o scanner só calcula as combinações com uma ponta numa corretora de farm (e as moedas do **Sempre mostrar**). Abaixo do spread mínimo normal (0,3%), cada mercado de farm (ex.: os futuros da Lighter) abre no máximo 50 combinações, as de maior spread (`max_livros_farm_por_mercado`). As métricas do período das outras combinações continuam sendo feitas pelos tickers: ao voltar para o Lucro, elas já estão prontas.
-- As amostras pelos tickers ficam só na memória: ao religar o scanner ou mudar o `Período das métricas`, as métricas voltam com as amostras do livro gravadas no banco e as dos tickers recomeçam do zero. Depois de trocar o período (ou de religar), as métricas levam até um período inteiro para se refazer: nesse tempo, o F médio de um spread que acabou de abrir conta só o tempo desde a troca.
-- A memória das métricas não cresce com o período: com `Período das métricas` maior, as amostras pelos tickers ficam mais espaçadas (período / 120: 24 h = a cada 12 min; 168 h = a cada 84 min), sempre ~120 por par.
-- No tempo sem livro, a `média dos 10 maiores` e a `duração mínima` de invertida ficam na resolução do ticker (uma amostra a cada 120 s com 4 h): a média dos 10 maiores sai menos extrema do que com amostras de 5 s, e uma invertida vista por uma amostra só pelo ticker conta com duração 0. O maior A/F e as invertidas pelo ticker usam o melhor bid/ask (sem comer o livro). O F médio (a métrica padrão) não é afetado.
+- MEXC e XT: a cada 12 a 18 minutos cada livro é assinado de novo; por alguns segundos o par fica sem livro e o sinal pode sumir e voltar.
+- O `VOL` da MEXC spot atualiza a cada 60 s (`intervalo_dados_lentos_s`).
+- No modo Farm, cada mercado de farm abre no máximo 50 combinações abaixo de 0,3% (`max_livros_farm_por_mercado`), as de maior spread.
 
 ---
 
@@ -698,14 +737,37 @@ Verde = positivo; vermelho = negativo. Linha com faixa amarela à esquerda = fix
 
 Cada campo está explicado no próprio `config.yaml` (o que faz, unidade, padrão e quando mexer).
 
-1. Abra o arquivo:
-   - Windows (PowerShell): `notepad config.yaml`
-   - VPS (terminal): `nano config.yaml` (salvar: `Ctrl+O`, `Enter`; sair: `Ctrl+X`)
-2. Mude o valor depois do `:`. Regras: um espaço depois do `:`; recuo de 2 espaços (nunca Tab); percentuais em % (`0.3` = 0,3%) com ponto decimal; sem acento.
-3. Confira (tem que aparecer `config ok`):
-   - Windows: `.venv\Scripts\python -m scanner --validar`
-   - VPS: `.venv/bin/python -m scanner --validar`
-4. Religue: Windows, `Ctrl+C` e ligue de novo; VPS, `sudo systemctl restart scanner`.
+1. Abra o arquivo. Windows (PowerShell, na pasta):
+
+   ```powershell
+   notepad config.yaml
+   ```
+
+   VPS (terminal; salvar: `Ctrl+O`, `Enter`; sair: `Ctrl+X`):
+
+   ```bash
+   cd ~/scanner-arbitragem
+   nano config.yaml
+   ```
+
+2. Mude o valor depois do `:`. Regras: um espaço depois do `:`; recuo de 2 espaços (nunca Tab); percentuais em % (`0.3` = 0,3%) com ponto decimal; sem acento; usuário e senha entre aspas.
+3. Confira. Tem que aparecer `config ok`. Windows (PowerShell):
+
+   ```powershell
+   .venv\Scripts\python -m scanner --validar
+   ```
+
+   VPS (terminal):
+
+   ```bash
+   .venv/bin/python -m scanner --validar
+   ```
+
+4. Religue. Windows: clique na barra de título da janela do scanner, aperte `Ctrl+C` e ligue de novo ([parte 2](#2-rodar-no-windows)). VPS (terminal):
+
+   ```bash
+   sudo systemctl restart scanner
+   ```
 
 ### Os 5 ajustes mais comuns
 
@@ -752,17 +814,7 @@ Depois:
 
 A primeira está em `corretoras`, a segunda em `mercados_por_corretora` e a terceira em `intervalo_funding_h`. Para a `lighter_rh`: `# - lighter_rh` em `corretoras` e `# lighter_rh: 1` em `intervalo_funding_h`. Uma corretora nova que não está no arquivo: acrescente `  - nome` em `corretoras`.
 
-**5. Usuário e senha do painel** (na VPS):
-
-```yaml
-painel:
-  host: 127.0.0.1
-  porta: 8000
-  usuario: dono
-  senha: "troque-por-uma-senha-forte"
-```
-
-Sem senha: `usuario: null` e `senha: null`, só com `host: 127.0.0.1` (ou `localhost`). Usuário sem senha (ou o contrário), ou `host: 0.0.0.0` sem usuário e senha, impede o scanner de ligar.
+**5. Usuário e senha do painel** (na VPS): veja a [parte 3.2](#32-usuário-e-senha-do-painel).
 
 ### Todos os campos
 
@@ -777,10 +829,10 @@ O padrão vale quando a linha não está no `config.yaml`.
 | `max_idade_livro_s` | `30` | s | idade máxima de livro ou ticker parado |
 | `spread_min_livro_pct` | `0.3` | % | spread de abertura mínimo para abrir o livro do par |
 | `manter_livro_s` | `60` | s | livro continua aberto depois que o spread cai |
-| `periodo_metricas_h` | `4` | h | janela das métricas do período |
+| `periodo_metricas_h` | `4` | h | janela das métricas do período (no máximo `retencao_dias` × 24) |
 | `rp_min_lucro_pct` | `0.2` | % | RP líquido mínimo do modo Lucro |
 | `custo_max_farm_pct` | `-0.1` | % | menor RP líquido aceito no modo Farm |
-| `limite_suspeito_pct` | `30` | % | spread de abertura acima disto = suspeito |
+| `limite_suspeito_pct` | `30` | % | diferença entre os preços das pontas acima disto = suspeito |
 | `anti_repeticao_s` | `60` | s | sinal que volta antes disto é o mesmo registro |
 | `ciclo_ms` | `500` | ms | intervalo do cálculo |
 | `amostra_s` | `5` | s | intervalo das amostras gravadas |
@@ -843,14 +895,20 @@ O padrão vale quando a linha não está no `config.yaml`.
 
 **Windows (PowerShell):**
 
-1. Pare o scanner (`Ctrl+C`).
+1. Pare o scanner ([parte 2](#2-rodar-no-windows), passo 3).
 2. Guarde o seu `config.yaml`:
 
    ```powershell
    Copy-Item C:\scanner-arbitragem\config.yaml "$HOME\config-antigo.yaml"
    ```
 
-3. Copie os arquivos da versão nova por cima de `C:\scanner-arbitragem` (aceite substituir). Não copie uma pasta `.venv` que venha junto. Se a pasta veio do GitHub, no lugar disso rode `git pull` na pasta.
+3. Copie os arquivos da versão nova por cima de `C:\scanner-arbitragem` (aceite substituir). Não copie uma pasta `.venv` que venha junto. Se a pasta veio do GitHub (com o Git instalado), no lugar de copiar rode (PowerShell, na pasta):
+
+   ```powershell
+   git checkout -- config.yaml
+   git pull
+   ```
+
 4. Veja o que mudou entre o seu `config.yaml` e o novo:
 
    ```powershell
@@ -880,13 +938,20 @@ O padrão vale quando a linha não está no `config.yaml`.
    scp "$HOME\scanner-arbitragem.tgz" usuario@IP:~/
    ```
 
-2. No terminal da VPS (o `config.yaml` da VPS, com a senha, é guardado e volta no lugar):
+2. No terminal da VPS, pare o scanner, guarde o `config.yaml` da VPS, desempacote e veja a diferença:
 
    ```bash
    sudo systemctl stop scanner
    cp ~/scanner-arbitragem/config.yaml ~/config-vps.yaml
    tar -xzf ~/scanner-arbitragem.tgz -C ~/scanner-arbitragem
-   cp ~/config-vps.yaml ~/scanner-arbitragem/config.yaml
+   diff ~/config-vps.yaml ~/scanner-arbitragem/config.yaml
+   ```
+
+   O `config.yaml` agora é o do PC (já ajustado no passo 4 da parte Windows). Linhas com `<` são as da VPS.
+3. Refaça a [parte 3.2](#32-usuário-e-senha-do-painel) (usuário, senha e host).
+4. Instale, rode os testes, confira e ligue:
+
+   ```bash
    cd ~/scanner-arbitragem
    .venv/bin/python -m pip install -r requirements-dev.txt
    .venv/bin/python -m pytest -q
@@ -905,24 +970,47 @@ Para qualquer erro fora desta tabela: copie a mensagem inteira (e as linhas em v
 | Mensagem | O que fazer |
 | --- | --- |
 | `O termo 'python' não é reconhecido...`, uma mensagem falando da Microsoft Store, ou `python --version` mostra outra versão | O Python 3.12 não está no PATH. Crie o `.venv` com `py -3.12 -m venv .venv` no lugar de `python -m venv .venv` e siga a [parte 1](#1-instalar-no-windows) a partir daí. Se `py` também não existir, reinstale o Python marcando **Add python.exe to PATH**. |
-| `o painel parou (RuntimeError: nao consegui abrir o painel em 127.0.0.1:8000 (a porta ja esta em uso?)); o scanner segue sem painel ate reiniciar` | Já tem outro scanner aberto (outra janela do PowerShell ou, na VPS, o serviço). Feche o outro (`Ctrl+C`; na VPS `sudo systemctl stop scanner`) e ligue de novo. Para ver quem usa a porta: Windows `Get-NetTCPConnection -LocalPort 8000 -State Listen` (coluna `OwningProcess`, depois `Stop-Process -Id NUMERO`); VPS `sudo ss -ltnp 'sport = :8000'`. Ou troque `painel.porta` para `8001` e abra `http://localhost:8001`. |
-| `Erro na configuracao: ...` | A mensagem diz o campo. Exemplos: `rp_min_lucro: campo desconhecido (erro de digitacao?)` (nome errado); `rp_min_lucro_pct: precisa ser um numero`; `o arquivo 'config.yaml' nao e um yaml valido: ... line 2, column 3` (recuo ou `[` `]` errado na linha indicada); `painel.senha: o painel tem usuario mas nao tem senha`; `limites_assinatura: mexcc nao esta em corretoras`. Corrija e rode `--validar` até dar `config ok`. |
+| `o painel parou (RuntimeError: nao consegui abrir o painel em 127.0.0.1:8000 (a porta ja esta em uso?)); o scanner segue sem painel ate reiniciar` | Já tem outro scanner aberto (outra janela do PowerShell ou, na VPS, o serviço). Feche o outro e ligue de novo. Para achar quem usa a porta, veja [Porta em uso](#porta-em-uso), abaixo da tabela. Ou troque `painel.porta` para `8001` e abra `http://localhost:8001`. |
+| `Erro na configuracao: ...` | A mensagem diz o campo. Exemplos: `rp_min_lucro: campo desconhecido (erro de digitacao?)` (nome errado); `rp_min_lucro_pct: precisa ser um numero`; `o arquivo 'config.yaml' nao e um yaml valido: ... line 2, column 3` (recuo ou `[` `]` errado na linha indicada); `painel.senha: o painel tem usuario mas nao tem senha`; `limites_assinatura: mexcc nao esta em corretoras`. Corrija e faça a [parte 6](#6-mudar-a-configuração), passos 3 e 4. |
 | `Erro na configuracao: o arquivo 'config.yaml' nao esta salvo em UTF-8 ...` | O `config.yaml` foi salvo em outra codificação. No Bloco de Notas: Arquivo > Salvar como > Codificação: **UTF-8** > Salvar. Ou tire os acentos que você escreveu. |
 | `Erro: ValueError: corretora 'mexcc' nao existe no ccxt (nome com erro de digitacao?)` | Nome errado em `corretoras`. Os nomes aceitos: `mexc`, `gate`, `bitget`, `bingx`, `xt`, `hyperliquid`, `kraken`, `krakenfutures`, `lighter`, `lighter_rh`. |
 | `mexc: nao consegui carregar a lista de mercados (...); a corretora fica de fora por enquanto e eu tento de novo sozinho em instantes` | A corretora não respondeu ao ligar. As outras seguem e ela tenta de novo sozinha (`ainda nao consegui carregar a lista de mercados ... tentativa N falhou`). Confira se o site dela abre. Se ficar horas assim, avise. |
 | `Erro: RuntimeError: nenhuma corretora carregou a lista de mercados; confira a internet e o config.yaml` | Sem internet ao ligar. Confira a internet e ligue de novo. Na VPS o systemd tenta de novo sozinho a cada 10 s. |
 | `o pacote 'websockets' nao esta instalado: o painel ao vivo (/ws/sinais) nao vai funcionar. Instale com: pip install websockets` (o painel fica em `Sem conexão: tentando de novo em Ns`) | Rode `.venv\Scripts\python -m pip install -r requirements.txt` (VPS: `.venv/bin/python -m pip install -r requirements.txt`) e religue. |
 | `Could not request local forwarding.` ao abrir o túnel SSH | A porta 8000 do PC está ocupada (o scanner do PC ligado). Use `ssh -L 8001:127.0.0.1:8000 usuario@IP` e abra <http://localhost:8001>. |
-| O navegador pede usuário e senha e não aceita | Use exatamente o `painel.usuario` e o `painel.senha` do `config.yaml` da VPS (maiúsculas contam). |
-| `Erro na configuracao: painel.host 0.0.0.0 abre o painel para fora desta maquina, e ele esta sem senha: ...` | Escolha um: preencha `painel.usuario` e `painel.senha` (parte 3.2); ou volte para `host: 127.0.0.1` e abra o painel pelo túnel SSH (parte 3.5, opção A). Rode `--validar` até dar `config ok`. |
+| O navegador pede usuário e senha e não aceita | No `config.yaml` da VPS, `painel.usuario` e `painel.senha` têm que estar entre aspas (ex.: `senha: "123456"`). Digite exatamente o que está entre as aspas (maiúsculas contam). Depois de mudar, faça a parte 6, passos 3 e 4. |
+| `Erro na configuracao: painel.senha: precisa ser texto (ou deixar vazio)` (ou `painel.usuario`) | Ponha o valor entre aspas, ex.: `senha: "123456"`. |
+| `Erro na configuracao: painel.host 0.0.0.0 abre o painel para fora desta maquina, e ele esta sem senha: ...` | Escolha um: preencha `painel.usuario` e `painel.senha` (parte 3.2); ou volte para `host: 127.0.0.1` e abra o painel pelo túnel SSH (parte 3.5, opção A). Faça a [parte 6](#6-mudar-a-configuração), passos 3 e 4. |
 | `Invalid host header` no navegador | O painel sem senha só abre por <http://localhost:8000> ou <http://127.0.0.1:8000> (proteção contra sites que se passam pelo seu PC). Abra por um desses endereços. |
 | `pedido recusado: veio de uma pagina de outro site` na caixa vermelha dos filtros | O painel só aceita mudanças vindas dele mesmo. Abra o painel direto pelo endereço (<http://localhost:8000>, ou `http://IP:8000` na opção B) e aperte F5. |
 | Gráfico com `Não deu para carregar a biblioteca do gráfico` e a internet funcionando | Aperte F12 > aba **Console**. Se aparecer `Failed to find a valid digest in the 'integrity' attribute`, o arquivo do gráfico no unpkg.com mudou e foi bloqueado por segurança: o resto do painel funciona; mande a mensagem ao desenvolvedor. |
 | Testes com `failed` ou `error` | Não ligue o scanner. Copie a saída inteira do `pytest` e mande. |
-| `Erro na configuracao: taxas: bitgte nao esta em corretoras (erro de digitacao?)` | Nome da corretora errado dentro de `taxas`. Corrija para o nome que está em `corretoras` e rode `--validar`. |
-| `Erro na configuracao: validade_funding_s (...) precisa ser maior que intervalo_dados_lentos_s (...)` | Aumente `validade_funding_s` (ou diminua `intervalo_dados_lentos_s`) e rode `--validar`. |
+| `Erro na configuracao: taxas: bitgte nao esta em corretoras (erro de digitacao?)` | Nome da corretora errado dentro de `taxas`. Corrija para o nome que está em `corretoras` e faça a parte 6, passos 3 e 4. |
+| `Erro na configuracao: validade_funding_s (...) precisa ser maior que intervalo_dados_lentos_s (...)` | Aumente `validade_funding_s` (ou diminua `intervalo_dados_lentos_s`) e faça a parte 6, passos 3 e 4. |
 | `banco no formato antigo: convertendo N amostras para o formato compacto` | Normal, uma vez só, ao ligar a versão nova com um `scanner.db` antigo. Espere aparecer `conversao do banco terminada` (com muitas amostras, alguns minutos). Não feche a janela no meio. |
 | `N sinais ficaram abertos na execucao anterior (...)` | Normal depois de uma queda (energia, janela fechada sem `Ctrl+C`): os registros foram fechados com a última hora conhecida. Nada a fazer. |
 | `sessao salva no banco ignorada (...)` | A última sessão guardada não vale mais (ex.: o período ficou acima de `retencao_dias` × 24). O scanner começa no padrão do `config.yaml`; abra o painel e escolha o grupo de filtros de novo. |
+| `Erro na configuracao: periodo_metricas_h (200 h) passa de retencao_dias x 24 (168 h): ...` | Diminua `periodo_metricas_h` (ou aumente `retencao_dias`) e faça a parte 6, passos 3 e 4. |
 | No painel: `periodo_metricas_h: no maximo 168 horas (...)` | O período das métricas passou da retenção do banco. Use até `retencao_dias` × 24 horas (ou aumente `retencao_dias` no `config.yaml`). |
 | `nao consegui gravar no banco (OperationalError: database is locked); N itens (...) voltaram para a fila e o escritor tenta de novo em Ns` | Outro programa está com o `scanner.db` aberto (ex.: DB Browser). Feche esse programa: o scanner grava sozinho o que estava esperando. Com `database or disk is full`, libere espaço no disco. |
+
+### Porta em uso
+
+Windows (PowerShell):
+
+```powershell
+Get-NetTCPConnection -LocalPort 8000 -State Listen
+```
+
+Anote o número da coluna `OwningProcess` e rode (troque `NUMERO` por ele):
+
+```powershell
+Stop-Process -Id NUMERO
+```
+
+VPS (terminal): o número vem depois de `pid=`.
+
+```bash
+sudo ss -ltnp 'sport = :8000'
+sudo kill NUMERO
+```
