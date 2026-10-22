@@ -1,0 +1,25 @@
+{
+  "_conferir": "Fixture montada a partir do formato da documentacao oficial da Lighter (https://apidocs.lighter.xyz/docs/websocket-reference e https://apidocs.lighter.xyz/docs/market-data, lidas em 22/10/2026), SEM rede. PRECISA ser conferida com uma mensagem real no PC do dono: tipo da primeira mensagem (subscribed/order_book), campos nonce/begin_nonce, niveis como {price, size} em texto e timestamp em ms.",
+  "channel": "order_book:0",
+  "offset": 1558300,
+  "order_book": {
+    "code": 0,
+    "asks": [
+      {"price": "2064.54", "size": "0.3285"},
+      {"price": "2064.60", "size": "1.2000"},
+      {"price": "2064.75", "size": "3.0500"}
+    ],
+    "bids": [
+      {"price": "2064.50", "size": "0.8100"},
+      {"price": "2064.42", "size": "2.5000"},
+      {"price": "2064.30", "size": "4.1000"}
+    ],
+    "offset": 1558300,
+    "nonce": 9182390020,
+    "last_updated_at": 1774884082309144,
+    "begin_nonce": 9182389998
+  },
+  "last_updated_at": 1774884082309144,
+  "timestamp": 1774884082326,
+  "type": "subscribed/order_book"
+}

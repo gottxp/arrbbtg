@@ -1,0 +1,37 @@
+{
+  "_conferir": "Fixture montada a partir da documentacao oficial da Lighter (GET /api/v1/orderBookDetails em https://apidocs.lighter.xyz/reference/orderbookdetails, lida em 22/10/2026; valores no estilo da resposta real que o ccxt 4.5.89 traz em ccxt/lighter.py), SEM rede. PRECISA ser conferida com a resposta real no PC do dono: taker_fee em % (\"0.0000\" na conta Standard), status active/inactive, symbol sem a cotacao nos perpetuos.",
+  "code": 200,
+  "order_book_details": [
+    {"symbol": "ETH", "market_id": 0, "market_type": "perp", "base_asset_id": 0, "quote_asset_id": 0,
+     "status": "active", "taker_fee": "0.0000", "maker_fee": "0.0000", "liquidation_fee": "1.0000",
+     "min_base_amount": "0.0050", "min_quote_amount": "10.000000", "order_quote_limit": "",
+     "supported_size_decimals": 4, "supported_price_decimals": 2, "supported_quote_decimals": 6,
+     "size_decimals": 4, "price_decimals": 2, "quote_multiplier": 1, "multiplier": "1.000000000000000000",
+     "last_trade_price": 2064.53, "daily_quote_token_volume": 1328505435.673896, "daily_price_change": -1.33},
+    {"symbol": "BTC", "market_id": 1, "market_type": "perp", "base_asset_id": 0, "quote_asset_id": 0,
+     "status": "active", "taker_fee": "0.0000", "maker_fee": "0.0000", "liquidation_fee": "1.0000",
+     "min_base_amount": "0.00020", "min_quote_amount": "10.000000", "order_quote_limit": "",
+     "supported_size_decimals": 5, "supported_price_decimals": 1, "supported_quote_decimals": 6,
+     "size_decimals": 5, "price_decimals": 1, "quote_multiplier": 1, "multiplier": "1.000000000000000000",
+     "last_trade_price": 64008.4, "daily_quote_token_volume": 1600000000.25, "daily_price_change": 0.52},
+    {"symbol": "1000PEPE", "market_id": 4, "market_type": "perp", "base_asset_id": 0, "quote_asset_id": 0,
+     "status": "active", "taker_fee": "0.0000", "maker_fee": "0.0000", "liquidation_fee": "1.0000",
+     "min_base_amount": "100", "min_quote_amount": "10.000000", "order_quote_limit": "",
+     "supported_size_decimals": 0, "supported_price_decimals": 6, "supported_quote_decimals": 6,
+     "size_decimals": 0, "price_decimals": 6, "quote_multiplier": 1, "multiplier": "1.000000000000000000",
+     "last_trade_price": 0.010013, "daily_quote_token_volume": 8150000.5, "daily_price_change": 2.15},
+    {"symbol": "LUNA", "market_id": 30, "market_type": "perp", "base_asset_id": 0, "quote_asset_id": 0,
+     "status": "inactive", "taker_fee": "0.0000", "maker_fee": "0.0000", "liquidation_fee": "1.0000",
+     "min_base_amount": "1", "min_quote_amount": "10.000000", "order_quote_limit": "",
+     "supported_size_decimals": 1, "supported_price_decimals": 4, "supported_quote_decimals": 6,
+     "size_decimals": 1, "price_decimals": 4, "quote_multiplier": 1, "multiplier": "1.000000000000000000",
+     "last_trade_price": 0.1, "daily_quote_token_volume": 0, "daily_price_change": 0}
+  ],
+  "spot_order_book_details": [
+    {"symbol": "ETH/USDC", "market_id": 2048, "market_type": "spot", "base_asset_id": 1, "quote_asset_id": 3,
+     "status": "active", "taker_fee": "0.0000", "maker_fee": "0.0000", "liquidation_fee": "0.0000",
+     "min_base_amount": "0.0001", "min_quote_amount": "0.000001", "order_quote_limit": "2500000.000000",
+     "supported_size_decimals": 4, "supported_price_decimals": 2, "supported_quote_decimals": 6,
+     "size_decimals": 4, "price_decimals": 2, "last_trade_price": 2731.79}
+  ]
+}

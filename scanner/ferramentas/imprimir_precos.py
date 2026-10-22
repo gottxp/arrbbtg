@@ -4,13 +4,15 @@ Como usar (no terminal, na pasta do projeto):
 
     python -m scanner.ferramentas.imprimir_precos bitget
     python -m scanner.ferramentas.imprimir_precos mexc gate bitget bingx xt hyperliquid
+    python -m scanner.ferramentas.imprimir_precos kraken krakenfutures lighter lighter_rh
 
 Ela conecta na(s) corretora(s) e, a cada 5 segundos, escreve o bid (melhor preco de
 compra) e o ask (melhor preco de venda) de BTC, ETH e SOL, no spot e no futuro.
 Cada corretora mostra os pares que ela tem, com o mesmo simbolo que o scanner usa (ex.: na
 Hyperliquid, "BTC/USDC:USDC", em USDC), e so os mercados ligados em mercados_por_corretora
-do config.yaml (a Hyperliquid, so o futuro). Compare com o site da corretora: os precos tem
-que bater. Com varias corretoras, uma que cair aparece como "parou" e as outras continuam.
+do config.yaml (a Hyperliquid, so o futuro). A Lighter (lighter e lighter_rh) usa o conector proprio
+do scanner, e nao o ccxt; os enderecos dela vem do config.yaml. Compare com o site da corretora: os
+precos tem que bater. Com varias corretoras, uma que cair aparece como "parou" e as outras continuam.
 Ctrl+C para parar. --config escolhe outro config.yaml (padrao: o da pasta, se existir).
 """
 
@@ -23,7 +25,9 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from scanner.coletores.base import Coletor
-from scanner.coletores.ccxt_coletor import ColetorCcxt, criar_exchange_ccxt, mercado_do_simbolo
+from scanner.coletores.ccxt_coletor import ColetorCcxt, mercado_do_simbolo
+from scanner.coletores.fabrica import criar_corretora
+from scanner.coletores.lighter import CORRETORAS_LIGHTER, ColetorLighter, e_lighter
 from scanner.config.carregar import MERCADOS, Config, ErroConfig, carregar_config
 from scanner.modelos import Livro
 
@@ -56,7 +60,11 @@ async def preparar(exchanges: dict, cfg: Config) -> tuple[list[ColetorCcxt], dic
             erros.append(f"{nome}: nao consegui carregar a lista de mercados ({type(resultado).__name__}: {resultado})")
             await exchanges[nome].close()
             continue
-        coletor = ColetorCcxt(nome, exchanges[nome], mercados=cfg.mercados_da_corretora(nome))
+        if e_lighter(nome):  # Task 16: conector proprio da Lighter (so futuros)
+            coletor = ColetorLighter(CORRETORAS_LIGHTER[nome], exchanges[nome],
+                                     intervalo_ping_s=cfg.intervalo_ping_lighter_s)
+        else:
+            coletor = ColetorCcxt(nome, exchanges[nome], mercados=cfg.mercados_da_corretora(nome))
         pares = simbolos_da_corretora(coletor)
         if not pares:
             mercados = ", ".join(cfg.mercados_da_corretora(nome))
@@ -150,7 +158,8 @@ def main(argv=None) -> int:
         description="Mostra os precos (bid/ask) de BTC, ETH e SOL, no spot e no futuro, de uma ou mais corretoras.",
     )
     parser.add_argument("corretoras", nargs="+", metavar="corretora",
-                        help="nome(s) da(s) corretora(s) no ccxt, ex.: mexc gate bitget bingx xt hyperliquid")
+                        help="nome(s) da(s) corretora(s), ex.: mexc gate bitget bingx xt hyperliquid kraken "
+                             "krakenfutures lighter lighter_rh")
     parser.add_argument(
         "--intervalo",
         type=float,
@@ -171,7 +180,7 @@ def main(argv=None) -> int:
 
     try:
         nomes = list(dict.fromkeys(args.corretoras))  # tira nomes repetidos, mantendo a ordem
-        exchanges = {nome: criar_exchange_ccxt(nome) for nome in nomes}
+        exchanges = {nome: criar_corretora(nome, cfg) for nome in nomes}  # a Lighter pelo conector proprio
         asyncio.run(_conferir(exchanges, cfg, args.intervalo))
     except KeyboardInterrupt:
         print("\nEncerrado.")

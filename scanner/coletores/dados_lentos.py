@@ -241,6 +241,28 @@ class DadosLentos:
             resultado[moeda] = valor
         return resultado
 
+    # --- entregues pelo proprio coletor (Lighter, Task 16) --------------------
+
+    def receber_taxas(self, corretora: str, markets: dict) -> None:
+        """Taxas taker lidas dos markets que o proprio coletor carregou (a Lighter nao passa pelo ccxt).
+
+        markets: no formato do ccxt (`market["taker"]` em fracao); vale a mesma regra do REST: a taxa mais
+        comum de cada mercado. A taxa do config.yaml continua valendo sobre esta (veja taxa_taker).
+        """
+        for mercado, taxa in _taxas_taker_dos_mercados(markets).items():
+            self._taxas_api[(corretora, mercado)] = taxa
+
+    def receber_funding(self, corretora: str, ativo: str, taxa_pct, intervalo_h: int) -> None:
+        """Funding de um futuro que chegou pelo WebSocket (Lighter: market_stats), ja em %.
+
+        intervalo_h: de quantas em quantas horas a corretora cobra; o intervalo_funding_h do config.yaml
+        vale sobre ele. Taxa que nao e numero real e ignorada (fica a anterior).
+        """
+        if not _numero_valido(taxa_pct):
+            return
+        horas = self._intervalos_config.get(corretora, intervalo_h)
+        self._funding[(corretora, ativo)] = (float(taxa_pct), horas)
+
     # --- atualizacao (REST) --------------------------------------------------
 
     async def atualizar(self, exchanges: dict) -> None:

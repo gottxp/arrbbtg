@@ -92,6 +92,16 @@ class Config:
     # Intervalo do funding em horas por corretora, ex.: {"hyperliquid": 1}. Vale sobre o que o ccxt informa.
     intervalo_funding_h: dict = field(default_factory=dict)
 
+    # Fase 3 de corretoras (Task 16): enderecos da API publica da Lighter (REST e WebSocket) de cada instancia.
+    # O WebSocket e sempre aberto so leitura (?readonly=true): o scanner nunca opera.
+    url_rest_lighter: str = "https://mainnet.zklighter.elliot.ai"
+    url_ws_lighter: str = "wss://mainnet.zklighter.elliot.ai/stream"
+    url_rest_lighter_rh: str = "https://api.rh.lighter.xyz"
+    url_ws_lighter_rh: str = "wss://api.rh.lighter.xyz/stream"
+    # De quanto em quanto tempo o scanner manda {"type": "ping"} a Lighter, em segundos. O servidor fecha a
+    # conexao que passa 2 minutos sem receber nada do cliente.
+    intervalo_ping_lighter_s: float = 30
+
     # Painel web.
     painel: dict = field(default_factory=_painel_padrao)
 
@@ -247,6 +257,33 @@ def _validar_fontes_cotacao(valor) -> dict:
     return resultado
 
 
+# Fase 3 (Task 16): enderecos da Lighter. REST com http(s)://, WebSocket com ws(s)://.
+CAMPOS_URL_LIGHTER = {
+    "url_rest_lighter": ("https://", "http://"),
+    "url_ws_lighter": ("wss://", "ws://"),
+    "url_rest_lighter_rh": ("https://", "http://"),
+    "url_ws_lighter_rh": ("wss://", "ws://"),
+}
+# O servidor da Lighter fecha a conexao depois de 2 minutos sem nada do cliente: o ping precisa vir antes.
+LIMITE_PING_LIGHTER_S = 120
+
+
+def _validar_url_lighter(campo: str, valor) -> str:
+    inicios = CAMPOS_URL_LIGHTER[campo]
+    if not isinstance(valor, str) or not valor.startswith(inicios) or len(valor) <= len(inicios[0]):
+        raise ErroConfig(f"{campo}: precisa ser um endereco que comeca com {' ou '.join(inicios)} "
+                         f"(valor recebido: {valor!r})")
+    return valor
+
+
+def _validar_ping_lighter(valor) -> float:
+    if not _e_numero(valor) or not 0 < valor < LIMITE_PING_LIGHTER_S:
+        raise ErroConfig(f"intervalo_ping_lighter_s: precisa ser um numero maior que zero e menor que "
+                         f"{LIMITE_PING_LIGHTER_S} (o servidor fecha a conexao em 2 minutos sem nada do cliente); "
+                         f"valor recebido: {valor!r}")
+    return valor
+
+
 def _validar_painel(valor) -> dict:
     """Completa o que faltar no painel com os padroes e confere cada item."""
     if not isinstance(valor, dict):
@@ -311,6 +348,10 @@ def _validar_campo(campo: str, valor):
         if not isinstance(valor, str) or not valor:
             raise ErroConfig("fonte_cotacao: precisa ser o nome de uma corretora com spot, ex.: bitget")
         return valor
+    if campo in CAMPOS_URL_LIGHTER:  # Task 16
+        return _validar_url_lighter(campo, valor)
+    if campo == "intervalo_ping_lighter_s":
+        return _validar_ping_lighter(valor)
     # Sobraram os campos numericos.
     if not _e_numero(valor):
         raise ErroConfig(f"{campo}: precisa ser um numero")

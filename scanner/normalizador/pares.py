@@ -26,7 +26,9 @@ MULTIPLICADORES = (
 # Moedas de cotacao em ordem de preferencia, quando um ativo tem mais de um par na mesma
 # corretora e mercado (ex.: BTC/USDT:USDT e BTC/USDC:USDC): so uma entra no estado.
 # Moeda fora da lista vem depois de todas, em ordem alfabetica.
-PREFERENCIA_COTACAO = ("USDT", "USDC", "USDG")
+# USD (Task 16): na Kraken muitos ativos so tem par em USD e EUR; o USD tem cotacao (USDT/USD da Kraken) e o
+# EUR nao (viraria 1:1 com aviso_cotacao, uns 15% fora). Sem o USD aqui, o EUR venceria pela ordem alfabetica.
+PREFERENCIA_COTACAO = ("USDT", "USDC", "USDG", "USD")
 
 
 def prioridade_cotacao(cotacao: str) -> tuple[int, str]:

@@ -318,12 +318,12 @@ async def tratar_mensagens(coletor, corretora_falsa, simbolos, *mensagens, chave
 
 
 def test_par_de_cotacao_le_o_simbolo_certo_mesmo_sem_ocupar_a_chave_do_estado(caplog):
-    # Kraken: USDT/USD e USDT/EUR sao o mesmo "ativo" USDT no spot; a chave do estado fica com um so
-    # (EUR vem antes de USD na ordem alfabetica). A cotacao do USD le o USDT/USD pelo simbolo.
+    # Kraken: USDT/USD, USDT/EUR e USDT/USDC sao o mesmo "ativo" USDT no spot; a chave do estado fica com um
+    # so (USDC vem antes de USD na preferencia). A cotacao do USD le o USDT/USD pelo simbolo.
     estado = EstadoMercados()
-    kraken = CorretoraFalsa([KRAKEN_USDT_USD, KRAKEN_USDT_EUR])
+    kraken = CorretoraFalsa([KRAKEN_USDT_USD, KRAKEN_USDT_EUR, market_ccxt("USDT/USDC", "USDT", quote="USDC")])
     coletor = ColetorCcxt("kraken", kraken, estado=estado, relogio=relogio)
-    assert coletor.simbolos_por_chave() == {("spot", "USDT"): "USDT/EUR"}
+    assert coletor.simbolos_por_chave() == {("spot", "USDT"): "USDT/USDC"}
     coletor.usar_para_cotacao({"USDT/USD"})
     d = dados_com_cotacao(estado, fonte_cotacao="kraken")
     d.escolher_pares_de_cotacao({"USD"}, {"kraken": kraken.markets})

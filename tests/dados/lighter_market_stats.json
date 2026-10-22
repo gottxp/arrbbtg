@@ -1,0 +1,41 @@
+{
+  "_conferir": "Fixture montada a partir da documentacao oficial da Lighter (canal market_stats/all em https://apidocs.lighter.xyz/docs/websocket-reference, lida em 22/10/2026; o formato de 'all', um objeto por market_id, segue o exemplo do ccxt 4.5.89 em ccxt/pro/lighter.py), SEM rede. PRECISA ser conferida com uma mensagem real no PC do dono: best_bid_price/best_ask_price presentes, current_funding_rate em % por hora, daily_price_change em %, daily_quote_token_volume na moeda de cotacao.",
+  "channel": "market_stats:all",
+  "market_stats": {
+    "0": {
+      "symbol": "ETH", "market_id": 0,
+      "index_price": "2064.61", "mark_price": "2064.55", "mid_price": "2064.52",
+      "best_bid_price": "2064.50", "best_ask_price": "2064.54", "last_trade_price": "2064.53",
+      "open_interest": "122736286.659423", "open_interest_limit": "72057594037927936.000000",
+      "funding_clamp_small": "0.0500", "funding_clamp_big": "4.0000",
+      "current_funding_rate": "0.0012", "funding_rate": "0.0008", "funding_timestamp": 1774882800000,
+      "base_interest_rate": "0.0100", "premium": "-0.0429",
+      "daily_base_token_volume": 643235.2763, "daily_quote_token_volume": 1328505435.673896,
+      "daily_price_low": 2031.42, "daily_price_high": 2090.81, "daily_price_change": -1.332599347722221
+    },
+    "1": {
+      "symbol": "BTC", "market_id": 1,
+      "index_price": "64010.1", "mark_price": "64008.9", "mid_price": "64008.5",
+      "best_bid_price": "64008.0", "best_ask_price": "64009.0", "last_trade_price": "64008.4",
+      "open_interest": "98765432.100000", "open_interest_limit": "72057594037927936.000000",
+      "funding_clamp_small": "0.0500", "funding_clamp_big": "4.0000",
+      "current_funding_rate": "0.0010", "funding_rate": "0.0011", "funding_timestamp": 1774882800000,
+      "base_interest_rate": "0.0100", "premium": "-0.0102",
+      "daily_base_token_volume": 25000.5, "daily_quote_token_volume": 1600000000.25,
+      "daily_price_low": 63100.0, "daily_price_high": 64500.0, "daily_price_change": 0.52
+    },
+    "4": {
+      "symbol": "1000PEPE", "market_id": 4,
+      "index_price": "0.010013", "mark_price": "0.010014", "mid_price": "0.0100135",
+      "best_bid_price": "0.010012", "best_ask_price": "0.010015", "last_trade_price": "0.010013",
+      "open_interest": "5123456.000000", "open_interest_limit": "72057594037927936.000000",
+      "funding_clamp_small": "0.0500", "funding_clamp_big": "4.0000",
+      "current_funding_rate": "-0.0025", "funding_rate": "-0.0019", "funding_timestamp": 1774882800000,
+      "base_interest_rate": "0.0100", "premium": "-0.1200",
+      "daily_base_token_volume": 812345678.0, "daily_quote_token_volume": 8150000.5,
+      "daily_price_low": 0.0098, "daily_price_high": 0.0102, "daily_price_change": 2.15
+    }
+  },
+  "timestamp": 1774884082500,
+  "type": "update/market_stats"
+}

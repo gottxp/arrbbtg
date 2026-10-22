@@ -12,11 +12,36 @@
 #     depender do ccxt (ela cobra de hora em hora).
 # Percentuais estao em % (0.3 = 0,3%).
 # A explicacao completa de cada campo vem no README (ultima etapa do projeto).
+# Fase 3 (Task 16), linhas do exemplo que NAO sao o padrao do codigo:
+#   corretoras: entram tambem kraken (Kraken Pro spot) e lighter; krakenfutures (futuros da Kraken Pro) e
+#     lighter_rh (Lighter Robinhood) ficam comentadas: confirme antes de ativar (especificacao, secao 11).
+#   corretoras_farm: o padrao e vazio (modo Farm desligado); aqui lighter, lighter_rh, kraken e krakenfutures.
+#   mercados_por_corretora: kraken: so spot (os futuros da Kraken Pro sao a corretora krakenfutures).
+#   fontes_cotacao: o padrao e vazio; USD: kraken (os futuros da Kraken cotam em USD e a cotacao vem do par
+#     spot USDT/USD da propria Kraken).
+#   intervalo_funding_h: lighter: 1h (ela cobra de hora em hora).
 
-# Corretoras do modo normal (fases 1 e 2).
-corretoras: [mexc, gate, bitget, bingx, xt, hyperliquid]
+# Corretoras do modo normal (fases 1, 2 e 3).
+#   kraken: Kraken Pro spot; krakenfutures: Kraken Pro futuros (perpetuos em USD). No ccxt sao duas corretoras
+#     (servidores e conexoes diferentes), cada uma com a sua saude no painel; o spot x futuro entre elas vale.
+#   lighter: Lighter principal (so futuros, em USDC); lighter_rh: Lighter Robinhood (so futuros, em USDG).
+#     As duas usam o conector proprio do scanner (sem ccxt) e so leem dados publicos.
+corretoras:
+  - mexc
+  - gate
+  - bitget
+  - bingx
+  - xt
+  - hyperliquid
+  - kraken
+  - lighter
+  # confirme antes de ativar: futuros da Kraken na sua conta / elegibilidade da Lighter Robinhood no Brasil
+  # (especificacao, secao 11). Para ativar, apague o "# " do comeco da linha.
+  # - krakenfutures
+  # - lighter_rh
 # Corretoras do modo Farm (custo de giro baixo, sem buscar lucro). Vazio = modo Farm desligado.
-corretoras_farm: []
+# Pode listar corretoras desligadas: so valem as que estiverem em corretoras.
+corretoras_farm: [lighter, lighter_rh, kraken, krakenfutures]
 
 # Tamanho da ordem usada para calcular o preco de execucao no livro, em USDT.
 tamanho_referencia_usd: 100
@@ -64,6 +89,12 @@ metrica_spread: medio
 #   xt: futuro: taxa de cada par informada pela API (0.06 no padrao); spot: o ccxt NAO traz (0.2 no padrao;
 #       so importa se o spot da xt for ligado em mercados_por_corretora).
 #   hyperliquid: tabela fixa do ccxt: futuro 0.045 (nivel 0).
+#   kraken: spot, taxa de cada par informada pela API (1a faixa da tabela do par; publica: 0.40 para volume
+#     de 30 dias abaixo de $10 mil).
+#   krakenfutures: tabela fixa do ccxt: 0.05 (1a faixa, volume de 30 dias abaixo de $100 mil).
+#   lighter: taxa da API (taker_fee do orderBookDetails, em %): conta Standard 0; Premium 0.028 (sem LIT em
+#     stake; cai com o LIT em stake).
+#   lighter_rh: taxa da API: conta Standard 0; Premium 0.035 (volume de 14 dias abaixo de $1 milhao).
 taxas: {}
 
 # Intervalo para atualizar funding e taxas (REST), em segundos.
@@ -79,9 +110,14 @@ timeout_desassinar_s: 5
 #   xt: so futuros porque o ccxt 4.5.89 nao traz bid/ask em nenhum ticker do spot da XT (conferido no
 #       codigo do ccxt): o spot ficaria sem dados. Para tentar mesmo assim, troque por [spot, futuro]; se
 #       nao funcionar, o log avisa "nenhum metodo de ticker traz bid/ask".
+#   kraken: so spot (os futuros da Kraken Pro sao a corretora krakenfutures).
+#   krakenfutures: so futuros; descomente junto com a krakenfutures em corretoras.
+#   lighter e lighter_rh: nao precisam (o conector da Lighter so le futuros).
 mercados_por_corretora:
   hyperliquid: [futuro]
   xt: [futuro]
+  kraken: [spot]
+  # krakenfutures: [futuro]
 # Metodo do ccxt que cada corretora tenta primeiro para os tickers (etapa 1): watch_tickers (todos os
 # pares numa assinatura), watch_bids_asks (so o melhor bid/ask) ou watch_ticker (um par por assinatura).
 # Sem nada, tenta nessa ordem os que a corretora tem; se um nao servir, passa ao seguinte.
@@ -95,10 +131,13 @@ mensagens_sem_bid_ask: 10
 # Cotacao das moedas fora de USDT (ex.: USDC da Hyperliquid): meio do bid/ask do par spot MOEDA/USDT
 # (ou USDT/MOEDA) da corretora fonte_cotacao. Precisa ser uma corretora ligada e com spot.
 fonte_cotacao: bitget
-# Fonte diferente para alguma moeda. Exemplo (Kraken, fase 3):
-#   fontes_cotacao:
-#     USD: kraken
-fontes_cotacao: {}
+# Fonte diferente para alguma moeda:
+#   USD: kraken: os futuros da Kraken (krakenfutures) e os pares spot da Kraken sem USDT cotam em USD; a
+#     cotacao vem do par spot USDT/USD da propria Kraken (1 USD = 1/preco USDT).
+#   USDG (Lighter Robinhood): vem da fonte_cotacao (bitget) se ela tiver o par spot USDG/USDT; senao, o log
+#     avisa e os pares em USDG usam 1:1 com aviso_cotacao. Outra corretora ligada com o par: USDG: nome.
+fontes_cotacao:
+  USD: kraken
 # Cotacao mais longe de 1 do que isto, em %, e tratada como sem cotacao (usa 1:1 e marca aviso_cotacao).
 faixa_cotacao_pct: 10
 
@@ -107,14 +146,20 @@ faixa_cotacao_pct: 10
 #   hyperliquid: cobra de hora em hora.
 #   bingx e xt: o ccxt ja traz o intervalo de cada contrato (pode ser diferente entre contratos); nao
 #     preencha, senao o mesmo valor vale para todos os contratos da corretora.
+#   lighter e lighter_rh: cobram de hora em hora (o conector ja usa 1h; a linha deixa explicito).
+#   krakenfutures: o ccxt ja informa 1h; descomente junto com a krakenfutures em corretoras.
 intervalo_funding_h:
   hyperliquid: 1
+  lighter: 1
+  # krakenfutures: 1
+  # lighter_rh: 1
 
 # Conexao que cai tenta de novo sozinha, esperando 1s, 2s, 4s... ate este maximo, em segundos.
 espera_max_reconexao_s: 60
 # Maximo de assinaturas por corretora (livros abertos; e tickers, se a corretora so assina um par
 # por vez, como a bingx e a hyperliquid com watch_ticker). Ficam os pares de maior volume 24h.
-# Vazio = sem limite; se o log disser que a mensagem "parece de limite de assinaturas", preencha. Exemplo:
+# Vazio = sem limite; se o log disser que a mensagem "parece de limite de assinaturas", preencha (a Lighter
+# nao documenta o limite dela; vale so para os livros, porque os tickers dela vem numa assinatura so). Exemplo:
 #   limites_assinatura:
 #     bingx: 200
 limites_assinatura: {}
@@ -128,6 +173,16 @@ pasta_logs: logs
 dias_logs: 30
 # De quanto em quanto tempo o log registra memoria, CPU e descartes, em segundos.
 intervalo_log_recursos_s: 300
+
+# Lighter (fase 3): enderecos da API publica de cada instancia (REST e WebSocket). O WebSocket e aberto
+# sempre so leitura (?readonly=true, vale tambem em regiao restrita): o scanner nunca opera.
+url_rest_lighter: https://mainnet.zklighter.elliot.ai
+url_ws_lighter: wss://mainnet.zklighter.elliot.ai/stream
+url_rest_lighter_rh: https://api.rh.lighter.xyz
+url_ws_lighter_rh: wss://api.rh.lighter.xyz/stream
+# De quanto em quanto tempo o scanner manda um ping a Lighter, em segundos (menos que 120: o servidor fecha
+# a conexao depois de 2 minutos sem nada do cliente). Sem nenhuma mensagem por 2 intervalos, reconecta.
+intervalo_ping_lighter_s: 30
 
 # Painel web. Na VPS, preencha usuario e senha.
 painel:

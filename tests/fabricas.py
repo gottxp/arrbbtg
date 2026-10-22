@@ -363,3 +363,100 @@ class EsperaFalsa:
         if self._bloquear:
             await asyncio.Event().wait()
         await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# Lighter falsa (Task 16): conexao WebSocket e cliente REST sem rede
+# ---------------------------------------------------------------------------
+
+
+class WsLighterFalso:
+    """Imita a conexao WebSocket da Lighter (a interface do _ConexaoWs: enviar, receber, fechar), sem rede.
+
+    `enviadas` guarda cada mensagem que o coletor mandou, em ordem. `entregar(*itens)` poe mensagens na fila
+    que `receber` devolve; item que e excecao e levantado (ex.: ConnectionResetError = a conexao caiu). Fila
+    vazia: `receber` espera, como a conexao de verdade esperando a proxima mensagem.
+    respostas: {canal: [mensagens da 1a assinatura, mensagens da 2a, ...]}: quando o coletor assina o canal
+        (ex.: "order_book/0"), as mensagens da vez entram na fila (acabou a lista: repete a ultima).
+    """
+
+    def __init__(self, respostas: dict | None = None):
+        self.enviadas: list[dict] = []
+        self.respostas = {canal: list(vezes) for canal, vezes in (respostas or {}).items()}
+        self._assinaturas: dict[str, int] = {}
+        self._fila: asyncio.Queue = asyncio.Queue()
+        self.fechada = False
+
+    def entregar(self, *itens) -> None:
+        for item in itens:
+            self._fila.put_nowait(item)
+
+    def vazia(self) -> bool:
+        return self._fila.empty()
+
+    async def enviar(self, dados: dict) -> None:
+        if self.fechada:
+            raise ConnectionResetError("conexao falsa ja fechada")
+        self.enviadas.append(dados)
+        canal = dados.get("channel")
+        if dados.get("type") == "subscribe" and canal in self.respostas and self.respostas[canal]:
+            vez = self._assinaturas.get(canal, 0)
+            self._assinaturas[canal] = vez + 1
+            vezes = self.respostas[canal]
+            self.entregar(*vezes[min(vez, len(vezes) - 1)])
+
+    async def receber(self):
+        item = await self._fila.get()
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    async def fechar(self) -> None:
+        if not self.fechada:
+            self.fechada = True
+            self._fila.put_nowait(ConnectionResetError("conexao falsa fechada"))
+
+    def canais(self, tipo: str = "subscribe") -> list[str]:
+        """Os canais das mensagens enviadas de um tipo ("subscribe", "unsubscribe"), em ordem."""
+        return [d.get("channel") for d in self.enviadas if d.get("type") == tipo]
+
+    def pings(self) -> int:
+        return sum(1 for d in self.enviadas if d.get("type") == "ping")
+
+
+class ClienteLighterFalso:
+    """Imita o ClienteLighter (REST + fabrica de conexoes WebSocket) sem rede.
+
+    markets: no formato que o ClienteLighter entrega (veja markets_de_lighter).
+    conexoes: o que cada `conectar_ws` devolve, em ordem: um WsLighterFalso ou uma excecao (a conexao nao
+        abriu). Acabou a lista: `conectar_ws` espera para sempre (o coletor fica tentando, sem rede).
+    """
+
+    def __init__(self, markets: dict, conexoes: list | None = None):
+        self.markets = markets
+        self.proximos_markets = None
+        self.has: dict = {}
+        self._conexoes = list(conexoes or [])
+        self.conectou = 0
+        self.fechado = False
+        self.cargas = 0
+
+    async def load_markets(self, reload=False, params=None):
+        await asyncio.sleep(0)
+        self.cargas += 1
+        if self.proximos_markets is not None:
+            self.markets, self.proximos_markets = self.proximos_markets, None
+        return self.markets
+
+    async def conectar_ws(self):
+        self.conectou += 1
+        await asyncio.sleep(0)
+        if not self._conexoes:
+            await asyncio.Event().wait()
+        item = self._conexoes.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    async def close(self) -> None:
+        self.fechado = True

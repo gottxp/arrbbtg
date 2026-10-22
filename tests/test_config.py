@@ -359,7 +359,7 @@ def test_fonte_padrao_fora_das_corretoras_nao_e_erro(tmp_path):
 def test_config_yaml_do_projeto_traz_as_seis_corretoras_e_os_campos_da_fase_2():
     caminho = RAIZ / "config.yaml"
     c = carregar_config(str(caminho))
-    assert c.corretoras == ["mexc", "gate", "bitget", "bingx", "xt", "hyperliquid"]
+    assert c.corretoras[:6] == ["mexc", "gate", "bitget", "bingx", "xt", "hyperliquid"]  # e as da fase 3
     assert c.mercados_da_corretora("hyperliquid") == ("futuro",)   # spec, secao 2: so futuros
     assert c.metodo_ticker.get("hyperliquid") == "watch_ticker"     # o lote (allMids) nao tem bid/ask
     assert c.intervalo_funding_h.get("hyperliquid") == 1            # funding de hora em hora

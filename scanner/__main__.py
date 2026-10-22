@@ -15,11 +15,15 @@ que nao carregou a lista de mercados ao ligar tenta de novo sozinha (_trazer_de_
 mercados e recarregada a cada `recarregar_mercados_s`, e a cada `intervalo_log_recursos_s` o log
 registra memoria, CPU e o resumo dos descartes. Log no terminal e num arquivo por dia (scanner/logs.py).
 
+Lighter (Task 16): lighter e lighter_rh usam o conector proprio (scanner/coletores/lighter.py) no lugar do
+ccxt; o funding e a taxa delas chegam ao DadosLentos pelo proprio coletor (fora do laco REST dele).
+
 Com --validar, so confere o config.yaml e sai (nao conecta em nada).
 """
 
 import argparse
 import asyncio
+import functools
 import logging
 import sys
 import time
@@ -27,8 +31,10 @@ from collections.abc import Awaitable, Callable
 
 from scanner.api import conferir_painel, criar_app, servir_api
 from scanner.armazenamento import Banco
-from scanner.coletores.ccxt_coletor import ColetorCcxt, criar_exchange_ccxt
+from scanner.coletores.ccxt_coletor import ColetorCcxt
 from scanner.coletores.dados_lentos import DadosLentos
+from scanner.coletores.fabrica import criar_corretora
+from scanner.coletores.lighter import criar_coletor_lighter, e_lighter
 from scanner.coletores.reconexao import espera_reconexao
 from scanner.config.carregar import Config, ErroConfig, carregar_config
 from scanner.estado import EstadoMercados
@@ -411,17 +417,20 @@ async def _encerrar(tarefas: list[asyncio.Task], coletores: dict[str, ColetorCcx
 
 async def rodar(
     cfg: Config,
-    criar_exchange: Callable[[str], object] = criar_exchange_ccxt,
+    criar_exchange: Callable[[str], object] | None = None,
     relogio: Callable[[], float] = time.time,
     ciclos: int | None = None,
 ) -> None:
     """Liga as pecas do scanner e roda ate ser cancelado (ou por `ciclos` ciclos).
 
-    criar_exchange: monta a corretora do ccxt pelo nome (os testes passam corretoras falsas).
+    criar_exchange: monta a corretora pelo nome (os testes passam corretoras falsas); None = criar_corretora
+        (a Lighter pelo conector proprio, as outras pelo ccxt).
     relogio: hora atual em segundos (os testes passam um relogio fixo).
     Levanta ErroConfig se o bloco `painel` for inseguro (antes de conectar em qualquer corretora) e
     RuntimeError se nenhuma corretora carregar a lista de mercados.
     """
+    if criar_exchange is None:  # Task 16: a Lighter pelo conector proprio, as outras pelo ccxt
+        criar_exchange = functools.partial(criar_corretora, cfg=cfg)
     estado = EstadoMercados(cfg.max_silencio_conexao_s, cfg.max_idade_livro_s, cfg.atraso_max_valido_s)
     dados_lentos = DadosLentos(
         cfg.taxas, intervalos_funding=cfg.intervalo_funding_h, estado=estado, fonte_cotacao=cfg.fonte_cotacao,
@@ -445,6 +454,8 @@ async def rodar(
             raise RuntimeError("nenhuma corretora carregou a lista de mercados; confira a internet e o config.yaml")
 
         def criar_coletor(nome: str) -> ColetorCcxt:
+            if e_lighter(nome):  # Task 16: conector proprio (funding e taxa vao direto ao DadosLentos)
+                return criar_coletor_lighter(nome, exchanges[nome], cfg, estado, dados_lentos, relogio)
             return ColetorCcxt(
                 nome, exchanges[nome], estado=estado, relogio=relogio,
                 timeout_desassinar_s=cfg.timeout_desassinar_s,
@@ -468,11 +479,15 @@ async def rodar(
             else:
                 registro.warning("%s: nenhum par em comum com as outras corretoras; fica sem tickers", nome)
 
+        # O laco REST do DadosLentos le as corretoras do ccxt; a Lighter entrega funding e taxa pelo coletor.
         tarefas.append(asyncio.create_task(
-            dados_lentos.rodar({nome: exchanges[nome] for nome in carregadas}, cfg.intervalo_dados_lentos_s),
+            dados_lentos.rodar({nome: exchanges[nome] for nome in carregadas if not e_lighter(nome)},
+                               cfg.intervalo_dados_lentos_s),
             name="dados lentos"))
 
         def ao_entrar(nome: str) -> None:  # corretora que entrou depois: liga os dados lentos dela
+            if e_lighter(nome):  # Task 16: funding e taxa da Lighter chegam pelo proprio coletor
+                return
             tarefas.append(asyncio.create_task(
                 dados_lentos.acompanhar(nome, exchanges[nome], cfg.intervalo_dados_lentos_s),
                 name=f"dados lentos {nome}"))
