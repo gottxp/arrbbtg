@@ -583,3 +583,30 @@ def test_rodar_atualiza_de_tempos_em_tempos_e_sobrevive_a_erro():
     antes = asyncio.run(cenario())
     assert ex.chamadas_lote > antes >= 2  # continuou chamando depois do erro
     assert d.funding("gate", "BTC") is not None
+
+
+# ---------------------------------------------------------------------------
+# Leitura para o motor (Task 10): mercados() e ticker_guardado()
+# ---------------------------------------------------------------------------
+
+def test_mercados_lista_os_pares_com_ticker_mesmo_velho():
+    e = EstadoMercados()
+    e.atualizar_ticker("gate", "spot", "BTC", 100.0, 100.1, recebido_em=0.0)
+    e.atualizar_ticker("gate", "futuro", "BTC", 100.0, 100.1, recebido_em=0.0)
+    e.atualizar_ticker("mexc", "futuro", "ETH", 10.0, 10.1, recebido_em=0.0)
+    assert e.mercados() == {"gate": {("spot", "BTC"), ("futuro", "BTC")}, "mexc": {("futuro", "ETH")}}
+    e.marcar_desconectada("gate")
+    assert e.mercados() == {"mexc": {("futuro", "ETH")}}
+    assert EstadoMercados().mercados() == {}
+
+
+def test_ticker_guardado_ignora_idade_e_conexao_mas_some_ao_desconectar():
+    e = EstadoMercados()
+    e.atualizar_ticker("gate", "spot", "BTC", 100.0, 100.1, recebido_em=0.0, volume_24h_usd=5.0,
+                       simbolo_original="BTC/USDC", cotacao="USDC")
+    assert e.obter_ticker("gate", "spot", "BTC", agora=1000.0) is None  # velho e sem conexao
+    t = e.ticker_guardado("gate", "spot", "BTC")
+    assert (t["cotacao"], t["simbolo_original"], t["volume_24h_usd"]) == ("USDC", "BTC/USDC", 5.0)
+    assert e.ticker_guardado("gate", "futuro", "BTC") is None
+    e.marcar_desconectada("gate")
+    assert e.ticker_guardado("gate", "spot", "BTC") is None

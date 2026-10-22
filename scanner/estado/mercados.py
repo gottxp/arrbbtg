@@ -106,6 +106,25 @@ class EstadoMercados:
             return None
         return ticker
 
+    def ticker_guardado(self, corretora: str, mercado: str, ativo: str) -> dict | None:
+        """O ultimo ticker guardado do par, SEM checar idade nem conexao (None se nao existe).
+
+        Serve so para dados de apoio que mudam devagar (moeda de cotacao, volume 24h, variacao).
+        Para PRECO, use obter_ticker ou obter_livro, que nunca devolvem dado velho.
+        """
+        return self._tickers.get((corretora, mercado, ativo))
+
+    def mercados(self) -> dict[str, set[tuple[str, str]]]:
+        """Por corretora, os (mercado, ativo) que ja receberam ticker. Ex.: {"gate": {("spot", "BTC")}}.
+
+        Inclui pares com dado velho: quem decide se o dado vale e obter_ticker/obter_livro.
+        Uma corretora desconectada (marcar_desconectada) some daqui.
+        """
+        resultado: dict[str, set[tuple[str, str]]] = {}
+        for corretora, mercado, ativo in self._tickers:
+            resultado.setdefault(corretora, set()).add((mercado, ativo))
+        return resultado
+
 
 def pares_para_livro(
     spreads_ticker: dict[str, float],

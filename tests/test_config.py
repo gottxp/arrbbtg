@@ -157,7 +157,7 @@ def test_config_yaml_do_projeto_e_valido_e_so_tem_campos_conhecidos():
 
 
 def test_main_imprime_config_ok(tmp_path, capsys):
-    assert main(["--config", escrever(tmp_path, "corretoras: [bitget]\n")]) == 0
+    assert main(["--config", escrever(tmp_path, "corretoras: [bitget]\n"), "--validar"]) == 0
     assert "config ok" in capsys.readouterr().out
 
 

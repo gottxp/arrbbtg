@@ -1,26 +1,184 @@
-"""Ponto de entrada: python -m scanner [--config caminho]
+"""Ponto de entrada: python -m scanner [--config caminho] [--validar]
 
-Por enquanto so le e valida o config.yaml e imprime "config ok".
+Sobe o scanner: le o config.yaml, conecta nas corretoras (so dados publicos), acompanha os
+tickers de todos os pares, abre o livro dos pares interessantes e, a cada `ciclo_ms`, roda o
+motor (candidatos -> filtros -> sinais -> banco). A cada minuto o log mostra quantos sinais
+estao ativos. Ctrl+C encerra fechando as conexoes e o banco.
+
+Com --validar, so confere o config.yaml e sai (nao conecta em nada).
 """
 
 import argparse
+import asyncio
+import logging
 import sys
+import time
+from collections.abc import Callable
 
-from scanner.config.carregar import ErroConfig, carregar_config
+from scanner.armazenamento import Banco
+from scanner.coletores.ccxt_coletor import ColetorCcxt, criar_exchange_ccxt
+from scanner.coletores.dados_lentos import DadosLentos
+from scanner.config.carregar import Config, ErroConfig, carregar_config
+from scanner.estado import EstadoMercados
+from scanner.motor import Motor, simbolos_para_tickers
+
+# Nome fixo (e nao __name__, que vira "__main__" com python -m): fica debaixo do logger "scanner".
+registro = logging.getLogger("scanner.principal")
+
+# De quanto em quanto tempo o log mostra a quantidade de sinais ativos (especificacao: a cada minuto).
+INTERVALO_LOG_SINAIS_S = 60
+
+
+def configurar_log(nivel: str) -> None:
+    """Log no terminal. "detalhado" mostra tambem as mensagens de depuracao do scanner."""
+    logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("scanner").setLevel(logging.DEBUG if nivel == "detalhado" else logging.INFO)
+
+
+async def _carregar_mercados(exchanges: dict) -> list[str]:
+    """Carrega a lista de mercados de todas as corretoras ao mesmo tempo. Devolve as que conseguiram.
+
+    Uma corretora que falha vai para o log e fica de fora; as outras seguem.
+    """
+    nomes = list(exchanges)
+    resultados = await asyncio.gather(*(exchanges[n].load_markets() for n in nomes), return_exceptions=True)
+    carregadas = []
+    for nome, resultado in zip(nomes, resultados):
+        if isinstance(resultado, BaseException):
+            registro.error("%s: nao consegui carregar a lista de mercados (%s: %s); a corretora fica de fora",
+                           nome, type(resultado).__name__, resultado)
+        else:
+            carregadas.append(nome)
+    return carregadas
+
+
+async def _acompanhar_tickers(coletor: ColetorCcxt, simbolos: list[str]) -> None:
+    """Etapa 1 de uma corretora. Se o stream parar com erro, registra e deixa as outras seguindo."""
+    try:
+        await coletor.iniciar_tickers(simbolos)
+    except Exception as erro:  # cancelamento (Ctrl+C) nao entra aqui
+        registro.error("%s: os tickers pararam (%s: %s); a corretora fica sem sinais ate reiniciar o scanner",
+                       coletor.nome, type(erro).__name__, erro)
+
+
+async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorCcxt], cfg: Config,
+                         relogio: Callable[[], float], ciclos: int | None) -> None:
+    """A cada `ciclo_ms`: roda o ciclo do motor e ajusta os livros abertos (etapa 2).
+
+    ciclos: quantos ciclos rodar (os testes usam 2); None = ate ser cancelado (Ctrl+C).
+    Um erro num ciclo vai para o log e o proximo ciclo tenta de novo.
+    """
+    intervalo_s = cfg.ciclo_ms / 1000
+    relogio_do_laco = asyncio.get_running_loop().time  # relogio que nao pula (so para marcar o ritmo)
+    proximo = relogio_do_laco() + intervalo_s  # espera um ciclo antes do primeiro: da tempo dos tickers chegarem
+    ultimo_log: float | None = None
+    feitos = 0
+    while ciclos is None or feitos < ciclos:
+        await asyncio.sleep(max(0.0, proximo - relogio_do_laco()))
+        # Ritmo fixo de ciclo_ms, descontando o tempo gasto no ciclo; se atrasar, segue sem "recuperar" ciclos.
+        proximo = max(proximo + intervalo_s, relogio_do_laco())
+        agora = relogio()
+        try:
+            motor.ciclo(agora)
+            selecao = motor.selecao_livros(agora)
+            # Todas as corretoras recebem a lista (vazia tambem), para cancelar os livros que sairam.
+            await asyncio.gather(*(c.assinar_livros(selecao.get(nome, set())) for nome, c in coletores.items()))
+        except Exception:
+            registro.exception("erro no ciclo do motor; tentando de novo no proximo ciclo")
+        feitos += 1
+        if ultimo_log is None or agora - ultimo_log >= INTERVALO_LOG_SINAIS_S:
+            ultimo_log = agora
+            registro.info("sinais ativos: %d", len(motor.sinais_ativos()))
+
+
+async def _encerrar(tarefas: list[asyncio.Task], coletores: dict[str, ColetorCcxt], exchanges: dict,
+                    banco: Banco | None) -> None:
+    """Para tudo e libera as conexoes e o banco. Um erro ao fechar uma coisa nao impede fechar as outras."""
+    for tarefa in tarefas:
+        tarefa.cancel()
+    await asyncio.gather(*tarefas, return_exceptions=True)
+    # O coletor fecha os livros e a corretora; a corretora sem coletor (nao carregou) fecha direto.
+    fechamentos = [c.fechar() for c in coletores.values()]
+    fechamentos += [ex.close() for nome, ex in exchanges.items() if nome not in coletores]
+    for erro in await asyncio.gather(*fechamentos, return_exceptions=True):
+        if isinstance(erro, Exception):
+            registro.warning("erro ao fechar uma corretora (%s: %s)", type(erro).__name__, erro)
+    if banco is not None:
+        banco.fechar()
+
+
+async def rodar(
+    cfg: Config,
+    criar_exchange: Callable[[str], object] = criar_exchange_ccxt,
+    relogio: Callable[[], float] = time.time,
+    ciclos: int | None = None,
+) -> None:
+    """Liga as pecas do scanner e roda ate ser cancelado (ou por `ciclos` ciclos).
+
+    criar_exchange: monta a corretora do ccxt pelo nome (os testes passam corretoras falsas).
+    relogio: hora atual em segundos (os testes passam um relogio fixo).
+    Levanta RuntimeError se nenhuma corretora carregar a lista de mercados.
+    """
+    estado = EstadoMercados(cfg.max_silencio_conexao_s, cfg.max_idade_livro_s)
+    dados_lentos = DadosLentos(cfg.taxas)
+    exchanges: dict = {}
+    coletores: dict[str, ColetorCcxt] = {}
+    tarefas: list[asyncio.Task] = []
+    banco: Banco | None = None
+    try:
+        for nome in dict.fromkeys(cfg.corretoras):  # sem nomes repetidos, na ordem da config
+            exchanges[nome] = criar_exchange(nome)
+        banco = Banco(cfg.banco)
+
+        carregadas = await _carregar_mercados(exchanges)
+        if not carregadas:
+            raise RuntimeError("nenhuma corretora carregou a lista de mercados; confira a internet e o config.yaml")
+        coletores = {nome: ColetorCcxt(nome, exchanges[nome], estado=estado, relogio=relogio) for nome in carregadas}
+
+        # Etapa 1: tickers so dos pares que formam alguma combinacao spot x futuro.
+        simbolos = simbolos_para_tickers({nome: c.simbolos_por_chave() for nome, c in coletores.items()})
+        for nome, coletor in coletores.items():
+            if simbolos.get(nome):
+                registro.info("%s: acompanhando %d pares", nome, len(simbolos[nome]))
+                tarefas.append(asyncio.create_task(_acompanhar_tickers(coletor, simbolos[nome]), name=f"tickers {nome}"))
+            else:
+                registro.warning("%s: nenhum par em comum com as outras corretoras; fica sem tickers", nome)
+
+        tarefas.append(asyncio.create_task(
+            dados_lentos.rodar({nome: exchanges[nome] for nome in carregadas}, cfg.intervalo_dados_lentos_s),
+            name="dados lentos",
+        ))
+        motor = Motor(cfg, estado, dados_lentos, banco=banco)
+        await _laco_do_motor(motor, coletores, cfg, relogio, ciclos)
+    finally:
+        await _encerrar(tarefas, coletores, exchanges, banco)
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m scanner", description="Scanner de arbitragem cripto")
     parser.add_argument("--config", default="config.yaml", help="caminho do config.yaml (padrao: ./config.yaml)")
+    parser.add_argument("--validar", action="store_true",
+                        help="so confere o config.yaml e sai, sem conectar nas corretoras")
     args = parser.parse_args(argv)
 
     try:
-        carregar_config(args.config)
+        cfg = carregar_config(args.config)
     except ErroConfig as erro:
         print(f"Erro na configuracao: {erro}", file=sys.stderr)
         return 1
 
-    print("config ok")
+    if args.validar:
+        print("config ok")
+        return 0
+
+    configurar_log(cfg.nivel_log)
+    try:
+        asyncio.run(rodar(cfg))
+    except KeyboardInterrupt:  # Ctrl+C: o asyncio.run ja cancelou tudo e o `rodar` fechou as conexoes
+        print("\nEncerrado.")
+    except Exception as erro:  # mostra o motivo em uma linha, sem o textao do traceback
+        print(f"Erro: {type(erro).__name__}: {erro}", file=sys.stderr)
+        return 1
     return 0
 
 

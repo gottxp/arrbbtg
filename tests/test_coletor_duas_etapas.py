@@ -924,3 +924,27 @@ def test_markets_recarregados_refazem_a_escolha():
 
     asyncio.run(cenario())
     assert estado.obter_ticker("hyperliquid", "futuro", "BTC", agora=500.0)["cotacao"] == "USDT"
+
+
+def test_simbolos_por_chave_um_simbolo_por_mercado_e_ativo():
+    # O __main__ (Task 10) pede tickers exatamente destes simbolos: os que alimentam o estado.
+    markets = {
+        **markets_com_cotacoes("USDC", "USDT"),
+        **MARKETS_GATE_MISTOS,
+        "BTC/USDC": mercado("BTC/USDC", "BTC", quote="USDC"),
+        "1000PEPE/USDT:USDT": mercado("1000PEPE/USDT:USDT", "1000PEPE"),
+    }
+    coletor = ColetorCcxt("gate", ExchangeDuasEtapas(markets=markets))
+    assert coletor.simbolos_por_chave() == {
+        ("futuro", "BTC"): "BTC/USDT:USDT",
+        ("spot", "BTC"): "BTC/USDC",
+        ("futuro", "PEPE"): "1000PEPE/USDT:USDT",
+    }
+
+
+def test_simbolos_por_chave_acompanha_markets_recarregados():
+    ex = ExchangeDuasEtapas(markets={})
+    coletor = ColetorCcxt("gate", ex)
+    assert coletor.simbolos_por_chave() == {}
+    ex.markets = markets_com_cotacoes("USDT", derivativo=False)
+    assert coletor.simbolos_por_chave() == {("spot", "BTC"): "BTC/USDT"}

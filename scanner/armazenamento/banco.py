@@ -167,6 +167,21 @@ class Banco:
                 (chave, ts, a, f, preco_long, preco_short, lote_long, lote_short),
             )
 
+    def gravar_amostras(self, amostras: list[tuple]) -> None:
+        """Grava varias amostras numa transacao so: um acesso ao disco por ciclo, e nao um por amostra.
+
+        Cada item e (chave, ts, a, f, preco_long, preco_short, lote_long, lote_short), na ordem de
+        `gravar_amostra`. Lista vazia nao faz nada.
+        """
+        if not amostras:
+            return
+        with self._trava, self._conn:
+            self._conn.executemany(
+                "INSERT INTO amostras (chave, ts, a, f, preco_long, preco_short, lote_long, lote_short) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                amostras,
+            )
+
     def amostras(self, chave: str, desde: float) -> list[dict]:
         """As amostras de `chave` com `ts >= desde`, da mais antiga para a mais nova."""
         with self._trava:

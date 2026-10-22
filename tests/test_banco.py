@@ -358,3 +358,21 @@ def test_usa_o_mesmo_banco_de_outra_thread(banco):
 
     assert erros == []
     assert len(banco.amostras("k", desde=0)) == 1
+
+
+def test_gravar_amostras_em_lote_numa_transacao(banco):
+    # O motor (Task 10) grava as amostras do ciclo de uma vez: um acesso ao disco por ciclo.
+    banco.gravar_amostras([
+        ("k1", 10.0, 1.0, -1.0, 100.0, 101.0, 1000.0, 900.0),
+        ("k2", 10.0, 2.0, -2.0, 50.0, 51.0, 500.0, 400.0),
+        ("k1", 15.0, 1.5, -0.5, 100.5, 101.5, 1100.0, 950.0),
+    ])
+    assert [a["ts"] for a in banco.amostras("k1", desde=0)] == [10.0, 15.0]
+    assert banco.amostras("k2", desde=0) == [
+        {"ts": 10.0, "a": 2.0, "f": -2.0, "preco_long": 50.0, "preco_short": 51.0, "lote_long": 500.0, "lote_short": 400.0}
+    ]
+
+
+def test_gravar_amostras_lista_vazia_nao_faz_nada(banco):
+    banco.gravar_amostras([])
+    assert banco.amostras("k", desde=0) == []

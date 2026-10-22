@@ -355,9 +355,27 @@ class ColetorCcxt(Coletor):
 
     # --- apoio ---------------------------------------------------------------
 
+    def simbolos_por_chave(self) -> dict[tuple[str, str], str]:
+        """Para cada (mercado, ativo), o simbolo do ccxt cujos dados vao para o estado.
+
+        Ex.: {("spot", "BTC"): "BTC/USDT", ("futuro", "PEPE"): "1000PEPE/USDT:USDT"}. Le
+        `exchange.markets` (carregue antes com load_markets); a escolha e a mesma de
+        `_indexar_markets` (cotacao preferida). O __main__ usa para saber quais tickers pedir.
+        """
+        self._indexar_se_preciso()
+        return dict(self._vencedor_da_chave)
+
     def _registrar_mensagem(self, agora: float) -> None:
         if self._estado is not None:
             self._estado.registrar_mensagem(self.nome, agora)
+
+    def _indexar_se_preciso(self) -> dict:
+        """Refaz o indice se `exchange.markets` mudou (primeira vez ou lista recarregada). Devolve os markets."""
+        markets = getattr(self._exchange, "markets", None)
+        if markets is not self._markets_indexados:
+            self._indexar_markets(markets or {})
+            self._markets_indexados = markets
+        return markets or {}
 
     def _par_do_simbolo(self, simbolo: str) -> ParNormalizado | None:
         """O par normalizado do simbolo, se os dados dele podem ir para o estado; senao None.
@@ -368,15 +386,12 @@ class ColetorCcxt(Coletor):
           - nao e spot nem perpetuo linear (opcao, futuro com vencimento, contrato inverso);
           - perde para outro simbolo do mesmo ativo e mercado por ter cotacao menos preferida.
         """
-        markets = getattr(self._exchange, "markets", None)
-        if markets is not self._markets_indexados:  # primeira vez, ou a lista de mercados foi recarregada
-            self._indexar_markets(markets or {})
-            self._markets_indexados = markets
+        markets = self._indexar_se_preciso()
         par = self._pares.get(simbolo)
         if par is None and simbolo not in self._avisados:
             self._avisados.add(simbolo)
             registro.warning("%s %s: %s; os dados deste par nao vao para o estado",
-                             self.nome, simbolo, self._motivo_fora_do_estado(simbolo, (markets or {}).get(simbolo)))
+                             self.nome, simbolo, self._motivo_fora_do_estado(simbolo, markets.get(simbolo)))
         return par
 
     def _indexar_markets(self, markets: dict) -> None:
