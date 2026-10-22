@@ -8,6 +8,7 @@ um controle no painel e o JavaScript nao usa o que as regras do projeto proibem.
 
 import base64
 import dataclasses
+import json
 import re
 import shutil
 import subprocess
@@ -15,6 +16,7 @@ from dataclasses import replace
 from pathlib import Path
 from urllib.parse import quote
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -118,8 +120,21 @@ def test_navegador_sempre_confere_se_o_arquivo_mudou(cliente):
         assert cliente.get(caminho).headers["cache-control"] == "no-cache"
 
 
-@pytest.mark.parametrize("caminho", ["/nao-existe", "/nao-existe.js", "/painel/app.js", "/../config.yaml"])
+@pytest.mark.parametrize("caminho", ["/nao-existe", "/nao-existe.js", "/painel/app.js"])
 def test_arquivo_que_nao_existe_da_404(cliente, caminho):
+    assert cliente.get(caminho).status_code == 404
+
+
+@pytest.mark.parametrize("caminho, arquivo_que_existe", [
+    ("/%2e%2e/api/app.py", "scanner/api/app.py"),          # um nivel acima da pasta do painel
+    ("/%2e%2e/%2e%2e/config.yaml", "config.yaml"),         # a raiz do projeto
+    ("/%2E%2E/%2E%2E/config.yaml", "config.yaml"),
+])
+def test_travessia_de_pasta_nao_sai_do_painel(cliente, caminho, arquivo_que_existe):
+    # Os ".." codificados chegam ao servidor como estao (o httpx so normaliza ".." sem codificar), e o
+    # arquivo de destino existe de verdade: o 404 e a protecao do StaticFiles, nao um arquivo que falta.
+    assert httpx.URL("http://testserver" + caminho).raw_path == caminho.encode()
+    assert (PASTA_PAINEL.parent.parent / arquivo_que_existe).is_file()
     assert cliente.get(caminho).status_code == 404
 
 
@@ -232,3 +247,123 @@ def test_javascript_nao_usa_innerhtml_nem_caixas_do_navegador():
 def test_app_js_sem_erro_de_sintaxe():
     resultado = subprocess.run(["node", "--check", str(PASTA_PAINEL / "app.js")], capture_output=True, text=True)
     assert resultado.returncode == 0, resultado.stderr
+
+
+# ---------------------------------------------------------------------------
+# Funcoes puras do app.js rodando no node (leitura de numeros e ordenacao)
+# ---------------------------------------------------------------------------
+#
+# O app.js funciona no navegador e, sem a pagina (no node), so exporta as funcoes puras. Os testes
+# abaixo mandam os casos como JSON e conferem o que as funcoes devolvem.
+
+sem_node = pytest.mark.skipif(shutil.which("node") is None, reason="node nao esta instalado")
+
+
+def rodar_no_node(codigo: str, dados):
+    """Carrega o app.js no node (`painel` = funcoes exportadas), roda `codigo` e devolve o JSON que ele imprimir."""
+    programa = (
+        f"const painel = require({json.dumps(str(PASTA_PAINEL / 'app.js'))});\n"
+        "const dados = JSON.parse(process.argv[1]);\n" + codigo
+    )
+    resultado = subprocess.run(["node", "-e", programa, json.dumps(dados)], capture_output=True, text=True, timeout=60)
+    assert resultado.returncode == 0, resultado.stderr
+    return json.loads(resultado.stdout)
+
+
+def ler_numeros(textos: list[str], dolar: bool) -> list:
+    return rodar_no_node("console.log(JSON.stringify(dados.textos.map((t) => painel.lerNumeroDigitado(t, dados.dolar))));",
+                         {"textos": textos, "dolar": dolar})
+
+
+CAMPOS_EM_DOLAR = [
+    ("50.000", 50000), ("1.000.000", 1000000), ("1.000,50", 1000.5), ("12.345.678,9", 12345678.9),
+    ("1.5", 1.5), ("1.0000", 1), ("0.500", 0.5), ("1234.5", 1234.5), (".5", 0.5), (",5", 0.5),
+    ("500", 500), ("0,5", 0.5), ("1,5", 1.5), ("-1.000", -1000), ("2 500", 2500), ("$1.000", 1000),
+]
+INVALIDOS_EM_DOLAR = ["abc", "1,000.50", "1.00.0", "1.000.5", "1,2,3", "1.", "1,", ",", "1.000,", "1e5", "--1", "0.000.000"]
+
+
+@sem_node
+def test_numeros_em_dolar_ponto_com_tres_digitos_e_milhar():
+    textos = [texto for texto, _ in CAMPOS_EM_DOLAR]
+    assert dict(zip(textos, ler_numeros(textos, dolar=True))) == dict(CAMPOS_EM_DOLAR)
+
+
+@sem_node
+def test_numeros_em_dolar_ambiguos_ou_invalidos_sao_recusados():
+    assert ler_numeros(INVALIDOS_EM_DOLAR, dolar=True) == [None] * len(INVALIDOS_EM_DOLAR)
+
+
+@sem_node
+def test_numeros_em_porcentagem_horas_e_contagens_o_ponto_e_decimal():
+    casos = [("0,5", 0.5), ("0.5", 0.5), ("1.000", 1), ("1.5", 1.5), ("-0,1", -0.1), (".5", 0.5), ("10", 10)]
+    invalidos = ["1.000,5", "1,2.3", "1..2", "abc", "1.", "1e5"]
+    textos = [texto for texto, _ in casos]
+    assert dict(zip(textos, ler_numeros(textos, dolar=False))) == dict(casos)
+    assert ler_numeros(invalidos, dolar=False) == [None] * len(invalidos)
+
+
+@sem_node
+def test_numero_mostrado_no_campo_em_formato_brasileiro_e_lido_de_volta_igual():
+    valores_dolar = [50000, 1000.5, 1.5, 0.125, 1500, 999, 1234567.89, -1000, 0.1]
+    valores_decimais = [0.5, 1000, -0.1, 0.0000001, 12.25]
+    resultado = rodar_no_node(
+        "const ida = (v, d) => painel.numeroParaCampo(v, d);"
+        "console.log(JSON.stringify({"
+        " dolar: dados.dolar.map((v) => [ida(v, true), painel.lerNumeroDigitado(ida(v, true), true)]),"
+        " decimal: dados.decimal.map((v) => [ida(v, false), painel.lerNumeroDigitado(ida(v, false), false)])"
+        "}));",
+        {"dolar": valores_dolar, "decimal": valores_decimais},
+    )
+    assert [texto for texto, _ in resultado["dolar"]][:3] == ["50.000", "1.000,5", "1,5"]
+    assert [texto for texto, _ in resultado["decimal"]][:2] == ["0,5", "1000"]
+    assert [valor for _, valor in resultado["dolar"]] == valores_dolar
+    assert [valor for _, valor in resultado["decimal"]] == valores_decimais
+
+
+def sinal_para_ordenar(par, rp_liquido, rp_bruto=0.0, custo=None, a=0.0, detectado="2026-10-22T10:00:00.000Z",
+                       volume_long=1000.0, volume_short=1000.0):
+    ponta = lambda corretora, mercado, volume: {"corretora": corretora, "mercado": mercado, "volume_24h_usd": volume}  # noqa: E731
+    return {"par": par, "tipo": "spot_futuro", "ponta_long": ponta("gate", "spot", volume_long),
+            "ponta_short": ponta("bitget", "futuro", volume_short), "rp_liquido_pct": rp_liquido,
+            "rp_bruto_pct": rp_bruto, "custo_por_1000_usd": custo, "spread_abertura_pct": a, "detectado_em": detectado}
+
+
+SINAIS_PARA_ORDENAR = [
+    sinal_para_ordenar("A/USDT", 0.3, rp_bruto=0.9, custo=-1.5, a=0.5, detectado="2026-10-22T10:00:03.000Z", volume_long=50),
+    sinal_para_ordenar("B/USDT", 0.5, rp_bruto=0.6, custo=None, a=0.9, detectado="2026-10-22T10:00:01.000Z"),
+    sinal_para_ordenar("C/USDT", 0.1, rp_bruto=0.7, custo=0.4, a=0.2, detectado="2026-10-22T10:00:02.000Z",
+                       volume_long=None),
+    sinal_para_ordenar("D/USDT", 0.5, rp_bruto=0.1, custo=0.2, a=0.3, detectado="2026-10-22T10:00:00.000Z",
+                       volume_long=3000, volume_short=5000),
+]
+
+
+def ordem(criterio, modo="lucro", comparacao=False, fixados=()):
+    resultado = rodar_no_node(
+        "painel.estado.modo = dados.modo; painel.estado.comparacao = dados.comparacao;"
+        "const lista = dados.sinais.map((s) => { const chave = painel.chaveDoSinal(s);"
+        " return { chave, sinal: s, fixado: dados.fixados.includes(s.par) }; });"
+        "painel.ordenar(lista, dados.criterio);"
+        "console.log(JSON.stringify(lista.map((item) => item.sinal.par[0])));",
+        {"sinais": SINAIS_PARA_ORDENAR, "criterio": criterio, "modo": modo, "comparacao": comparacao,
+         "fixados": list(fixados)},
+    )
+    return "".join(resultado)
+
+
+@sem_node
+def test_ordenacao_do_painel():
+    assert ordem(None) == "BDAC"  # RP liquido decrescente; empate (B e D) pela chave
+    assert ordem("resultado", comparacao=True) == "ACBD"  # comparacao: RP bruto
+    assert ordem(None, modo="farm") == "ADCB"  # Farm: menor custo primeiro; sem custo por ultimo
+    assert ordem("horario") == "ACBD"  # mais recente primeiro
+    assert ordem("spread") == "BADC"  # A atual decrescente
+    assert ordem("volume") == "DBAC"  # o menor volume das duas pontas; volume desconhecido por ultimo
+    assert ordem(None, fixados=["C/USDT", "A/USDT"]) == "ACBD"  # fixados no topo, na mesma ordem do criterio
+
+
+@sem_node
+def test_chave_do_sinal_igual_a_do_motor():
+    sinal = sinal_para_ordenar("BTC/USDT", 0.1)
+    assert rodar_no_node("console.log(JSON.stringify(painel.chaveDoSinal(dados)));", sinal) == CHAVE_TEXTO

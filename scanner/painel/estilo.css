@@ -190,6 +190,18 @@ input.invalido { border-color: var(--vermelho) !important; }
   padding: 14px 16px 16px;
   min-width: 0;
 }
+/* O conjunto dos campos (fieldset) sem a moldura padrao do navegador. Travado ate os filtros chegarem. */
+.campos-filtros { border: 0; margin: 0; padding: 0; min-width: 0; }
+.campos-filtros:disabled { opacity: 0.45; }
+.aviso-carregando {
+  margin-bottom: 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--borda-forte);
+  border-radius: var(--raio);
+  background: var(--painel-2);
+  color: var(--amarelo);
+}
+.segmento:disabled, .interruptor input:disabled + .interruptor-trilho { opacity: 0.45; cursor: default; }
 .linha-grupo { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px 16px; }
 .campo-grupo { width: auto; }
 .grupo-controles { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }

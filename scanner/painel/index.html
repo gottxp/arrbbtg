@@ -31,11 +31,11 @@
   <div class="marca">Scanner de Arbitragem</div>
   <div class="topo-controles">
     <div class="segmentado" role="group" aria-label="Modo">
-      <button type="button" class="segmento" data-modo="lucro" aria-pressed="true">Lucro</button>
-      <button type="button" class="segmento" data-modo="farm" aria-pressed="false">Farm</button>
+      <button type="button" class="segmento" data-modo="lucro" aria-pressed="true" disabled>Lucro</button>
+      <button type="button" class="segmento" data-modo="farm" aria-pressed="false" disabled>Farm</button>
     </div>
     <label class="interruptor" title="Mostra e decide pelo RP bruto (sem custos), como o Arbimax calcula">
-      <input type="checkbox" id="comparacao">
+      <input type="checkbox" id="comparacao" disabled>
       <span class="interruptor-trilho" aria-hidden="true"></span>
       <span>Modo comparação</span>
     </label>
@@ -53,6 +53,11 @@
 
   <!-- ===================== Filtros ===================== -->
   <section id="filtros" class="filtros" aria-label="Filtros">
+
+    <!-- Ate o painel ler a sessao e os grupos do scanner, os filtros ficam travados (disabled):
+         assim um formulario vazio nunca e gravado por cima do que o scanner tem. -->
+    <div id="aviso-carregando" class="aviso-carregando" role="status">Carregando filtros…</div>
+    <fieldset id="campos-filtros" class="campos-filtros" disabled>
 
     <div class="linha-grupo">
       <div class="campo campo-grupo">
@@ -277,6 +282,7 @@
         <input id="f-lista_negra" data-campo="lista_negra" data-tipo="lista" autocomplete="off" placeholder="BTC, ETH">
       </div>
     </div>
+    </fieldset>
   </section>
 
   <!-- ===================== Tabela de sinais ===================== -->

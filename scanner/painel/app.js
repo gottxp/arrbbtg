@@ -32,6 +32,8 @@ const INTERVALO_STATUS_MS = 3000;      // de quanto em quanto tempo pergunta a s
 const RECONEXAO_INICIAL_MS = 1000;     // primeira espera para reconectar o WebSocket...
 const RECONEXAO_MAXIMA_MS = 30000;     // ...que dobra a cada falha, ate 30 s
 const ESPERA_BIBLIOTECA_MS = 15000;    // quanto esperar a biblioteca do grafico chegar
+const LIMITE_PEDIDO_MS = 10000;        // pedido ao scanner sem resposta em 10 s e dado como falho
+const RECARREGAR_FILTROS_MAX_MS = 10000;  // ao abrir, tenta ler os filtros de novo em 1 s, 2 s... ate 10 s
 const FUSO = "America/Sao_Paulo";      // horario de Brasilia
 
 // Nomes guardados no navegador (localStorage). So conveniencia: sem eles o painel funciona igual.
@@ -232,21 +234,48 @@ function rotuloCorretoraMercado(valor) {
   return `${nomeCorretora(corretora)} ${NOMES_MERCADOS[mercado] || mercado}`;
 }
 
-/** Numero em texto para o formulario, com virgula: 0.5 -> "0,5". */
-function numeroParaCampo(valor) {
-  return numeroValido(valor) ? String(valor).replace(".", ",") : "";
+// Como o numero aparece no campo depois de lido (o dono ve o que valeu). Os dois formatos sao lidos
+// de volta pelo lerNumeroDigitado exatamente com o mesmo valor.
+const formatoCampoDolar = new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 20 });                 // 50.000 · 1.000,5
+const formatoCampoDecimal = new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 20, useGrouping: false }); // 0,5 · 1000
+
+/** Numero em texto para o formulario. Em dolar com separador de milhar ("50.000"); nos outros, "0,5". */
+function numeroParaCampo(valor, dolar) {
+  if (!numeroValido(valor)) return "";
+  return (dolar ? formatoCampoDolar : formatoCampoDecimal).format(valor);
 }
 
 /**
- * Le um numero digitado ("0,5", "0.5", "-0,1", "1.000,5"). Devolve null se o texto nao for um numero.
- * Virgula ou ponto servem de separador decimal; com os dois, o ponto e separador de milhar.
+ * Le um numero digitado. Devolve null se o texto nao for um numero claro (o campo fica vermelho).
+ *
+ * Campos em dolar (dolar = true), no jeito brasileiro:
+ *   "50.000" = 50000 · "1.000.000" = 1000000 · "1.000,50" = 1000,5 · "0,5" = 0,5
+ *   ponto seguido de grupos de exatamente 3 digitos e separador de milhar; fora isso, um ponto so
+ *   e decimal ("1.5" = 1,5). Misturas como "1,000.50" ou "1.00.0" sao recusadas.
+ * Outros campos (%, horas, segundos, contagens): virgula ou ponto e o separador decimal, um so
+ *   ("0,5" = "0.5" = 0,5; "1.000" = 1). "1.000,5" e recusado.
+ * Espacos sao ignorados; em dolar, um "$" na frente tambem.
  */
-function lerNumeroDigitado(texto) {
-  let limpo = texto.replace(/\s/g, "");
-  if (limpo.includes(",") && limpo.includes(".")) limpo = limpo.replace(/\./g, "");
-  limpo = limpo.replace(",", ".");
-  if (!/^[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(limpo)) return null;
-  const numero = Number(limpo);
+function lerNumeroDigitado(texto, dolar) {
+  let limpo = String(texto).replace(/\s/g, "");
+  let sinal = "";
+  if (/^[-+]/.test(limpo)) {
+    sinal = limpo[0] === "-" ? "-" : "";
+    limpo = limpo.slice(1);
+  }
+  if (dolar) limpo = limpo.replace(/^\$/, "");
+  let normal = null;  // o numero no formato do JavaScript ("1000.5")
+  if (dolar) {
+    if (/^\d+$/.test(limpo)) normal = limpo;                                                // 500
+    else if (/^[1-9]\d{0,2}(\.\d{3})+$/.test(limpo)) normal = limpo.replace(/\./g, "");    // 50.000
+    else if (/^([1-9]\d{0,2}(\.\d{3})+|\d*),\d+$/.test(limpo)) {                          // 1.000,50 · 0,5 · ,5
+      normal = limpo.replace(/\./g, "").replace(",", ".");
+    } else if (/^\d*\.\d+$/.test(limpo)) normal = limpo;                                     // 1.5 · 0.500
+  } else if (/^(\d+|\d*[.,]\d+)$/.test(limpo)) {
+    normal = limpo.replace(",", ".");
+  }
+  if (normal === null) return null;
+  const numero = Number(sinal + normal);
   return Number.isFinite(numero) ? numero : null;
 }
 
@@ -267,6 +296,8 @@ const estado = {
   conexao: "conectando",  // conectando | ao_vivo | reconectando
   proximaTentativaMs: null,
   ultimaMensagemMs: null, // quando chegou a ultima mensagem do WebSocket
+  carregado: false,       // o formulario ja foi preenchido com a sessao e os grupos do servidor?
+                          // Ate isso acontecer, o painel nao grava nada (nem sessao, nem grupo).
   corretoras: [],         // nomes das corretoras (do /api/status)
   saude: null,            // ultima resposta do /api/status
   saudeFalhou: false,
@@ -296,27 +327,37 @@ function textoDoErro(dados, status) {
   return `o servidor respondeu com erro ${status}`;
 }
 
-/** Faz um pedido HTTP ao scanner e devolve o JSON da resposta. Em erro, levanta ErroServidor. */
+/**
+ * Faz um pedido HTTP ao scanner e devolve o JSON da resposta. Em erro, levanta ErroServidor
+ * (status 0 = nao chegou ao scanner: sem conexao ou sem resposta em LIMITE_PEDIDO_MS).
+ */
 async function pedir(metodo, caminho, corpo) {
-  const opcoes = { method: metodo, headers: {}, cache: "no-store" };
+  const cancelar = new AbortController();
+  const limite = setTimeout(() => cancelar.abort(), LIMITE_PEDIDO_MS);  // pedido pendurado nao trava o painel
+  const opcoes = { method: metodo, headers: {}, cache: "no-store", signal: cancelar.signal };
   if (corpo !== undefined) {
     opcoes.headers["Content-Type"] = "application/json";
     opcoes.body = JSON.stringify(corpo);
   }
-  let resposta;
   try {
-    resposta = await fetch(caminho, opcoes);
-  } catch (erro) {
-    throw new ErroServidor("sem conexão com o scanner", 0);
+    let resposta;
+    try {
+      resposta = await fetch(caminho, opcoes);
+    } catch (erro) {
+      throw new ErroServidor(cancelar.signal.aborted ? "o scanner não respondeu a tempo" : "sem conexão com o scanner", 0);
+    }
+    let dados = null;
+    try {
+      dados = await resposta.json();
+    } catch (erro) {
+      if (cancelar.signal.aborted) throw new ErroServidor("o scanner não respondeu a tempo", 0);
+      dados = null;
+    }
+    if (!resposta.ok) throw new ErroServidor(textoDoErro(dados, resposta.status), resposta.status);
+    return dados;
+  } finally {
+    clearTimeout(limite);
   }
-  let dados = null;
-  try {
-    dados = await resposta.json();
-  } catch (erro) {
-    dados = null;
-  }
-  if (!resposta.ok) throw new ErroServidor(textoDoErro(dados, resposta.status), resposta.status);
-  return dados;
 }
 
 /** A chave de um sinal: par|tipo|corretora_long|mercado_long|corretora_short|mercado_short (igual a do motor). */
@@ -348,22 +389,33 @@ function rotuloDoCampo(elemento) {
   return rotulo ? rotulo.textContent.trim() : elemento.dataset.campo;
 }
 
-/** Campo de numero: texto vazio = null (filtro desligado). Aceita virgula ou ponto. */
+/**
+ * Campo de numero: texto vazio = null (filtro desligado). Os campos em dolar (nome terminando em
+ * "_usd") leem "50.000" como cinquenta mil; os outros usam virgula ou ponto como decimal (veja
+ * lerNumeroDigitado). Ao sair do campo, o numero aparece no formato brasileiro, para o dono ver o que valeu.
+ */
 function controleNumero(entrada) {
+  const dolar = entrada.dataset.campo.endsWith("_usd");
+  const exemplo = dolar ? "use 50000, 50.000 ou 1.000,50" : "use 0,5 ou 0.5";
+  const invalido = () => entrada.value.trim() !== "" && lerNumeroDigitado(entrada.value, dolar) === null;
   entrada.addEventListener("input", () => {
-    entrada.classList.toggle("invalido", entrada.value.trim() !== "" && lerNumeroDigitado(entrada.value) === null);
+    entrada.classList.toggle("invalido", invalido());
     aoMudarFiltro(ESPERA_DIGITACAO_MS);
+  });
+  entrada.addEventListener("change", () => {
+    if (entrada.value.trim() === "" || invalido()) return;
+    entrada.value = numeroParaCampo(lerNumeroDigitado(entrada.value, dolar), dolar);
   });
   return {
     ler() {
       const texto = entrada.value.trim();
       if (texto === "") return null;
-      const numero = lerNumeroDigitado(texto);
-      if (numero === null) throw new ErroCampo(`${rotuloDoCampo(entrada)}: "${texto}" não é um número`);
+      const numero = lerNumeroDigitado(texto, dolar);
+      if (numero === null) throw new ErroCampo(`${rotuloDoCampo(entrada)}: "${texto}" não é um número claro (${exemplo})`);
       return numero;
     },
     escrever(valor) {
-      entrada.value = numeroParaCampo(valor);
+      entrada.value = numeroParaCampo(valor, dolar);
       entrada.classList.remove("invalido");
     },
   };
@@ -636,7 +688,13 @@ let temporizadorEnvio = null;
 let enviando = false;
 let enviarDeNovo = false;
 let salvarGrupoPendente = false;  // houve mudanca de filtro ainda nao salva no grupo
-let semConexaoNoEnvio = false;    // o ultimo envio nao chegou ao scanner (sem conexao): reenviar ao reconectar
+let semConexaoNoEnvio = false;    // o ultimo envio nao chegou ao scanner (sem conexao ou sem resposta)
+
+// Versao do formulario: sobe a cada mudanca feita na tela (filtro, modo, comparacao, grupo escolhido).
+// `versaoConfirmada` e a ultima que o scanner aceitou. Se sao diferentes, o dono tem uma mudanca que o
+// scanner ainda nao recebeu (esperando digitacao, em envio, sem conexao, recusada ou numero invalido).
+let versaoFormulario = 0;
+let versaoConfirmada = 0;
 
 /** Um filtro mudou: manda depois de `atraso` ms (campos de texto esperam o dono parar de digitar). */
 function aoMudarFiltro(atraso) {
@@ -646,6 +704,7 @@ function aoMudarFiltro(atraso) {
 
 /** Agenda o envio da sessao (um novo agendamento substitui o anterior). */
 function agendarEnvio(atraso) {
+  versaoFormulario += 1;
   clearTimeout(temporizadorEnvio);
   temporizadorEnvio = setTimeout(() => {
     temporizadorEnvio = null;
@@ -671,6 +730,10 @@ async function enviarSessao() {
 }
 
 async function enviarSessaoUmaVez() {
+  // Regra de seguranca: nada e gravado antes de o formulario ter sido preenchido com o que o scanner
+  // tem (senao um formulario vazio apagaria a sessao do motor ou um grupo salvo).
+  if (!estado.carregado) return;
+  const versao = versaoFormulario;
   const { filtros, erros } = lerFiltros();
   if (erros.length) {
     mostrarErroFiltros("Corrija antes de aplicar:\n" + erros.join("\n"));
@@ -687,12 +750,13 @@ async function enviarSessaoUmaVez() {
       estado.grupos[grupo] = await pedir("POST", "/api/filtros/" + encodeURIComponent(grupo), filtros);
     }
     semConexaoNoEnvio = false;
+    versaoConfirmada = Math.max(versaoConfirmada, versao);
     mostrarErroFiltros("");
   } catch (erro) {
     if (salvarGrupo) salvarGrupoPendente = true;  // tenta salvar no grupo de novo no proximo envio
     semConexaoNoEnvio = erro.status === 0;
     mostrarErroFiltros(semConexaoNoEnvio
-      ? "Sem conexão com o scanner: os filtros serão enviados quando a conexão voltar."
+      ? `Os filtros não chegaram ao scanner (${erro.message}): serão enviados quando a conexão voltar.`
       : "O scanner recusou os filtros: " + erro.message);
   }
   atualizarCabecalhos();
@@ -705,32 +769,57 @@ async function terminarEnvioPendente() {
     temporizadorEnvio = null;
     await enviarSessao();
   }
-  while (enviando) await esperar(30);
+  while (enviando) await esperar(30);  // cada pedido tem tempo limite, entao isto sempre termina
+}
+
+/** True se o dono esta mexendo nos filtros ou tem uma mudanca que o scanner ainda nao recebeu. */
+function haMudancaLocal() {
+  const foco = document.activeElement;
+  const editando = Boolean(foco && foco.closest && foco.closest("#filtros [data-campo]"));
+  return editando || versaoFormulario !== versaoConfirmada;
+}
+
+/** Tem a propriedade `nome` (e nao herdada, ex.: "constructor"). */
+function tem(objeto, nome) {
+  return Object.prototype.hasOwnProperty.call(objeto, nome);
 }
 
 /**
- * Traz do servidor a sessao em uso e os grupos salvos e mostra no formulario (ao abrir a pagina e a
- * cada reconexao: se o scanner reiniciou, a sessao dele voltou ao padrao).
- * Se o grupo escolhido (ou lembrado neste navegador) existe e tem filtros diferentes, ele e aplicado de novo.
- * Se uma mudanca do dono nao chegou ao scanner por falta de conexao, ela e mandada agora (o formulario fica).
+ * Traz do servidor a sessao em uso e os grupos salvos (ao abrir a pagina e a cada reconexao: se o
+ * scanner reiniciou, a sessao dele voltou ao padrao).
+ * - Primeira vez: preenche o formulario com a sessao, libera os filtros e, se o grupo lembrado neste
+ *   navegador existe e tem filtros diferentes, mostra e aplica o grupo.
+ * - Depois: se o dono esta mexendo ou tem mudanca nao enviada, o formulario fica como esta e vai para o
+ *   scanner (no mesmo grupo que ele via escolhido). Senao, o formulario mostra a sessao do scanner e o
+ *   grupo escolhido e reaplicado se for diferente.
  */
 async function sincronizarComServidor() {
   await terminarEnvioPendente();
   const [sessao, grupos] = await Promise.all([pedir("GET", "/api/sessao"), pedir("GET", "/api/filtros")]);
+  const primeiraVez = !estado.carregado;
   estado.sessao = sessao;
   estado.grupos = grupos || {};
-  const preferido = estado.grupoSelecionado || lerGuardado(GUARDADO_GRUPO);
-  estado.grupoSelecionado = preferido && Object.prototype.hasOwnProperty.call(estado.grupos, preferido) ? preferido : "";
-  if (semConexaoNoEnvio) {
+  if (primeiraVez) {
+    const lembrado = lerGuardado(GUARDADO_GRUPO);
+    estado.grupoSelecionado = lembrado && tem(estado.grupos, lembrado) ? lembrado : "";
+  } else if (estado.grupoSelecionado && !tem(estado.grupos, estado.grupoSelecionado)) {
+    estado.grupoSelecionado = "";  // apagado no scanner (por outra aba): nao recriar sem querer
+    salvarGrupoPendente = false;
+    guardar(GUARDADO_GRUPO, null);
+  }
+
+  if (!primeiraVez && haMudancaLocal()) {
     preencherGrupos();
     agendarEnvio(0);
     return;
   }
+
   estado.modo = sessao.modo;
   estado.comparacao = sessao.comparacao === true;
   escreverFiltros(sessao.filtros);
   mostrarErroFiltros("");
-
+  versaoConfirmada = versaoFormulario;  // o formulario agora e igual ao scanner
+  if (primeiraVez) liberarFormulario();
   if (estado.grupoSelecionado) {
     const filtrosDoGrupo = estado.grupos[estado.grupoSelecionado];
     if (textoEstavel(filtrosDoGrupo) !== textoEstavel(sessao.filtros)) {
@@ -741,6 +830,41 @@ async function sincronizarComServidor() {
   preencherGrupos();
   atualizarControlesDeSessao();
   desenharAgora();
+}
+
+// Uma sincronizacao por vez (a da abertura e a da reconexao podem coincidir).
+let sincronizacaoEmAndamento = null;
+function sincronizar() {
+  if (!sincronizacaoEmAndamento) {
+    sincronizacaoEmAndamento = sincronizarComServidor().finally(() => {
+      sincronizacaoEmAndamento = null;
+    });
+  }
+  return sincronizacaoEmAndamento;
+}
+
+/** Ao abrir: le os filtros do scanner, sem depender do WebSocket, tentando de novo ate conseguir. */
+async function carregarFiltrosAoAbrir() {
+  let espera = 1000;
+  while (!estado.carregado) {
+    try {
+      await sincronizar();
+    } catch (erro) {
+      porId("aviso-carregando").textContent =
+        `Carregando filtros… (o scanner não respondeu: ${erro.message}; tentando de novo em ${Math.round(espera / 1000)} s)`;
+      await esperar(espera);
+      espera = Math.min(espera * 2, RECARREGAR_FILTROS_MAX_MS);
+    }
+  }
+}
+
+/** Depois da primeira leitura: libera os filtros, o modo e a comparacao. */
+function liberarFormulario() {
+  estado.carregado = true;
+  porId("campos-filtros").disabled = false;
+  for (const botao of document.querySelectorAll("[data-modo]")) botao.disabled = false;
+  porId("comparacao").disabled = false;
+  porId("aviso-carregando").hidden = true;
 }
 
 // --- Modo e comparacao ---------------------------------------------------------
@@ -814,6 +938,7 @@ function mensagemGrupo(texto, erro) {
 
 /** Escolhe um grupo: carrega os filtros dele no formulario e aplica no scanner. "" = nenhum grupo. */
 async function escolherGrupo(nome) {
+  if (!estado.carregado) return;
   await terminarEnvioPendente();  // o que foi digitado vai para o grupo anterior antes de trocar
   fecharCaixasDoGrupo();
   estado.grupoSelecionado = nome;
@@ -874,11 +999,24 @@ async function salvarNomeDoGrupo() {
   if (!acao) return;
   const nome = porId("grupo-nome").value.trim();
   const atual = estado.grupoSelecionado;
+  if (!estado.carregado) return;
   if (!nome) return mensagemGrupo("Digite um nome para o grupo.", true);
   if (nome.includes("/")) return mensagemGrupo('O nome do grupo não pode ter "/".', true);
   if (acao === "renomear" && nome === atual) return fecharCaixasDoGrupo();
   await terminarEnvioPendente();
-  if (Object.prototype.hasOwnProperty.call(estado.grupos, nome)) {
+  // A lista de grupos vem de novo do scanner: outra aba pode ter criado ou mudado um grupo, e o
+  // "ja existe" nao pode usar uma lista velha (senao um grupo salvo seria substituido sem aviso).
+  try {
+    estado.grupos = (await pedir("GET", "/api/filtros")) || {};
+  } catch (erro) {
+    return mensagemGrupo("Não deu para conferir os grupos no scanner: " + erro.message, true);
+  }
+  if (acao !== "criar" && !tem(estado.grupos, atual)) {
+    await recarregarGrupos();
+    return mensagemGrupo(`O grupo "${atual}" não existe mais no scanner.`, true);
+  }
+  if (tem(estado.grupos, nome)) {
+    preencherGrupos();
     return mensagemGrupo(`Já existe um grupo chamado "${nome}".`, true);
   }
 
@@ -922,7 +1060,7 @@ function pedirConfirmacaoApagar() {
 async function apagarGrupo() {
   const nome = estado.grupoSelecionado;
   fecharCaixasDoGrupo();
-  if (!nome) return;
+  if (!nome || !estado.carregado) return;
   await terminarEnvioPendente();
   try {
     await pedir("DELETE", "/api/filtros/" + encodeURIComponent(nome));
@@ -962,11 +1100,15 @@ function prepararGrupos() {
 //   {"tipo": "snapshot", "sinais": [...]}       substitui a tabela inteira (ao conectar)
 //   {"tipo": "novo" | "atualizado", "sinal": {...}}  poe ou troca o sinal pela chave
 //   {"tipo": "encerrado", "sinal": {...}}        tira o sinal
-// Caiu a conexao: tenta de novo em 1 s, 2 s, 4 s... ate 30 s. (Nao da para saber pelo codigo de
-// fechamento se foi senha errada: no servidor de verdade isso chega como uma falha comum.)
+// Caiu a conexao: tenta de novo em 1 s, 2 s, 4 s... ate 30 s. A espera so volta a 1 s depois que o
+// snapshot chega (um servidor que aceita e fecha logo em seguida nao vira uma tentativa por segundo).
+// Nao da para saber pelo codigo de fechamento se foi senha errada: no servidor de verdade isso chega
+// como uma falha comum.
+// Depois de uma queda, os filtros sao lidos de novo do scanner (ele pode ter reiniciado).
 
 let conexao = null;
 let esperaReconexaoMs = RECONEXAO_INICIAL_MS;
+let caiuDesdeOUltimoSnapshot = false;
 
 function conectar() {
   const protocolo = window.location.protocol === "https:" ? "wss://" : "ws://";
@@ -981,9 +1123,7 @@ function conectar() {
   socket.addEventListener("open", () => {
     estado.conexao = "ao_vivo";
     estado.proximaTentativaMs = null;
-    esperaReconexaoMs = RECONEXAO_INICIAL_MS;
     atualizarBarra();
-    sincronizarComServidor().catch((erro) => mostrarErroFiltros("Não deu para ler os filtros do scanner: " + erro.message));
   });
   socket.addEventListener("message", (evento) => receberMensagem(evento.data));
   socket.addEventListener("close", () => {
@@ -994,6 +1134,7 @@ function conectar() {
 }
 
 function agendarReconexao() {
+  caiuDesdeOUltimoSnapshot = true;
   estado.conexao = "reconectando";
   estado.proximaTentativaMs = Date.now() + esperaReconexaoMs;
   setTimeout(conectar, esperaReconexaoMs);
@@ -1015,6 +1156,11 @@ function receberMensagem(texto) {
     const novos = new Map();
     for (const sinal of mensagem.sinais || []) novos.set(chaveDoSinal(sinal), sinal);
     estado.sinais = novos;
+    esperaReconexaoMs = RECONEXAO_INICIAL_MS;  // a conexao funcionou de verdade
+    if ((caiuDesdeOUltimoSnapshot || semConexaoNoEnvio) && estado.carregado) {
+      caiuDesdeOUltimoSnapshot = false;
+      sincronizar().catch((erro) => mostrarErroFiltros("Não deu para ler os filtros do scanner: " + erro.message));
+    }
   } else if (mensagem.tipo === "novo" || mensagem.tipo === "atualizado") {
     estado.sinais.set(chaveDoSinal(mensagem.sinal), mensagem.sinal);
   } else if (mensagem.tipo === "encerrado") {
@@ -1035,7 +1181,7 @@ const linhasDaTabela = new Map();  // chave -> {tr, sinal, fixado, visao}: reapr
 // continuam na posicao certa e sao atualizadas assim que aparecem na tela (rolando a pagina).
 // Sem isso, centenas de sinais atualizados a cada ciclo deixariam o navegador lento.
 const linhasNaTela = new Set();
-const observadorDeLinhas = "IntersectionObserver" in window
+const observadorDeLinhas = typeof window !== "undefined" && "IntersectionObserver" in window
   ? new IntersectionObserver((entradas) => {
     let apareceu = false;
     for (const entrada of entradas) {
@@ -1071,7 +1217,7 @@ function desenharTabela() {
   const fonte = estado.congelados || estado.sinais;
   const fixados = new Set(estado.fixados.map(String));
   const criterio = controles.ordenar_por ? controles.ordenar_por.ler() : null;
-  const visao = `${estado.modo}|${estado.comparacao}`;  // o que muda o desenho de todas as linhas
+  const visao = `${estado.modo}|${estado.comparacao}|${estado.carregado}`;  // o que muda o desenho de todas as linhas
 
   const lista = [];
   for (const [chave, sinal] of fonte) {
@@ -1294,8 +1440,9 @@ function celulaFixar(fixado) {
   botao.type = "button";
   botao.dataset.acao = "fixar";
   botao.setAttribute("aria-pressed", String(fixado));
-  botao.title = fixado ? "Desafixar" : "Fixar no topo";
+  botao.title = !estado.carregado ? "Carregando filtros…" : fixado ? "Desafixar" : "Fixar no topo";
   botao.setAttribute("aria-label", botao.title);
+  botao.disabled = !estado.carregado;
   botao.appendChild(icone("fixar"));
   td.appendChild(botao);
   return td;
@@ -1303,6 +1450,7 @@ function celulaFixar(fixado) {
 
 /** Fixa ou desafixa um sinal (vai para os filtros: e salvo na sessao e no grupo). */
 function alternarFixado(chave) {
+  if (!estado.carregado) return;  // os fixados fazem parte dos filtros: so depois de le-los do scanner
   const indice = estado.fixados.map(String).indexOf(chave);
   if (indice >= 0) estado.fixados.splice(indice, 1);
   else estado.fixados.push(chave);
@@ -1435,6 +1583,8 @@ async function acompanharSaude() {
   try {
     estado.saude = await pedir("GET", "/api/status");
     estado.saudeFalhou = false;
+    // O scanner respondeu: se uma mudanca de filtro nao tinha chegado nele, manda de novo agora.
+    if (semConexaoNoEnvio && estado.carregado && !enviando && temporizadorEnvio === null) agendarEnvio(0);
     const nomes = Object.keys(estado.saude || {});
     if (textoEstavel(nomes) !== textoEstavel(estado.corretoras)) {
       estado.corretoras = nomes;
@@ -1795,7 +1945,14 @@ function iniciar() {
   atualizarControlesDeSessao();
   desenharAgora();
   acompanharSaude();
-  conectar();  // ao conectar, traz a sessao e os grupos (sincronizarComServidor)
+  carregarFiltrosAoAbrir();  // sessao e grupos do scanner, sem depender do WebSocket
+  conectar();
 }
 
-iniciar();
+// No navegador, a pagina comeca aqui. No node (testes automaticos, sem pagina), o arquivo so entrega
+// as funcoes que nao dependem da pagina, para os testes conferirem a leitura de numeros e a ordenacao.
+if (typeof document !== "undefined") {
+  iniciar();
+} else if (typeof module !== "undefined" && module.exports) {
+  module.exports = { lerNumeroDigitado, numeroParaCampo, ordenar, valorParaOrdenar, chaveDoSinal, estado };
+}
