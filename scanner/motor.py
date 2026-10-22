@@ -790,8 +790,10 @@ class Motor:
             registro.exception("nao consegui gravar %d eventos no banco", len(eventos))
         else:
             for evento, erro in recusados:
-                registro.error("nao consegui gravar o evento %s do sinal %s no banco (%s: %s)",
-                               evento.tipo, evento.sinal.get("id"), type(erro).__name__, erro)
+                sinal = evento.sinal if isinstance(evento.sinal, dict) else {}
+                registro.error("nao consegui gravar no banco o evento %s do sinal id=%s par=%s tipo=%s (%s: %s); "
+                               "os outros eventos do ciclo foram gravados", evento.tipo, sinal.get("id"),
+                               sinal.get("par"), sinal.get("tipo"), type(erro).__name__, erro)
         try:
             self.banco.gravar_amostras([(texto_da_chave(chave), *resto) for chave, *resto in amostras])
         except Exception:

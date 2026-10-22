@@ -1340,7 +1340,7 @@ def test_main_sobe_o_scanner_com_a_config_lida(tmp_path, monkeypatch):
         recebidas.append(config)
 
     monkeypatch.setattr(principal, "rodar", rodar_falso)
-    monkeypatch.setattr(principal, "configurar_log", lambda nivel: None)
+    monkeypatch.setattr(principal, "configurar_log", lambda cfg: None)
     assert principal.main(["--config", escrever_config(tmp_path)]) == 0
     assert recebidas[0].corretoras == ["bitget"]
 
@@ -1350,7 +1350,7 @@ def test_main_ctrl_c_encerra_sem_erro(tmp_path, capsys, monkeypatch):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(principal, "rodar", rodar_falso)
-    monkeypatch.setattr(principal, "configurar_log", lambda nivel: None)
+    monkeypatch.setattr(principal, "configurar_log", lambda cfg: None)
     assert principal.main(["--config", escrever_config(tmp_path)]) == 0
     assert "Encerrado" in capsys.readouterr().out
 
@@ -1360,7 +1360,7 @@ def test_main_erro_ao_rodar_mostra_e_devolve_1(tmp_path, capsys, monkeypatch):
         raise RuntimeError("nenhuma corretora carregou")
 
     monkeypatch.setattr(principal, "rodar", rodar_falso)
-    monkeypatch.setattr(principal, "configurar_log", lambda nivel: None)
+    monkeypatch.setattr(principal, "configurar_log", lambda cfg: None)
     assert principal.main(["--config", escrever_config(tmp_path)]) == 1
     assert "nenhuma corretora carregou" in capsys.readouterr().err
 

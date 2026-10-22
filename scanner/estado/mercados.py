@@ -104,6 +104,16 @@ class EstadoMercados:
         if livro is not None and (simbolo_original is None or livro.simbolo_original == simbolo_original):
             del self._livros[chave]
 
+    def remover_ticker(self, corretora: str, mercado: str, ativo: str, simbolo_original: str | None = None) -> None:
+        """Apaga o ticker do par: a assinatura dele parou (ticker um a um). O livro do par nao e tocado.
+
+        simbolo_original: se informado, so apaga se o ticker guardado veio desse simbolo.
+        """
+        chave = (corretora, mercado, ativo)
+        ticker = self._tickers.get(chave)
+        if ticker is not None and (simbolo_original is None or ticker.get("simbolo_original") == simbolo_original):
+            del self._tickers[chave]
+
     def marcar_desconectada(self, corretora: str) -> None:
         """A conexao caiu: apaga tudo da corretora e o painel passa a mostrar "reconectando".
 
@@ -121,7 +131,8 @@ class EstadoMercados:
     def marcar_reconectada(self, corretora: str) -> None:
         """A conexao voltou (chegou a primeira mensagem boa depois da queda): conta uma reconexao.
 
-        So conta se a corretora estava reconectando; chamar de novo nao conta duas vezes.
+        So conta se a corretora estava reconectando; chamar de novo nao conta duas vezes (o coletor
+        chama a cada mensagem de ticker, e so a primeira depois da queda conta).
         """
         if corretora in self._reconectando:
             self._reconectando.discard(corretora)

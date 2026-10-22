@@ -5,6 +5,8 @@ cada regra de evento (novo, reabrir, encerrar, atualizado, encerrado sem registr
 do dia em `sinais_do_dia`, a persistencia depois de reabrir o arquivo e a limpeza.
 """
 
+import sqlite3
+
 import pytest
 
 from scanner.armazenamento import Banco
@@ -415,3 +417,42 @@ def test_gravar_eventos_lista_vazia_nao_faz_nada(banco):
 def test_modo_wal_com_sincronizacao_normal(banco):
     assert banco._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert banco._conn.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
+
+
+# ---------------------------------------------------------------------------
+# Correcao pos-revisao da Task 14: um evento ruim nunca leva o lote junto
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("campo, valor", [
+    ("par", None), ("par", ""), ("id", None), ("id", 7), ("modo", None), ("tipo", ""),
+    ("detectado_em", None), ("rp_liquido_pct", "0.5x"), ("rp_liquido_pct", True),
+])
+def test_evento_com_campo_obrigatorio_ruim_e_recusado_e_o_bom_e_gravado(banco, campo, valor):
+    bom = Evento("novo", _sinal(id="bom"), registrar_historico=True)
+    ruim = Evento("novo", _sinal(**{"id": "ruim", campo: valor}), registrar_historico=True)
+    recusados = banco.gravar_eventos([bom, ruim])
+    assert [e for e, _ in recusados] == [ruim]
+    assert isinstance(recusados[0][1], ValueError) and campo in str(recusados[0][1])
+    assert _ids(banco, "2026-10-20") == ["bom"]
+
+
+def test_lote_que_falha_no_sqlite_e_refeito_linha_a_linha(banco, monkeypatch):
+    # Se algo passar da validacao e o SQLite recusar no meio do lote, os bons continuam gravados.
+    original = Banco._linha_do_evento
+
+    def sem_validacao(e):
+        if e.sinal["id"] == "ruim":
+            return ("ruim", "lucro", None, "spot_futuro", "2026-10-20T15:00:00.000Z", None, None, "{}")  # par NULL
+        return original(e)
+
+    monkeypatch.setattr(Banco, "_linha_do_evento", staticmethod(sem_validacao))
+    eventos = [Evento("novo", _sinal(id=i), registrar_historico=True) for i in ("a", "ruim", "c")]
+    comandos = []
+    banco._conn.set_trace_callback(comandos.append)
+    recusados = banco.gravar_eventos(eventos)
+    banco._conn.set_trace_callback(None)
+    assert [e.sinal["id"] for e, _ in recusados] == ["ruim"]
+    assert isinstance(recusados[0][1], sqlite3.IntegrityError)
+    assert _ids(banco, "2026-10-20") == ["a", "c"]
+    assert comandos.count("COMMIT") == 1  # a nova tentativa, linha a linha, ainda e uma transacao so

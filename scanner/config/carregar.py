@@ -68,7 +68,7 @@ class Config:
     # Atraso (chegada - horario informado pela corretora) maior que isto, para mais ou para menos,
     # so acontece com relogio errado: fica fora do atraso medio. Em segundos.
     atraso_max_valido_s: float = 30
-    # Logs: pasta dos arquivos (um por dia) e quantos dias de arquivos guardar.
+    # Logs: pasta dos arquivos (um por dia, data local) e quantos dias anteriores guardar alem do de hoje.
     pasta_logs: str = "logs"
     dias_logs: int = 30
     # De quanto em quanto tempo o log registra memoria, CPU e o resumo dos descartes, em segundos.
@@ -249,4 +249,17 @@ def carregar_config(caminho: str) -> Config:
         if campo not in conhecidos:
             raise ErroConfig(f"{campo}: campo desconhecido (erro de digitacao?)")
         valores[campo] = _validar_campo(campo, valor)
-    return Config(**valores)
+    config = Config(**valores)
+    _conferir_nomes_das_corretoras(config)
+    return config
+
+
+def _conferir_nomes_das_corretoras(config: Config) -> None:
+    """Campo por corretora (limites_assinatura) so com corretoras que estao em `corretoras`.
+
+    Um nome com erro de digitacao seria ignorado em silencio (o limite ficaria desligado).
+    """
+    fora = sorted(set(config.limites_assinatura) - set(config.corretoras))
+    if fora:
+        raise ErroConfig(f"limites_assinatura: {', '.join(fora)} nao esta em corretoras (erro de digitacao?); "
+                         f"corretoras: {', '.join(config.corretoras)}")

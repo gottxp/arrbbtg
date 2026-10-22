@@ -66,8 +66,10 @@ limites_assinatura: {}
 # Atraso do dado (chegada - horario da corretora) acima disto, para mais ou para menos, e relogio
 # errado e fica fora do atraso medio do painel, em segundos.
 atraso_max_valido_s: 30
-# Pasta dos logs (um arquivo por dia) e quantos dias de arquivos guardar.
+# Pasta dos logs: um arquivo por dia (scanner-AAAA-MM-DD.log), com o horario LOCAL do computador
+# (cada linha mostra tambem o fuso, ex.: -0300); o arquivo vira a meia-noite local.
 pasta_logs: logs
+# Quantos arquivos de dias anteriores guardar, alem do de hoje (os mais velhos sao apagados).
 dias_logs: 30
 # De quanto em quanto tempo o log registra memoria, CPU e descartes, em segundos.
 intervalo_log_recursos_s: 300

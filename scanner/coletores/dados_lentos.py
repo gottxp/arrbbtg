@@ -124,24 +124,29 @@ class DadosLentos:
                     esperar: Callable[[float], Awaitable] = asyncio.sleep) -> None:
         """Atualiza para sempre (ate ser cancelado), cada corretora no seu proprio ritmo.
 
-        Cada corretora tem o seu laco: atualiza e espera `intervalo_s`. Assim uma corretora lenta
-        (ou travada) nao atrasa a atualizacao das outras. Erro de uma corretora vai para o log e o
-        laco dela tenta de novo na proxima rodada.
+        Cada corretora tem o seu laco (`acompanhar`): uma corretora lenta (ou travada) nao atrasa a
+        atualizacao das outras. Erro de uma corretora vai para o log e o laco dela tenta de novo na
+        proxima rodada.
         esperar: funcao que espera N segundos (os testes trocam para nao dormir de verdade).
         """
-
-        async def laco(corretora: str, exchange) -> None:
-            while True:
-                await self._atualizar_sem_quebrar(corretora, exchange)
-                await esperar(intervalo_s)
-
-        tarefas = [asyncio.create_task(laco(c, e), name=f"dados lentos {c}") for c, e in exchanges.items()]
+        tarefas = [asyncio.create_task(self.acompanhar(c, e, intervalo_s, esperar), name=f"dados lentos {c}")
+                   for c, e in exchanges.items()]
         try:
             await asyncio.gather(*tarefas)
         finally:
             for tarefa in tarefas:
                 tarefa.cancel()
             await asyncio.gather(*tarefas, return_exceptions=True)
+
+    async def acompanhar(self, corretora: str, exchange, intervalo_s: float,
+                         esperar: Callable[[float], Awaitable] = asyncio.sleep) -> None:
+        """O laco de UMA corretora: atualiza, espera `intervalo_s` e repete, ate ser cancelado.
+
+        O __main__ usa direto para a corretora que entra depois (nao tinha carregado os mercados ao ligar).
+        """
+        while True:
+            await self._atualizar_sem_quebrar(corretora, exchange)
+            await esperar(intervalo_s)
 
     async def _atualizar_sem_quebrar(self, corretora: str, exchange) -> None:
         try:

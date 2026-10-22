@@ -190,6 +190,7 @@ def test_campos_da_robustez_com_os_padroes(tmp_path):
 
 def test_campos_da_robustez_lidos_do_yaml(tmp_path):
     c = carregar_config(escrever(tmp_path, (
+        "corretoras: [bingx, mexc]\n"
         "espera_max_reconexao_s: 30\n"
         "limites_assinatura:\n  bingx: 200\n  mexc: 30\n"
         "pasta_logs: registros\n"
@@ -237,3 +238,13 @@ def test_config_yaml_do_projeto_traz_os_campos_da_robustez():
     for campo in ("espera_max_reconexao_s", "limites_assinatura", "pasta_logs", "dias_logs",
                   "intervalo_log_recursos_s", "atraso_max_valido_s"):
         assert campo in chaves, campo
+
+
+def test_limite_de_corretora_que_nao_esta_em_corretoras_da_erro_claro(tmp_path):
+    # Erro de digitacao no nome desligaria o limite em silencio.
+    with pytest.raises(ErroConfig, match="limites_assinatura.*bingks.*corretoras"):
+        carregar_config(escrever(tmp_path, "corretoras: [bingx, gate]\nlimites_assinatura:\n  bingks: 200\n"))
+    with pytest.raises(ErroConfig, match="limites_assinatura.*bingx"):  # corretoras padrao: mexc, gate, bitget
+        carregar_config(escrever(tmp_path, "limites_assinatura:\n  bingx: 200\n"))
+    c = carregar_config(escrever(tmp_path, "corretoras: [bingx, gate]\nlimites_assinatura:\n  bingx: 200\n"))
+    assert c.limites_assinatura == {"bingx": 200}

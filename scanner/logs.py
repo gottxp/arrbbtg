@@ -1,51 +1,114 @@
 """Log do scanner (especificacao, secao 8): terminal + um arquivo por dia, e a medida de memoria e CPU.
 
-Arquivo: `<pasta_logs>/scanner.log` e o do dia; a meia-noite (UTC) ele vira `scanner-AAAA-MM-DD.log`
-e um `scanner.log` novo comeca. Ficam os `dias_logs` arquivos mais novos; os mais velhos sao apagados.
-A troca usa o `logging.handlers.TimedRotatingFileHandler` da biblioteca padrao: e o proprio handler que
-fecha o arquivo antes de renomea-lo, entao funciona no Windows (onde nao se renomeia arquivo aberto),
-desde que so UM scanner use a pasta de logs (dois processos no mesmo arquivo nao funcionam no Windows).
+Arquivo: `<pasta_logs>/scanner-AAAA-MM-DD.log`, com a data LOCAL da maquina. O scanner grava direto no
+arquivo do dia e, a meia-noite (horario local), passa a gravar no arquivo do dia novo. Nenhum arquivo
+e renomeado: no Windows, renomear falha se outro programa estiver com o arquivo aberto (ex.: o dono
+acompanhando o log no PowerShell ou num visualizador), e o log se perderia. Ficam o arquivo de hoje e
+os `dias_logs` anteriores; os mais velhos sao apagados (um arquivo preso por outro programa fica para a
+proxima virada, sem atrapalhar o log).
 
-Horarios do log em UTC, no formato da spec (ex.: 2026-10-22T15:04:12.345Z), para bater com os horarios
-dos sinais (detectado_em, encerrado_em).
+Horario de cada linha: o local da maquina, com o deslocamento do fuso (ex.: `2026-10-22 07:30:01,123 -0300`),
+para nao haver duvida quando o log vier de uma VPS em outro fuso.
 
 Memoria: o RSS do processo (memoria que ele ocupa agora), so com a biblioteca padrao. CPU: % de uso
 medida pela diferenca do tempo de processador entre duas medidas.
 """
 
 import logging
-import logging.handlers
 import os
+import re
 import sys
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 
 registro = logging.getLogger("scanner.logs")
 
-# Nome do arquivo do dia, dentro da pasta de logs.
-NOME_DO_ARQUIVO = "scanner.log"
+# Nome dos arquivos: um por dia, com a data local.
+FORMATO_DO_NOME = "scanner-%Y-%m-%d.log"
+_NOME_DE_ARQUIVO_DO_DIA = re.compile(r"scanner-\d{4}-\d{2}-\d{2}\.log")
 
-# Formato de cada linha: horario UTC, nivel, de onde veio e a mensagem.
-FORMATO = "%(asctime)s.%(msecs)03dZ %(levelname)s %(name)s: %(message)s"
-FORMATO_DA_DATA = "%Y-%m-%dT%H:%M:%S"
+# Formato de cada linha: horario local com fuso, nivel, de onde veio e a mensagem.
+FORMATO = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 
-def _nome_do_dia(nome_padrao: str) -> str:
-    """Nome do arquivo de um dia que acabou: ".../scanner.log.2026-10-21" vira ".../scanner-2026-10-21.log".
+def nome_do_arquivo(momento: float) -> str:
+    """Nome do arquivo do dia (data local) do `momento` (segundos desde 1970), ex.: "scanner-2026-10-22.log"."""
+    return time.strftime(FORMATO_DO_NOME, time.localtime(momento))
 
-    O TimedRotatingFileHandler chama esta funcao (namer) na virada do dia e tambem para achar os
-    arquivos antigos que vai apagar; ".log" no fim deixa o arquivo abrir com duplo clique no Windows.
+
+def _meia_noite(momento: float, dias_depois: int = 0) -> float:
+    """Meia-noite local do dia do `momento` (ou `dias_depois` dias depois), em segundos desde 1970.
+
+    O mktime acerta o horario de verao e a virada de mes/ano sozinho (dia 32 vira o dia 1 seguinte).
     """
-    pasta, nome = os.path.split(nome_padrao)
-    base, _, data = nome.rpartition(".")
-    raiz, extensao = os.path.splitext(base)  # "scanner", ".log"
-    return os.path.join(pasta, f"{raiz}-{data}{extensao or '.log'}")
+    local = time.localtime(momento)
+    return time.mktime((local.tm_year, local.tm_mon, local.tm_mday + dias_depois, 0, 0, 0, 0, 0, -1))
 
 
-def _formatador() -> logging.Formatter:
-    formatador = logging.Formatter(FORMATO, datefmt=FORMATO_DA_DATA)
-    formatador.converter = time.gmtime  # horario em UTC (o "Z" do formato)
-    return formatador
+class _FormatoLocal(logging.Formatter):
+    """Horario local com o deslocamento do fuso: "2026-10-22 07:30:01,123 -0300"."""
+
+    def formatTime(self, record, datefmt=None):
+        momento = datetime.fromtimestamp(record.created, tz=timezone.utc).astimezone()  # no fuso local
+        return f"{momento:%Y-%m-%d %H:%M:%S},{int(record.msecs):03d} {momento:%z}"
+
+
+class ArquivoDoDia(logging.FileHandler):
+    """Grava no arquivo do dia (`scanner-AAAA-MM-DD.log`, data local) e troca de arquivo a meia-noite local.
+
+    Diferente do TimedRotatingFileHandler, nunca renomeia: na virada so fecha o arquivo do dia que
+    acabou e abre (cria) o do dia novo. Ao ligar, abre o arquivo do dia de hoje (continua nele se ja
+    existe). Depois de cada troca (e ao ligar) apaga os arquivos mais velhos, ficando o de hoje e os
+    `dias` anteriores; arquivo que nao puder ser apagado (preso por outro programa) so gera um aviso.
+    relogio: hora atual em segundos (os testes trocam por um relogio falso).
+    """
+
+    def __init__(self, pasta: str, dias: int, relogio: Callable[[], float] = time.time):
+        self._pasta = pasta
+        self._dias = dias
+        self._relogio = relogio
+        agora = relogio()
+        self._marcar_o_dia(agora)
+        super().__init__(os.path.join(pasta, nome_do_arquivo(agora)), encoding="utf-8")
+        self._apagar_os_antigos()
+
+    def _marcar_o_dia(self, agora: float) -> None:
+        self._comeco_do_dia = _meia_noite(agora)
+        self._proxima_virada = _meia_noite(agora, dias_depois=1)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        agora = self._relogio()
+        if agora >= self._proxima_virada or agora < self._comeco_do_dia:  # outro dia (ou o relogio voltou)
+            self._trocar_de_dia(agora)
+        super().emit(record)
+
+    def _trocar_de_dia(self, agora: float) -> None:
+        """Fecha o arquivo do dia que acabou e passa a gravar no do dia novo (aberto no proximo emit)."""
+        if self.stream is not None:
+            self.stream.flush()
+            self.stream.close()
+            self.stream = None  # o FileHandler abre de novo, ja no arquivo novo, ao gravar a linha
+        self.baseFilename = os.path.abspath(os.path.join(self._pasta, nome_do_arquivo(agora)))
+        self._marcar_o_dia(agora)
+        self._apagar_os_antigos()
+
+    def _apagar_os_antigos(self) -> None:
+        """Apaga os arquivos de dias anteriores alem dos `dias` mais novos. Nunca levanta erro."""
+        hoje = os.path.basename(self.baseFilename)
+        try:
+            nomes = os.listdir(self._pasta)
+        except OSError:
+            return
+        # O nome tem a data no formato AAAA-MM-DD: a ordem alfabetica e a ordem dos dias.
+        antigos = sorted(n for n in nomes if _NOME_DE_ARQUIVO_DO_DIA.fullmatch(n) and n < hoje)
+        for nome in antigos[:max(0, len(antigos) - self._dias)]:
+            try:
+                os.remove(os.path.join(self._pasta, nome))
+            except OSError as erro:  # ex.: arquivo aberto por outro programa no Windows
+                # Nao usa o proprio log aqui (estamos dentro dele): avisa direto no terminal.
+                sys.stderr.write(f"aviso do log: nao consegui apagar o log antigo {nome} ({erro}); "
+                                 "tento de novo na proxima virada do dia\n")
 
 
 def desligar_logs() -> None:
@@ -56,14 +119,13 @@ def desligar_logs() -> None:
         handler.close()
 
 
-def configurar_logs(nivel: str, pasta: str, dias: int) -> None:
+def configurar_logs(nivel: str, pasta: str, dias: int, relogio: Callable[[], float] = time.time) -> None:
     """Liga o log no terminal e no arquivo do dia, dentro de `pasta` (criada se nao existir).
 
     nivel: "normal" (INFO do scanner) ou "detalhado" (tambem o DEBUG do scanner, ex.: cada descarte).
         As bibliotecas (ccxt, uvicorn, asyncio) so aparecem a partir de WARNING.
-    dias: quantos arquivos de dias anteriores guardar (dias_logs da Config).
-    Pode ser chamada de novo: troca os handlers antigos pelos novos, sem abrir o arquivo duas vezes
-    (no Windows, dois handlers no mesmo arquivo impediriam a troca do dia).
+    dias: quantos arquivos de dias anteriores guardar, alem do de hoje (dias_logs da Config).
+    Pode ser chamada de novo: troca os handlers antigos pelos novos, sem abrir o arquivo duas vezes.
     Se a pasta nao puder ser criada ou o arquivo nao abrir, segue so com o terminal e avisa.
     """
     desligar_logs()
@@ -72,21 +134,18 @@ def configurar_logs(nivel: str, pasta: str, dias: int) -> None:
     logging.getLogger("scanner").setLevel(logging.DEBUG if nivel == "detalhado" else logging.INFO)
 
     terminal = logging.StreamHandler()  # sys.stderr
-    terminal.setFormatter(_formatador())
+    terminal.setFormatter(_FormatoLocal(FORMATO))
     terminal.do_scanner = True
     raiz.addHandler(terminal)
 
     try:
         os.makedirs(pasta, exist_ok=True)
-        arquivo = logging.handlers.TimedRotatingFileHandler(
-            os.path.join(pasta, NOME_DO_ARQUIVO), when="midnight", backupCount=dias, encoding="utf-8", utc=True,
-        )
+        arquivo = ArquivoDoDia(pasta, dias, relogio=relogio)
     except OSError as erro:
         registro.warning("sem arquivo de log: nao consegui usar a pasta '%s' (%s); o log fica so no terminal",
                          pasta, erro)
         return
-    arquivo.namer = _nome_do_dia
-    arquivo.setFormatter(_formatador())
+    arquivo.setFormatter(_FormatoLocal(FORMATO))
     arquivo.do_scanner = True
     raiz.addHandler(arquivo)
 

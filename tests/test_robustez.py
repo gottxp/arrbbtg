@@ -7,11 +7,12 @@ por uma `EsperaFalsa`, que so anota quantos segundos esperaria.
 
 import asyncio
 import logging
-import logging.handlers
 import math
 import os
+import re
 import sqlite3
 import time
+from pathlib import Path
 
 import pytest
 from ccxt.base.errors import ChecksumError, ExchangeError, NotSupported
@@ -694,35 +695,125 @@ def logs_limpos():
     do_scanner.setLevel(niveis[1])
 
 
+@pytest.fixture
+def fuso_brasilia():
+    """O fuso local da maquina passa a ser UTC-3 (como o PC do dono), so durante o teste."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("trocar o fuso no meio do processo nao funciona no Windows")
+    antes = os.environ.get("TZ")
+    os.environ["TZ"] = "BRT3"  # fuso no formato POSIX: 3 h atras do UTC, sem horario de verao
+    time.tzset()
+    yield
+    if antes is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = antes
+    time.tzset()
+
+
 def handlers_do_scanner():
     return [h for h in logging.getLogger().handlers if getattr(h, "do_scanner", False)]
 
 
-def test_logs_no_terminal_e_num_arquivo_por_dia(tmp_path, logs_limpos, capsys):
+def descarregar():
+    for h in handlers_do_scanner():
+        h.flush()
+
+
+def momento_local(ano, mes, dia, hora, minuto, segundo) -> float:
+    """Segundos desde 1970 do horario LOCAL dado."""
+    return time.mktime((ano, mes, dia, hora, minuto, segundo, 0, 0, -1))
+
+
+def arquivos_de_log(pasta) -> list[str]:
+    return sorted(p.name for p in Path(pasta).glob("scanner-*.log"))
+
+
+@pytest.fixture
+def sem_renomear(monkeypatch):
+    """Falha o teste se o log tentar renomear algum arquivo (no Windows isso quebra com o arquivo aberto)."""
+    def proibido(*args, **kwargs):
+        raise AssertionError(f"o log nao pode renomear arquivo: {args}")
+
+    monkeypatch.setattr(os, "rename", proibido)
+    monkeypatch.setattr(os, "replace", proibido)
+
+
+def test_logs_no_terminal_e_no_arquivo_do_dia_com_horario_local(tmp_path, logs_limpos, fuso_brasilia, capsys):
     pasta = tmp_path / "meus_logs"
     logs.configurar_logs("normal", str(pasta), dias=30)
     logging.getLogger("scanner.teste").info("linha de teste")
     logging.getLogger("scanner.teste").debug("detalhe que nao aparece no normal")
     logging.getLogger("outra.biblioteca").warning("aviso de biblioteca")
-    for h in handlers_do_scanner():
-        h.flush()
-    arquivo = pasta / logs.NOME_DO_ARQUIVO
-    texto = arquivo.read_text(encoding="utf-8")
-    assert "INFO scanner.teste: linha de teste" in texto and "aviso de biblioteca" in texto
-    assert "detalhe" not in texto
+    descarregar()
+    assert arquivos_de_log(pasta) == [f"scanner-{time.strftime('%Y-%m-%d')}.log"]  # data LOCAL
+    texto = (pasta / arquivos_de_log(pasta)[0]).read_text(encoding="utf-8")
+    # Horario local com o deslocamento do fuso, para nao haver duvida num log vindo de outra maquina.
+    assert re.search(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} -0300 INFO scanner.teste: linha de teste$", texto, re.M)
+    assert "aviso de biblioteca" in texto and "detalhe" not in texto
     assert "linha de teste" in capsys.readouterr().err  # terminal
-    # Horario em UTC no formato da spec (ISO 8601 terminando em Z).
-    assert texto.split(" ")[0].endswith("Z") and "T" in texto.split(" ")[0]
-    (arquivo_h,) = [h for h in handlers_do_scanner() if isinstance(h, logging.handlers.TimedRotatingFileHandler)]
-    assert arquivo_h.when == "MIDNIGHT" and arquivo_h.backupCount == 30 and arquivo_h.utc
+
+
+def test_virada_a_meia_noite_local_troca_de_arquivo_sem_renomear(tmp_path, logs_limpos, fuso_brasilia, sem_renomear):
+    agora = [momento_local(2026, 10, 22, 23, 59, 59)]
+    logs.configurar_logs("normal", str(tmp_path), dias=30, relogio=lambda: agora[0])
+    log = logging.getLogger("scanner.teste")
+    log.info("antes da meia-noite")
+    agora[0] = momento_local(2026, 10, 23, 0, 0, 1)
+    log.info("depois da meia-noite")
+    descarregar()
+    assert arquivos_de_log(tmp_path) == ["scanner-2026-10-22.log", "scanner-2026-10-23.log"]
+    dia_22 = (tmp_path / "scanner-2026-10-22.log").read_text(encoding="utf-8")
+    dia_23 = (tmp_path / "scanner-2026-10-23.log").read_text(encoding="utf-8")
+    assert "antes da meia-noite" in dia_22 and "depois" not in dia_22
+    assert "depois da meia-noite" in dia_23 and "antes" not in dia_23
+
+
+def test_partida_num_dia_novo_abre_o_arquivo_do_dia_sem_mexer_no_antigo(tmp_path, logs_limpos, fuso_brasilia,
+                                                                       sem_renomear):
+    antigo = tmp_path / "scanner-2026-10-21.log"
+    antigo.write_text("ontem\n", encoding="utf-8")
+    logs.configurar_logs("normal", str(tmp_path), dias=30, relogio=lambda: momento_local(2026, 10, 22, 8, 0, 0))
+    logging.getLogger("scanner.teste").info("hoje")
+    descarregar()
+    assert antigo.read_text(encoding="utf-8") == "ontem\n"
+    assert "hoje" in (tmp_path / "scanner-2026-10-22.log").read_text(encoding="utf-8")
+
+
+def test_guarda_o_arquivo_de_hoje_e_os_dias_logs_anteriores(tmp_path, logs_limpos, fuso_brasilia):
+    for dia in range(1, 11):
+        (tmp_path / f"scanner-2026-10-{dia:02d}.log").write_text("antigo\n")
+    (tmp_path / "outra-coisa.txt").write_text("nao e log\n")
+    agora = [momento_local(2026, 10, 11, 12, 0, 0)]
+    logs.configurar_logs("normal", str(tmp_path), dias=3, relogio=lambda: agora[0])
+    assert arquivos_de_log(tmp_path) == [f"scanner-2026-10-{d}.log" for d in ("08", "09", "10", "11")]
+    agora[0] = momento_local(2026, 10, 12, 0, 0, 1)
+    logging.getLogger("scanner.teste").info("dia novo")
+    assert arquivos_de_log(tmp_path) == [f"scanner-2026-10-{d}.log" for d in ("09", "10", "11", "12")]
+    assert (tmp_path / "outra-coisa.txt").exists()
+
+
+def test_arquivo_antigo_preso_nao_quebra_o_log(tmp_path, logs_limpos, fuso_brasilia, monkeypatch, capsys):
+    for dia in range(1, 6):
+        (tmp_path / f"scanner-2026-10-{dia:02d}.log").write_text("antigo\n")
+
+    def remover_preso(caminho, *args, **kwargs):
+        raise PermissionError(32, "o arquivo esta sendo usado por outro processo", str(caminho))
+
+    monkeypatch.setattr(os, "remove", remover_preso)
+    logs.configurar_logs("normal", str(tmp_path), dias=1, relogio=lambda: momento_local(2026, 10, 6, 9, 0, 0))
+    logging.getLogger("scanner.teste").info("segue normal")
+    descarregar()
+    assert "segue normal" in (tmp_path / "scanner-2026-10-06.log").read_text(encoding="utf-8")
+    erro = capsys.readouterr().err
+    assert "nao consegui apagar" in erro and "Logging error" not in erro
 
 
 def test_nivel_detalhado_grava_tambem_o_debug(tmp_path, logs_limpos):
     logs.configurar_logs("detalhado", str(tmp_path), dias=3)
     logging.getLogger("scanner.teste").debug("descarte detalhado")
-    for h in handlers_do_scanner():
-        h.flush()
-    assert "descarte detalhado" in (tmp_path / logs.NOME_DO_ARQUIVO).read_text(encoding="utf-8")
+    descarregar()
+    assert "descarte detalhado" in (tmp_path / arquivos_de_log(tmp_path)[0]).read_text(encoding="utf-8")
 
 
 def test_configurar_duas_vezes_nao_duplica_nem_abre_o_arquivo_duas_vezes(tmp_path, logs_limpos):
@@ -730,27 +821,8 @@ def test_configurar_duas_vezes_nao_duplica_nem_abre_o_arquivo_duas_vezes(tmp_pat
     logs.configurar_logs("normal", str(tmp_path), dias=3)
     assert len(handlers_do_scanner()) == 2  # um para o terminal e um para o arquivo
     logging.getLogger("scanner.teste").info("uma vez so")
-    for h in handlers_do_scanner():
-        h.flush()
-    assert (tmp_path / logs.NOME_DO_ARQUIVO).read_text(encoding="utf-8").count("uma vez so") == 1
-
-
-def test_virada_do_dia_renomeia_e_guarda_so_dias_logs_arquivos(tmp_path, logs_limpos):
-    for dia in range(1, 11):  # dez dias antigos
-        (tmp_path / f"scanner-2026-09-{dia:02d}.log").write_text("antigo\n")
-    (tmp_path / "outra-coisa.txt").write_text("nao e log\n")
-    logs.configurar_logs("normal", str(tmp_path), dias=3)
-    (arquivo_h,) = [h for h in handlers_do_scanner() if isinstance(h, logging.handlers.TimedRotatingFileHandler)]
-    logging.getLogger("scanner.teste").info("dia 1")
-    arquivo_h.rolloverAt = int(time.time()) - 1  # como se tivesse passado da meia-noite
-    logging.getLogger("scanner.teste").info("dia 2")
-    arquivo_h.flush()
-    nomes = sorted(p.name for p in tmp_path.iterdir())
-    antigos = [n for n in nomes if n.startswith("scanner-")]
-    assert len(antigos) == 3  # so os `dias` mais novos ficam (o do dia que acabou de virar e 2 antigos)
-    assert "outra-coisa.txt" in nomes and logs.NOME_DO_ARQUIVO in nomes
-    assert (tmp_path / logs.NOME_DO_ARQUIVO).read_text(encoding="utf-8").count("dia 2") == 1
-    assert any("dia 1" in (tmp_path / n).read_text(encoding="utf-8") for n in antigos)
+    descarregar()
+    assert (tmp_path / arquivos_de_log(tmp_path)[0]).read_text(encoding="utf-8").count("uma vez so") == 1
 
 
 def test_pasta_de_logs_que_nao_abre_deixa_so_o_terminal(tmp_path, logs_limpos, capsys):
@@ -771,9 +843,8 @@ def test_main_configura_o_log_com_a_pasta_da_config(tmp_path, monkeypatch, logs_
 
     monkeypatch.setattr(principal, "rodar", rodar_falso)
     assert principal.main(["--config", str(arq)]) == 0
-    for h in handlers_do_scanner():
-        h.flush()
-    assert "scanner subiu" in (pasta / logs.NOME_DO_ARQUIVO).read_text(encoding="utf-8")
+    descarregar()
+    assert "scanner subiu" in (pasta / arquivos_de_log(pasta)[0]).read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -872,27 +943,34 @@ def test_descartes_contados_por_corretora_e_cada_um_em_debug(caplog):
     assert len(debug) == 3
 
 
-def test_sequencia_quebrada_vai_para_o_log_e_o_livro_e_pedido_de_novo(caplog):
+def test_sequencia_quebrada_vai_para_o_log_e_o_livro_e_pedido_de_novo_na_hora(caplog):
     estado = EstadoMercados()
     gate = CorretoraFalsa(MARKETS_GATE)
     espera = EsperaFalsa()
     coletor = ColetorCcxt("gate", gate, estado=estado, relogio=relogio, esperar=espera)
     quebra = ChecksumError("gate BTC/USDT : orderbook data checksum validation failed")
+    pedidos = lambda: len(gate.pedidos_de("watch_order_book"))  # noqa: E731
 
     async def cenario():
         await coletor.assinar_livros({"BTC/USDT"})
         gate.entregar(("livro", "BTC/USDT"), ob(), quebra)
-        await esperar_ate(lambda: espera.esperas == [1])
+        await esperar_ate(lambda: pedidos() == 3)  # reassinou na hora (sem espera)
+        assert espera.esperas == []
         assert estado.obter_livro("gate", "spot", "BTC", AGORA) is None  # o livro com buraco nao vale mais
-        gate.entregar(("livro", "BTC/USDT"), ob(bid=99.5))
+        gate.entregar(("livro", "BTC/USDT"), quebra)  # quebrou de novo sem nenhum livro bom: agora espera
+        await esperar_ate(lambda: espera.esperas == [1] and pedidos() == 4)
+        gate.entregar(("livro", "BTC/USDT"), ob(bid=99.5), quebra)  # livro bom no meio: a proxima e na hora de novo
+        await esperar_ate(lambda: pedidos() == 6)
+        assert espera.esperas == [1]
+        gate.entregar(("livro", "BTC/USDT"), ob(bid=99.6))
         await esperar_ate(lambda: estado.obter_livro("gate", "spot", "BTC", AGORA) is not None)
         await coletor.fechar()
 
     with caplog.at_level(logging.WARNING, logger="scanner"):
         asyncio.run(cenario())
-    assert coletor.tirar_descartes()["sequencia_quebrada"] == 1
+    assert coletor.tirar_descartes()["sequencia_quebrada"] == 3
     quebradas = [r for r in caplog.records if "sequencia" in r.getMessage()]
-    assert len(quebradas) == 1 and not quebradas[0].exc_info  # esperado: sem traceback
+    assert len(quebradas) == 3 and not any(r.exc_info for r in quebradas)  # esperado: sem traceback
 
 
 # ---------------------------------------------------------------------------
@@ -1146,17 +1224,21 @@ def test_evento_recusado_pelo_banco_vai_ao_log_e_os_outros_sao_gravados(tmp_path
     m = motor_btc_e_eth()
     m.banco = Banco(str(tmp_path / "e.db"))
     original = m.gerenciador.processar
+    estragados = []
 
     def processar_com_um_nan(aprovados, agora):
         eventos = original(aprovados, agora)
         eventos[0].sinal["rp_liquido_pct"] = math.nan  # o JSON da spec nao aceita NaN
+        estragados.append(eventos[0].sinal)
         return eventos
 
     monkeypatch.setattr(m.gerenciador, "processar", processar_com_um_nan)
     with caplog.at_level(logging.ERROR, logger="scanner"):
         m.ciclo(AGORA)
     assert len(m.banco.sinais_do_dia("1970-01-01")) == 1
-    assert len(avisos(caplog, logging.ERROR)) == 1
+    (erro,) = avisos(caplog, logging.ERROR)
+    sinal = estragados[0]
+    assert sinal["id"] in erro and sinal["par"] in erro and sinal["tipo"] in erro  # diz QUAL evento era
     m.banco.fechar()
 
 
@@ -1266,14 +1348,18 @@ def test_ticker_um_a_um_que_falha_so_ele_tenta_de_novo():
     estado = EstadoMercados()
     espera = EsperaFalsa()
     coletor = ColetorCcxt("bingx", gate, estado=estado, relogio=relogio, esperar=espera)
+    pares = lambda: estado.mercados().get("bingx", set())  # noqa: E731
 
     async def cenario():
         tarefa = asyncio.create_task(coletor.manter_tickers(["BTC/USDT", "ETH/USDT"]))
-        gate.entregar(("ticker", "ETH/USDT"), ExchangeError("bingx bad symbol ETH/USDT"))
+        gate.entregar(("ticker", "ETH/USDT"), tk(20.0, 20.1))
         gate.entregar(("ticker", "BTC/USDT"), tk(10.0, 10.1))
-        await esperar_ate(lambda: espera.esperas == [1] and estado.obter_ticker("bingx", "spot", "BTC", AGORA))
-        gate.entregar(("ticker", "ETH/USDT"), tk(20.0, 20.1))  # voltou sozinho, depois da espera
-        await esperar_ate(lambda: estado.obter_ticker("bingx", "spot", "ETH", AGORA) is not None)
+        await esperar_ate(lambda: pares() == {("spot", "BTC"), ("spot", "ETH")})
+        gate.entregar(("ticker", "ETH/USDT"), ExchangeError("bingx bad symbol ETH/USDT"))
+        await esperar_ate(lambda: espera.esperas == [1])
+        assert pares() == {("spot", "BTC")}  # o ticker do par que parou sai do estado na hora, como o livro
+        gate.entregar(("ticker", "ETH/USDT"), tk(21.0, 21.1))  # voltou sozinho, depois da espera
+        await esperar_ate(lambda: ("spot", "ETH") in pares())
         await parar(tarefa)
 
     asyncio.run(cenario())
@@ -1315,3 +1401,197 @@ def test_queda_de_rede_nos_livros_sem_traceback(caplog):
         asyncio.run(cenario())
     quedas = [r for r in caplog.records if "BTC/USDT" in r.getMessage()]
     assert len(quedas) == 2 and not any(r.exc_info for r in quedas)  # queda de rede: o traceback nao ajuda
+
+
+# ---------------------------------------------------------------------------
+# Correcao pos-revisao: corretora que nao carregou ao ligar volta sozinha
+# ---------------------------------------------------------------------------
+
+
+class CorretoraQueDemoraACarregar(CorretoraFalsa):
+    """Como a CorretoraFalsa, mas sem markets ate o load_markets dar certo, e as `falhas` primeiras cargas falham."""
+
+    def __init__(self, markets, falhas, **kwargs):
+        super().__init__({}, **kwargs)
+        self._markets_de_verdade = markets
+        self._falhas = falhas
+
+    async def load_markets(self, reload=False, params=None):
+        self.cargas.append(reload)
+        await asyncio.sleep(0)
+        if self._falhas > 0:
+            self._falhas -= 1
+            raise OSError("sem rede")
+        self.markets = self._markets_de_verdade
+        return self.markets
+
+
+def test_corretora_que_nao_carregou_ao_ligar_volta_sozinha(caplog):
+    gate = CorretoraQueDemoraACarregar(MARKETS_GATE, falhas=2)
+    bitget = CorretoraFalsa(MARKETS_BITGET)
+    estado = EstadoMercados()
+    coletores = {"bitget": ColetorCcxt("bitget", bitget, estado=estado, relogio=relogio)}
+    tickers = principal._Tickers(coletores)
+    espera = EsperaFalsa()
+    saude_em_cada_espera = []
+    entraram = []
+
+    async def esperar(segundos):
+        saude_em_cada_espera.append(estado.saude("gate", AGORA)["estado"])
+        await espera(segundos)
+
+    async def cenario():
+        await principal._trazer_de_volta(
+            "gate", gate, coletores, tickers, estado,
+            criar_coletor=lambda nome: ColetorCcxt(nome, gate, estado=estado, relogio=relogio),
+            ao_entrar=entraram.append, espera_max_s=60, esperar=esperar,
+        )
+        # A bitget nao tinha par em comum com ninguem; com a gate de volta, ganhou e comecou os tickers.
+        assert tickers.simbolos == {"gate": ["BTC/USDT"], "bitget": ["BTC/USDT:USDT"]}
+        gate.entregar(("tickers", "spot"), {"BTC/USDT": tk()})
+        await esperar_ate(lambda: estado.saude("gate", AGORA)["estado"] == "conectada")
+        for tarefa in tickers.tarefas.values():
+            await parar(tarefa)
+
+    with caplog.at_level(logging.WARNING, logger="scanner"):
+        asyncio.run(cenario())
+    assert espera.esperas == [1, 2, 4]                          # 1 s, 2 s, 4 s: falhou 2 vezes e carregou na 3a
+    assert saude_em_cada_espera == ["reconectando"] * 3         # o painel mostra "reconectando" enquanto isso
+    assert gate.cargas == [False, False, False] and "gate" in coletores and entraram == ["gate"]
+    tentativas = [m for m in avisos(caplog) if "gate" in m and "tentativa" in m]
+    assert len(tentativas) == 2                                 # cada tentativa que falhou vai para o log
+    assert estado.saude("gate", AGORA)["reconexoes"] == 1
+
+
+def test_rodar_corretora_que_falhou_ao_ligar_entra_sozinha_depois(tmp_path, caplog):
+    gate = CorretoraQueDemoraACarregar(MARKETS_GATE, falhas=2)
+    bitget = CorretoraFalsa(MARKETS_BITGET)
+    gate.entregar(("tickers", "spot"), {"BTC/USDT": tk()})
+    gate.entregar(("livro", "BTC/USDT"), ob())
+    bitget.entregar(("tickers", "futuro"), {"BTC/USDT:USDT": tk(101.0, 101.1)})
+    bitget.entregar(("livro", "BTC/USDT:USDT"), ob(101.0, 101.1))
+    config = cfg_com(corretoras=["gate", "bitget"], banco=str(tmp_path / "s.db"), ciclo_ms=50,
+                     rp_min_lucro_pct=-5.0, espera_max_reconexao_s=0.01)
+    with caplog.at_level(logging.WARNING, logger="scanner"):
+        asyncio.run(asyncio.wait_for(principal.rodar(
+            config, criar_exchange={"gate": gate, "bitget": bitget}.__getitem__, relogio=relogio, ciclos=10),
+            timeout=5))
+    assert gate.cargas[:3] == [False, False, False]
+    banco = Banco(config.banco)
+    # A gate entrou sozinha: tickers, livros e dados lentos (taxa) dela funcionando, e o sinal nasceu.
+    assert [r["par"] for r in banco.sinais_do_dia("1970-01-01")] == ["BTC/USDT"]
+    banco.fechar()
+    assert any("gate" in m and "tento de novo" in m for m in avisos(caplog))
+
+
+# ---------------------------------------------------------------------------
+# Correcao pos-revisao: menores
+# ---------------------------------------------------------------------------
+
+
+def test_defeito_no_stream_de_tickers_sai_com_traceback_na_primeira_vez(caplog):
+    from ccxt.base.errors import NetworkError
+
+    gate = CorretoraFalsa(MARKETS_GATE)
+    espera = EsperaFalsa()
+    coletor = ColetorCcxt("gate", gate, estado=EstadoMercados(), relogio=relogio, esperar=espera)
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers(["BTC/USDT"]))
+        gate.entregar(("tickers", "spot"), NetworkError("rede"), RuntimeError("defeito"), RuntimeError("defeito"))
+        await esperar_ate(lambda: len(espera.esperas) == 3)
+        await parar(tarefa)
+
+    with caplog.at_level(logging.WARNING, logger="scanner"):
+        asyncio.run(cenario())
+    quedas = [r for r in caplog.records if "caiu" in r.getMessage()]
+    assert [bool(r.exc_info) for r in quedas] == [False, True, False]  # rede: nunca; defeito: so na primeira
+
+
+def test_mercado_inativo_fica_de_fora_e_sai_do_estado_na_recarga(caplog):
+    inativo = lambda simbolo, base: {**market_ccxt(simbolo, base), "active": False}  # noqa: E731
+    gate = CorretoraFalsa(dict(MARKETS_GATE_ETH))
+    estado = EstadoMercados()
+    coletores = {"gate": ColetorCcxt("gate", gate, estado=estado, relogio=relogio)}
+    tickers = principal._Tickers(coletores)
+
+    async def cenario():
+        tickers.iniciar("gate", ["BTC/USDT", "ETH/USDT", "ETH/USDT:USDT"])
+        colocar_ponta(estado, "gate", "spot", "ETH", 100.0, "long", AGORA)
+        colocar_ponta(estado, "gate", "futuro", "ETH", 101.0, "short", AGORA)
+        gate.proximos_markets = {"BTC/USDT": market_ccxt("BTC/USDT", "BTC"),
+                                 "ETH/USDT": inativo("ETH/USDT", "ETH"),
+                                 "ETH/USDT:USDT": inativo("ETH/USDT:USDT", "ETH")}  # suspenso, ainda listado
+        await principal._recarregar_mercados({"gate": gate}, coletores, tickers, estado)
+        assert coletores["gate"].simbolos_por_chave() == {("spot", "BTC"): "BTC/USDT"}
+        assert estado.mercados().get("gate", set()) == set()  # o ETH saiu do estado, como um par que sumiu
+        for tarefa in tickers.tarefas.values():
+            await parar(tarefa)
+
+    with caplog.at_level(logging.WARNING, logger="scanner"):
+        asyncio.run(cenario())
+    inativos = [m for m in avisos(caplog) if "inativo" in m]
+    assert len(inativos) == 2  # um aviso por simbolo
+
+
+def test_selecionar_pares_prefere_os_ja_abertos_no_empate_e_na_diferenca_pequena():
+    assert selecionar_pares(["A", "B", "C"], {"A": 100, "B": 100, "C": 100}, 2, abertos={"B", "C"}) == (["B", "C"], 1)
+    assert selecionar_pares(["A", "B"], {"A": 105, "B": 100}, 1, abertos={"B"}, margem=0.10) == (["B"], 1)
+    assert selecionar_pares(["A", "B"], {"A": 120, "B": 100}, 1, abertos={"B"}, margem=0.10) == (["A"], 1)
+
+
+def test_limite_de_livros_nao_fica_trocando_por_diferenca_pequena_de_volume():
+    estado = estado_com_volumes({"A": 100.0, "B": 100.0, "C": 100.0})
+    gate = CorretoraFalsa(MARKETS_ABC)
+    coletor = ColetorCcxt("gate", gate, estado=estado, relogio=relogio, limite_assinaturas=2)
+    volume = lambda ativo, v: estado.atualizar_ticker("gate", "spot", ativo, 1.0, 1.01, AGORA, v, None,  # noqa: E731
+                                                      simbolo_original=f"{ativo}/USDT", cotacao="USDT")
+
+    async def cenario():
+        await coletor.assinar_livros({"A/USDT", "B/USDT", "C/USDT"})
+        assert set(coletor._tarefas_livro) == {"A/USDT", "B/USDT"}
+        volume("C", 105.0)  # um pouco mais que os abertos: nao vale trocar
+        await coletor.assinar_livros({"A/USDT", "B/USDT", "C/USDT"})
+        assert set(coletor._tarefas_livro) == {"A/USDT", "B/USDT"} and gate.desassinados == []
+        volume("C", 200.0)  # bem mais: troca
+        await coletor.assinar_livros({"A/USDT", "B/USDT", "C/USDT"})
+        assert set(coletor._tarefas_livro) == {"A/USDT", "C/USDT"} and gate.desassinados == ["B/USDT"]
+        await coletor.fechar()
+
+    asyncio.run(cenario())
+
+
+def test_volumes_guardados_evitam_rest_a_cada_reconexao():
+    from ccxt.base.errors import NetworkError
+
+    rest = {"A/USDT": tk(volume=10.0), "B/USDT": tk(volume=300.0), "C/USDT": tk(volume=50.0)}
+    gate = CorretoraFalsa(MARKETS_ABC, has={"watchTicker": True, "fetchTickers": True}, tickers_rest=rest)
+    espera = EsperaFalsa()
+    coletor = ColetorCcxt("bingx", gate, estado=EstadoMercados(), relogio=relogio, limite_assinaturas=2,
+                          esperar=espera)
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers(["A/USDT", "B/USDT", "C/USDT"]))
+        gate.entregar(("ticker", "B/USDT"), tk(volume=300.0), NetworkError("caiu"))
+        await esperar_ate(lambda: espera.esperas == [1] and len(gate.pedidos_de("watch_ticker")) >= 5)
+        await parar(tarefa)
+
+    asyncio.run(cenario())
+    assert len(gate.pedidos_de("fetch_tickers")) == 1  # so na primeira vez; a reconexao usa os volumes guardados
+    assert {s for (s,) in gate.pedidos_de("watch_ticker")} == {"B/USDT", "C/USDT"}
+
+
+def test_iniciar_os_tickers_de_novo_para_a_tarefa_anterior():
+    gate = CorretoraFalsa(MARKETS_GATE)
+    tickers = principal._Tickers({"gate": ColetorCcxt("gate", gate, estado=EstadoMercados(), relogio=relogio)})
+
+    async def cenario():
+        tickers.iniciar("gate", ["BTC/USDT"])
+        primeira = tickers.tarefas["gate"]
+        await esperar_ate(lambda: gate.pedidos_de("watch_tickers"))
+        tickers.iniciar("gate", ["BTC/USDT"])
+        await esperar_ate(lambda: primeira.done())  # nunca dois streams da mesma corretora
+        assert tickers.tarefas["gate"] is not primeira
+        await parar(tickers.tarefas["gate"])
+
+    asyncio.run(cenario())

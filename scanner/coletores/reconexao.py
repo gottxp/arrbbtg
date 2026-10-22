@@ -32,15 +32,32 @@ def _volume(volumes: dict, par: str) -> float:
     return -math.inf
 
 
-def selecionar_pares(pares: list[str], volumes: dict[str, float], limite: int) -> tuple[list[str], int]:
+# Histerese do limite de livros: um par novo so tira o lugar de um livro ja aberto se tiver volume 24h
+# pelo menos 10% maior. Sem isso, pares no corte com volume parecido trocariam de lugar a cada ciclo
+# (cada troca e um cancelamento, um un_watch e uma assinatura nova). Detalhe tecnico, nao limite de negocio.
+MARGEM_PARA_TROCAR_LIVRO = 0.10
+
+
+def selecionar_pares(pares: list[str], volumes: dict[str, float], limite: int,
+                     abertos: set[str] | frozenset = frozenset(), margem: float = 0.0) -> tuple[list[str], int]:
     """Os `limite` pares de maior volume 24h, do maior para o menor, e quantos ficaram de fora.
 
-    Par sem volume conhecido vai para o fim. Empate de volume: ordem alfabetica do nome (assim a
-    escolha nao muda de um ciclo para o outro). Par repetido na lista conta uma vez so.
+    Par sem volume conhecido vai para o fim. Empate de volume: primeiro os `abertos` (ja assinados),
+    depois a ordem alfabetica do nome (assim a escolha nao muda de um ciclo para o outro). Com `margem`
+    (ex.: 0.10), o volume dos abertos conta `margem` a mais: um par novo so entra no lugar de um aberto
+    se tiver volume bem maior. Par repetido na lista conta uma vez so.
     Ex.: selecionar_pares(["A", "B", "C"], {"A": 10, "B": 300, "C": 50}, limite=2) -> (["B", "C"], 1)
     """
     unicos = list(dict.fromkeys(pares))
-    ordenados = sorted(unicos, key=lambda par: (-_volume(volumes, par), par))
+
+    def ordem(par: str) -> tuple:
+        volume = _volume(volumes, par)
+        aberto = par in abertos
+        if aberto and math.isfinite(volume):
+            volume *= 1 + margem
+        return (-volume, 0 if aberto else 1, par)
+
+    ordenados = sorted(unicos, key=ordem)
     escolhidos = ordenados[:max(0, limite)]
     return escolhidos, len(unicos) - len(escolhidos)
 

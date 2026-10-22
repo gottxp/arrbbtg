@@ -22,6 +22,7 @@ no modo WAL, com `synchronous=NORMAL` (veja `__init__`).
 """
 
 import json
+import math
 import sqlite3
 import threading
 from datetime import date, datetime, timedelta, timezone
@@ -73,6 +74,14 @@ ON CONFLICT (id) DO UPDATE SET
     rp_liquido_pct = excluded.rp_liquido_pct,
     sinal_json = excluded.sinal_json
 """
+
+
+# Campos de texto que a tabela `sinais` exige (NOT NULL): precisam ser texto nao vazio.
+_CAMPOS_DE_TEXTO_OBRIGATORIOS = ("id", "modo", "par", "tipo", "detectado_em")
+
+# Erros que o SQLite da para UMA linha com dado que ele nao aceita (NOT NULL vazio, tipo que nao sabe
+# gravar, numero de valores errado). Erro do banco em si (disco cheio, arquivo travado) nao entra aqui.
+_ERROS_DE_UMA_LINHA = (sqlite3.IntegrityError, sqlite3.InterfaceError, sqlite3.ProgrammingError)
 
 
 def _json(valor) -> str:
@@ -137,32 +146,71 @@ class Banco:
     def gravar_eventos(self, eventos: list[Evento]) -> list[tuple[Evento, Exception]]:
         """Grava os eventos de um ciclo numa transacao so (um acesso ao disco por ciclo, e nao um por evento).
 
-        Cada evento segue as regras de `gravar_evento`. Evento cujo sinal nao vira JSON valido (ex.: NaN)
-        ou nao tem os campos obrigatorios fica de fora, sem impedir os outros: a lista devolvida traz cada
-        recusado com o erro, para quem chamou registrar no log. Erro do proprio banco (disco cheio...)
-        levanta a excecao e nada do lote e gravado.
+        Cada evento segue as regras de `gravar_evento`. Um evento ruim nunca leva os outros junto:
+        - antes de tocar no banco, cada evento e conferido (`_linha_do_evento`): id, modo, par, tipo e
+          detectado_em texto nao vazio, rp_liquido_pct numero real ou vazio, sinal que vira JSON valido.
+          O que nao passa fica de fora;
+        - se mesmo assim o SQLite recusar uma linha no meio do lote (IntegrityError, InterfaceError,
+          ProgrammingError), o lote e refeito linha a linha (SAVEPOINT por evento, ainda uma transacao
+          so) e so a linha recusada fica de fora.
+        Devolve os recusados, cada um com o erro, para quem chamou registrar no log qual era. Erro do
+        proprio banco (disco cheio, arquivo travado...) levanta a excecao e nada do lote e gravado.
         """
-        linhas, recusados = [], []
+        linhas, recusados = [], []  # linhas: (evento, valores da linha)
         for e in eventos:
             if e.tipo == "atualizado":
                 continue
             try:
-                linhas.append(self._linha_do_evento(e))  # antes de tocar no banco: JSON invalido nao entra
+                linhas.append((e, self._linha_do_evento(e)))  # antes de tocar no banco
             except (ValueError, TypeError, KeyError) as erro:
                 recusados.append((e, erro))
-        if linhas:
+        if not linhas:
+            return recusados
+        try:
             with self._trava, self._conn:
-                self._conn.executemany(_GRAVAR_SINAL, linhas)
+                self._conn.executemany(_GRAVAR_SINAL, [linha for _, linha in linhas])
+        except _ERROS_DE_UMA_LINHA:  # alguma linha passou da conferencia mas o SQLite recusou: uma por uma
+            recusados += self._gravar_uma_por_uma(linhas)
+        return recusados
+
+    def _gravar_uma_por_uma(self, linhas: list[tuple[Evento, tuple]]) -> list[tuple[Evento, Exception]]:
+        """Grava as linhas numa transacao so, com um SAVEPOINT por linha: a recusada volta atras sozinha."""
+        recusados = []
+        with self._trava, self._conn:
+            self._conn.execute("BEGIN")  # uma transacao para todas; o `with` faz o COMMIT no fim
+            for evento, linha in linhas:
+                self._conn.execute("SAVEPOINT evento")
+                try:
+                    self._conn.execute(_GRAVAR_SINAL, linha)
+                except _ERROS_DE_UMA_LINHA as erro:
+                    self._conn.execute("ROLLBACK TO evento")  # desfaz so esta linha
+                    recusados.append((evento, erro))
+                self._conn.execute("RELEASE evento")
         return recusados
 
     @staticmethod
     def _linha_do_evento(e: Evento) -> tuple:
-        """Os valores da linha da tabela `sinais` para o evento (na ordem de _GRAVAR_SINAL)."""
+        """Os valores da linha da tabela `sinais` para o evento (na ordem de _GRAVAR_SINAL).
+
+        Levanta ValueError (dizendo qual campo) se o evento nao pode ser gravado.
+        """
         sinal = e.sinal
-        texto = _json(sinal)
+        if not isinstance(sinal, dict):
+            raise ValueError(f"o sinal do evento nao e um dict: {sinal!r}")
+        for campo in _CAMPOS_DE_TEXTO_OBRIGATORIOS:
+            valor = sinal.get(campo)
+            if not isinstance(valor, str) or not valor:
+                raise ValueError(f"campo {campo} vazio ou que nao e texto: {valor!r}")
+        rp = sinal.get("rp_liquido_pct")
+        numero = isinstance(rp, (int, float)) and not isinstance(rp, bool)
+        if rp is not None and not (numero and math.isfinite(rp)):
+            raise ValueError(f"campo rp_liquido_pct nao e um numero real: {rp!r}")
         encerrado_em = sinal.get("encerrado_em") if e.tipo == "encerrado" else None
+        if encerrado_em is not None and not isinstance(encerrado_em, str):
+            raise ValueError(f"campo encerrado_em nao e texto: {encerrado_em!r}")
+        texto = _json(sinal)
         return (sinal["id"], sinal["modo"], sinal["par"], sinal["tipo"], sinal["detectado_em"],
-                encerrado_em, sinal.get("rp_liquido_pct"), texto)
+                encerrado_em, rp, texto)
 
     def sinais_do_dia(self, dia: str) -> list[dict]:
         """Os sinais detectados no dia UTC `dia` ("AAAA-MM-DD"), do mais antigo ao mais novo.

@@ -6,8 +6,9 @@ motor (candidatos -> filtros -> sinais -> banco). Junto sobe a API do painel (ro
 WebSocket /ws/sinais, que recebe cada evento do motor). A cada minuto o log mostra quantos
 sinais estao ativos. Ctrl+C encerra fechando as conexoes, o painel e o banco.
 
-Robustez (especificacao, secao 8): conexao que cai volta sozinha (coletor.manter_tickers), a lista
-de mercados e recarregada a cada `recarregar_mercados_s`, e a cada `intervalo_log_recursos_s` o log
+Robustez (especificacao, secao 8): conexao que cai volta sozinha (coletor.manter_tickers), corretora
+que nao carregou a lista de mercados ao ligar tenta de novo sozinha (_trazer_de_volta), a lista de
+mercados e recarregada a cada `recarregar_mercados_s`, e a cada `intervalo_log_recursos_s` o log
 registra memoria, CPU e o resumo dos descartes. Log no terminal e num arquivo por dia (scanner/logs.py).
 
 Com --validar, so confere o config.yaml e sai (nao conecta em nada).
@@ -24,6 +25,7 @@ from scanner.api import conferir_painel, criar_app, servir_api
 from scanner.armazenamento import Banco
 from scanner.coletores.ccxt_coletor import ColetorCcxt, criar_exchange_ccxt
 from scanner.coletores.dados_lentos import DadosLentos
+from scanner.coletores.reconexao import espera_reconexao
 from scanner.config.carregar import Config, ErroConfig, carregar_config
 from scanner.estado import EstadoMercados
 from scanner.logs import MedidorCpu, configurar_logs, linha_de_recursos, memoria_do_processo
@@ -48,15 +50,17 @@ def configurar_log(cfg: Config) -> None:
 async def _carregar_mercados(exchanges: dict) -> list[str]:
     """Carrega a lista de mercados de todas as corretoras ao mesmo tempo. Devolve as que conseguiram.
 
-    Uma corretora que falha vai para o log e fica de fora; as outras seguem.
+    Uma corretora que falha vai para o log e fica de fora por enquanto; as outras seguem. O `rodar`
+    tenta de novo sozinho as que faltaram (veja _trazer_de_volta).
     """
     nomes = list(exchanges)
     resultados = await asyncio.gather(*(exchanges[n].load_markets() for n in nomes), return_exceptions=True)
     carregadas = []
     for nome, resultado in zip(nomes, resultados):
         if isinstance(resultado, BaseException):
-            registro.error("%s: nao consegui carregar a lista de mercados (%s: %s); a corretora fica de fora",
-                           nome, type(resultado).__name__, resultado)
+            registro.error("%s: nao consegui carregar a lista de mercados (%s: %s); a corretora fica de fora "
+                           "por enquanto e eu tento de novo sozinho em instantes", nome, type(resultado).__name__,
+                           resultado)
         else:
             carregadas.append(nome)
     return carregadas
@@ -65,8 +69,10 @@ async def _carregar_mercados(exchanges: dict) -> list[str]:
 async def _acompanhar_tickers(coletor: ColetorCcxt, simbolos: list[str]) -> None:
     """Etapa 1 de uma corretora, com reconexao (veja ColetorCcxt.manter_tickers).
 
-    Quedas de conexao sao tratadas pelo coletor (espera crescente e tenta de novo). Aqui so chega um
-    defeito inesperado do proprio scanner: vai para o log, com traceback, e as outras corretoras seguem.
+    Qualquer erro dentro do stream (queda de conexao, erro da corretora ou defeito do proprio scanner)
+    e tratado pelo coletor: espera crescente e tenta de novo; o que nao e queda de conexao sai no log
+    com traceback na primeira vez. Aqui so chega um erro de fora desse laco (ex.: no proprio laco de
+    reconexao): vai para o log, com traceback, e as outras corretoras seguem.
     """
     try:
         await coletor.manter_tickers(simbolos)
@@ -78,16 +84,24 @@ async def _acompanhar_tickers(coletor: ColetorCcxt, simbolos: list[str]) -> None
 class _Tickers:
     """As tarefas da etapa 1 (uma por corretora) e a lista de simbolos que cada uma acompanha.
 
-    A recarga da lista de mercados usa isto para reiniciar so as corretoras cuja lista mudou.
+    A recarga da lista de mercados e a corretora que entra depois usam isto para reiniciar so as
+    corretoras cuja lista mudou. `trava`: so um ajuste das listas por vez (veja _ajustar_tickers).
     """
 
     def __init__(self, coletores: dict[str, ColetorCcxt]):
         self._coletores = coletores
         self.tarefas: dict[str, asyncio.Task] = {}
         self.simbolos: dict[str, list[str]] = {}
+        self.trava = asyncio.Lock()
 
     def iniciar(self, nome: str, simbolos: list[str]) -> None:
-        """Comeca a acompanhar os tickers de `simbolos` na corretora `nome` (numa tarefa propria)."""
+        """Comeca a acompanhar os tickers de `simbolos` na corretora `nome` (numa tarefa propria).
+
+        Se ja havia uma tarefa dessa corretora, ela e cancelada antes: nunca dois streams da mesma corretora.
+        """
+        anterior = self.tarefas.get(nome)
+        if anterior is not None and not anterior.done():
+            anterior.cancel()
         self.simbolos[nome] = list(simbolos)
         self.tarefas[nome] = asyncio.create_task(
             _acompanhar_tickers(self._coletores[nome], list(simbolos)), name=f"tickers {nome}"
@@ -106,11 +120,8 @@ async def _recarregar_mercados(exchanges: dict, coletores: dict[str, ColetorCcxt
                                estado: EstadoMercados) -> None:
     """Recarrega a lista de mercados de todas as corretoras (especificacao, secao 8: mudancas nas corretoras).
 
-    1. load_markets(reload=True) em todas ao mesmo tempo; a que falhar vai para o log e segue com a
-       lista anterior.
-    2. Recalcula os simbolos da etapa 1; o stream de tickers so reinicia nas corretoras cuja lista mudou.
-    3. Par que saiu da lista (a corretora tirou, ou ele deixou de formar combinacao) sai do estado,
-       ticker e livro: some do scanner sem erro e o sinal dele e encerrado pelo fluxo normal.
+    load_markets(reload=True) em todas ao mesmo tempo; a que falhar vai para o log e segue com a lista
+    anterior. Depois ajusta os tickers de todas (veja _ajustar_tickers).
     """
     nomes = list(coletores)
     resultados = await asyncio.gather(*(exchanges[n].load_markets(reload=True) for n in nomes),
@@ -119,23 +130,68 @@ async def _recarregar_mercados(exchanges: dict, coletores: dict[str, ColetorCcxt
         if isinstance(resultado, Exception):
             registro.warning("%s: nao consegui recarregar a lista de mercados (%s: %s); sigo com a lista anterior",
                              nome, type(resultado).__name__, resultado)
-    vencedores = {nome: coletor.simbolos_por_chave() for nome, coletor in coletores.items()}
-    novos = simbolos_para_tickers(vencedores)
-    for nome in nomes:
-        lista = novos.get(nome, [])
-        anterior = tickers.simbolos.get(nome, [])
-        mudou = lista != anterior
-        if mudou:
-            registro.info("%s: a lista de pares mudou (%d -> %d pares); reiniciando os tickers",
-                          nome, len(anterior), len(lista))
-            await tickers.parar(nome)  # antes de limpar o estado: o stream velho nao devolve o par que saiu
-        usados = set(lista)
-        chaves = {chave for chave, simbolo in vencedores[nome].items() if simbolo in usados}
-        removidos = estado.remover_pares_fora(nome, chaves)
-        if removidos:
-            registro.info("%s: %d pares sairam da lista e foram tirados do scanner", nome, removidos)
-        if mudou and lista:
-            tickers.iniciar(nome, lista)
+    await _ajustar_tickers(coletores, tickers, estado)
+
+
+async def _ajustar_tickers(coletores: dict[str, ColetorCcxt], tickers: _Tickers, estado: EstadoMercados) -> None:
+    """Recalcula os simbolos da etapa 1 de todas as corretoras e ajusta os streams.
+
+    - o stream de tickers so reinicia nas corretoras cuja lista mudou (ex.: uma corretora nova entrou e
+      as outras ganharam pares em comum com ela);
+    - par que saiu da lista (a corretora tirou, ficou inativo ou deixou de formar combinacao) sai do
+      estado, ticker e livro: some do scanner sem erro e o sinal dele e encerrado pelo fluxo normal.
+    Um ajuste por vez (`tickers.trava`): a recarga e a corretora que entra nao se atropelam.
+    """
+    async with tickers.trava:
+        vencedores = {nome: coletor.simbolos_por_chave() for nome, coletor in coletores.items()}
+        novos = simbolos_para_tickers(vencedores)
+        for nome in list(coletores):
+            lista = novos.get(nome, [])
+            anterior = tickers.simbolos.get(nome, [])
+            mudou = lista != anterior
+            if mudou:
+                registro.info("%s: a lista de pares mudou (%d -> %d pares); reiniciando os tickers",
+                              nome, len(anterior), len(lista))
+                await tickers.parar(nome)  # antes de limpar o estado: o stream velho nao devolve o par que saiu
+            usados = set(lista)
+            chaves = {chave for chave, simbolo in vencedores[nome].items() if simbolo in usados}
+            removidos = estado.remover_pares_fora(nome, chaves)
+            if removidos:
+                registro.info("%s: %d pares sairam da lista e foram tirados do scanner", nome, removidos)
+            if mudou and lista:
+                tickers.iniciar(nome, lista)
+
+
+async def _trazer_de_volta(nome: str, exchange, coletores: dict[str, ColetorCcxt], tickers: _Tickers,
+                           estado: EstadoMercados, criar_coletor: Callable[[str], ColetorCcxt],
+                           ao_entrar: Callable[[str], None], espera_max_s: float,
+                           esperar: Callable[[float], Awaitable] = asyncio.sleep) -> None:
+    """Corretora que nao carregou a lista de mercados ao ligar: tenta de novo sozinha ate conseguir.
+
+    Espera 1s, 2s, 4s... (ate espera_max_s) entre as tentativas; cada tentativa que falha vai para o log.
+    Enquanto isso o painel mostra "reconectando" para ela. Quando carrega: cria o coletor dela, chama
+    `ao_entrar` (o __main__ liga os dados lentos dela; a recarga dos mercados ja passa a incluir quem
+    esta em `coletores`) e ajusta os tickers de todas (as outras podem ganhar pares em comum com ela).
+    """
+    estado.marcar_desconectada(nome)  # painel: "reconectando"
+    tentativa = 0
+    while True:
+        await esperar(espera_reconexao(tentativa, espera_max_s))
+        tentativa += 1
+        try:
+            await exchange.load_markets()
+            break
+        except Exception as erro:  # cancelamento (Ctrl+C) nao entra aqui
+            registro.warning("%s: ainda nao consegui carregar a lista de mercados (%s: %s); tentativa %d falhou, "
+                             "tento de novo em %gs", nome, type(erro).__name__, erro, tentativa,
+                             espera_reconexao(tentativa, espera_max_s))
+    registro.info("%s: lista de mercados carregada na tentativa %d; a corretora entra no scanner", nome, tentativa)
+    coletores[nome] = criar_coletor(nome)
+    ao_entrar(nome)
+    await _ajustar_tickers(coletores, tickers, estado)
+    if nome not in tickers.tarefas:  # sem ticker nenhum, nada tiraria o "reconectando" do painel
+        registro.warning("%s: nenhum par em comum com as outras corretoras; fica sem tickers", nome)
+        estado.marcar_reconectada(nome)
 
 
 async def _recarregar_mercados_sempre(exchanges: dict, coletores: dict[str, ColetorCcxt], tickers: _Tickers,
@@ -325,13 +381,17 @@ async def rodar(
         carregadas = await _carregar_mercados(exchanges)
         if not carregadas:
             raise RuntimeError("nenhuma corretora carregou a lista de mercados; confira a internet e o config.yaml")
-        for nome in carregadas:
-            coletores[nome] = ColetorCcxt(
+
+        def criar_coletor(nome: str) -> ColetorCcxt:
+            return ColetorCcxt(
                 nome, exchanges[nome], estado=estado, relogio=relogio,
                 timeout_desassinar_s=cfg.timeout_desassinar_s,
                 espera_max_reconexao_s=cfg.espera_max_reconexao_s,
                 limite_assinaturas=cfg.limites_assinatura.get(nome),
             )
+
+        for nome in carregadas:
+            coletores[nome] = criar_coletor(nome)
 
         # Etapa 1: tickers so dos pares que formam alguma combinacao (spot x futuro ou futuro x futuro).
         simbolos = simbolos_para_tickers({nome: c.simbolos_por_chave() for nome, c in coletores.items()})
@@ -342,12 +402,26 @@ async def rodar(
             else:
                 registro.warning("%s: nenhum par em comum com as outras corretoras; fica sem tickers", nome)
 
-        das_carregadas = {nome: exchanges[nome] for nome in carregadas}
         tarefas.append(asyncio.create_task(
-            dados_lentos.rodar(das_carregadas, cfg.intervalo_dados_lentos_s), name="dados lentos"))
+            dados_lentos.rodar({nome: exchanges[nome] for nome in carregadas}, cfg.intervalo_dados_lentos_s),
+            name="dados lentos"))
+
+        def ao_entrar(nome: str) -> None:  # corretora que entrou depois: liga os dados lentos dela
+            tarefas.append(asyncio.create_task(
+                dados_lentos.acompanhar(nome, exchanges[nome], cfg.intervalo_dados_lentos_s),
+                name=f"dados lentos {nome}"))
+
+        # Quem nao carregou a lista de mercados ao ligar tenta de novo sozinha, com espera crescente.
+        for nome in exchanges:
+            if nome not in coletores:
+                tarefas.append(asyncio.create_task(
+                    _trazer_de_volta(nome, exchanges[nome], coletores, tickers, estado, criar_coletor, ao_entrar,
+                                     cfg.espera_max_reconexao_s),
+                    name=f"volta de {nome}"))
         tarefas.append(asyncio.create_task(_servir_painel(app, cfg), name="painel"))
+        # A recarga passa por todas as corretoras que estao em `coletores` (inclusive as que entrarem depois).
         tarefas.append(asyncio.create_task(
-            _recarregar_mercados_sempre(das_carregadas, coletores, tickers, estado, cfg.recarregar_mercados_s),
+            _recarregar_mercados_sempre(exchanges, coletores, tickers, estado, cfg.recarregar_mercados_s),
             name="recarga dos mercados"))
         tarefas.append(asyncio.create_task(
             _registrar_recursos(motor, coletores, cfg.intervalo_log_recursos_s), name="recursos"))
