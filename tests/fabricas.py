@@ -3,6 +3,7 @@
 import asyncio
 from dataclasses import replace
 
+from scanner.coletores.ccxt_coletor import mercado_do_simbolo
 from scanner.coletores.dados_lentos import TaxaDesconhecida
 from scanner.config.carregar import Config
 from scanner.estado.mercados import EstadoMercados
@@ -363,6 +364,103 @@ class EsperaFalsa:
         if self._bloquear:
             await asyncio.Event().wait()
         await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# Corretora do ccxt falsa (Task 15; usada tambem na fase 3)
+# ---------------------------------------------------------------------------
+
+
+class CorretoraFalsa:
+    """Imita a corretora do ccxt.pro com filas: cada watch_* devolve o proximo item da fila dele.
+
+    Filas: (metodo, "spot" | "futuro") para watch_tickers / watch_bids_asks, ("watch_ticker", simbolo) e
+    ("livro", simbolo). Item que e excecao e levantado. Fila vazia: a chamada espera (como o ccxt esperando
+    a proxima mensagem). `pedidos` guarda (metodo, simbolos, params) de cada chamada e `canais`, o canal
+    que a opcao do ccxt pedia na hora do pedido ((metodo, simbolos, options[...]["method"])), como a XT le.
+    """
+
+    def __init__(self, markets, has=None, funding=None):
+        self.markets = {m["symbol"]: m for m in markets} if isinstance(markets, list) else markets
+        self.proximos_markets = None
+        self.has = {"watchTickers": True, "fetchFundingRates": True} if has is None else has
+        self.funding = dict(funding or {})
+        self.pedidos = []
+        self.canais = []
+        self.options = {}
+        self.chamadas_funding = 0
+        self._filas = {}
+
+    def fila(self, chave) -> asyncio.Queue:
+        if chave not in self._filas:
+            self._filas[chave] = asyncio.Queue()
+        return self._filas[chave]
+
+    def entregar(self, chave, *itens) -> None:
+        for item in itens:
+            self.fila(chave).put_nowait(item)
+
+    async def _proximo(self, chave):
+        item = await self.fila(chave).get()
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def pedidos_de(self, metodo) -> list:
+        return [(simbolos, params) for nome, simbolos, params in self.pedidos if nome == metodo]
+
+    async def load_markets(self, reload=False, params=None):
+        await asyncio.sleep(0)
+        if self.proximos_markets is not None:
+            self.markets, self.proximos_markets = self.proximos_markets, None
+        return self.markets
+
+    async def watch_tickers(self, symbols=None, params=None):
+        self.pedidos.append(("watch_tickers", tuple(symbols), params))
+        self.canais.append(("watch_tickers", tuple(symbols), (self.options.get("watchTickers") or {}).get("method")))
+        return await self._proximo(("watch_tickers", mercado_do_simbolo(symbols[0])))
+
+    async def watch_bids_asks(self, symbols=None, params=None):
+        self.pedidos.append(("watch_bids_asks", tuple(symbols), params))
+        return await self._proximo(("watch_bids_asks", mercado_do_simbolo(symbols[0])))
+
+    async def watch_ticker(self, symbol, params=None):
+        self.pedidos.append(("watch_ticker", (symbol,), params))
+        self.canais.append(("watch_ticker", (symbol,), (self.options.get("watchTicker") or {}).get("method")))
+        return await self._proximo(("watch_ticker", symbol))
+
+    async def watch_order_book(self, symbol, limit=None, params=None):
+        self.pedidos.append(("watch_order_book", (symbol,), params))
+        return await self._proximo(("livro", symbol))
+
+    async def un_watch_order_book(self, symbol, params=None):
+        await asyncio.sleep(0)
+
+    async def fetch_tickers(self, symbols=None, params=None):
+        await asyncio.sleep(0)
+        return {}
+
+    async def fetch_funding_rates(self, symbols=None, params=None):
+        self.chamadas_funding += 1
+        await asyncio.sleep(0)
+        return dict(self.funding)
+
+    async def fetch_funding_rate(self, symbol, params=None):
+        await asyncio.sleep(0)
+        return self.funding[symbol]
+
+    async def close(self):
+        pass
+
+
+def tk(bid=99.9, ask=100.0, volume=5e6):
+    """Ticker no formato do ccxt."""
+    return {"bid": bid, "ask": ask, "quoteVolume": volume, "percentage": 1.0, "timestamp": None}
+
+
+def ob(bid=99.9, ask=100.0, qtd=10.0):
+    """Livro no formato do ccxt, um nivel de cada lado."""
+    return {"bids": [[bid, qtd]], "asks": [[ask, qtd]], "timestamp": None}
 
 
 # ---------------------------------------------------------------------------

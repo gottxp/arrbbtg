@@ -181,8 +181,23 @@ url_ws_lighter: wss://mainnet.zklighter.elliot.ai/stream
 url_rest_lighter_rh: https://api.rh.lighter.xyz
 url_ws_lighter_rh: wss://api.rh.lighter.xyz/stream
 # De quanto em quanto tempo o scanner manda um ping a Lighter, em segundos (menos que 120: o servidor fecha
-# a conexao depois de 2 minutos sem nada do cliente). Sem nenhuma mensagem por 2 intervalos, reconecta.
+# a conexao depois de 2 minutos sem nada do cliente).
 intervalo_ping_lighter_s: 30
+# Sem nenhuma mensagem da Lighter por tantos intervalos de ping (nem a resposta do ping), a conexao e dada
+# como morta e o scanner reconecta (numero inteiro).
+pings_sem_resposta_lighter: 2
+# Tempo maximo de uma chamada REST da Lighter (lista de mercados) e da abertura da conexao WebSocket, em segundos.
+tempo_max_rede_lighter_s: 10
+# Niveis de cada lado do livro da Lighter que vao para o scanner (os melhores). A Lighter manda o livro inteiro
+# (milhares de niveis nos pares grandes); o calculo so come o livro ate o tamanho de referencia. Se aumentar
+# muito o tamanho_referencia_usd, aumente aqui tambem (livro curto demais = "sem liquidez" = sem sinal).
+niveis_livro_lighter: 100
+# Livro pedido a Lighter que nao recebe o livro completo em tantos segundos e pedido de novo (1s, 2s, 4s... de
+# espera se continuar sem chegar).
+tempo_max_livro_completo_lighter_s: 10
+# Mudancas de livro seguidas sem o livro completo antes delas para o log avisar (uma vez por par): sinal de que o
+# formato da Lighter mudou.
+mudancas_sem_livro_completo_lighter: 10
 
 # Painel web. Na VPS, preencha usuario e senha.
 painel:

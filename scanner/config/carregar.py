@@ -101,6 +101,16 @@ class Config:
     # De quanto em quanto tempo o scanner manda {"type": "ping"} a Lighter, em segundos. O servidor fecha a
     # conexao que passa 2 minutos sem receber nada do cliente.
     intervalo_ping_lighter_s: float = 30
+    # Sem nenhuma mensagem por tantos intervalos de ping (nem o pong), a conexao da Lighter e dada como morta.
+    pings_sem_resposta_lighter: int = 2
+    # Tempo maximo de uma chamada REST da Lighter e da abertura da conexao WebSocket, em segundos.
+    tempo_max_rede_lighter_s: float = 10
+    # Niveis de cada lado do livro da Lighter que vao ao estado (os melhores): a Lighter manda o livro inteiro.
+    niveis_livro_lighter: int = 100
+    # Livro pedido que nao recebe o livro completo em tantos segundos e pedido de novo (com espera crescente).
+    tempo_max_livro_completo_lighter_s: float = 10
+    # Mudancas de livro seguidas sem o livro completo antes delas para o log avisar (uma vez por par).
+    mudancas_sem_livro_completo_lighter: int = 10
 
     # Painel web.
     painel: dict = field(default_factory=_painel_padrao)
@@ -132,6 +142,8 @@ CAMPOS_POSITIVOS = (
     "atraso_max_valido_s",
     "intervalo_log_recursos_s",
     "faixa_cotacao_pct",
+    "tempo_max_rede_lighter_s",
+    "tempo_max_livro_completo_lighter_s",
 )
 
 # Campos numericos que aceitam qualquer valor (inclusive zero ou negativo).
@@ -266,6 +278,8 @@ CAMPOS_URL_LIGHTER = {
 }
 # O servidor da Lighter fecha a conexao depois de 2 minutos sem nada do cliente: o ping precisa vir antes.
 LIMITE_PING_LIGHTER_S = 120
+# Campos da Lighter que sao numero inteiro maior que zero.
+CAMPOS_INTEIROS_LIGHTER = ("pings_sem_resposta_lighter", "niveis_livro_lighter", "mudancas_sem_livro_completo_lighter")
 
 
 def _validar_url_lighter(campo: str, valor) -> str:
@@ -332,7 +346,7 @@ def _validar_campo(campo: str, valor):
         if not isinstance(valor, str) or not valor:
             raise ErroConfig("pasta_logs: precisa ser o nome de uma pasta, ex.: logs")
         return valor
-    if campo in ("dias_logs", "mensagens_sem_bid_ask"):
+    if campo in ("dias_logs", "mensagens_sem_bid_ask", *CAMPOS_INTEIROS_LIGHTER):
         if not _inteiro_positivo(valor):
             raise ErroConfig(f"{campo}: precisa ser um numero inteiro maior que zero (valor recebido: {valor!r})")
         return valor

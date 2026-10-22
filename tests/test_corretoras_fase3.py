@@ -31,8 +31,16 @@ from scanner.config.carregar import Config, ErroConfig, carregar_config
 from scanner.estado import EstadoMercados
 from scanner.ferramentas import imprimir_precos as ferramenta
 from scanner.motor import Sessao
-from tests.fabricas import ClienteLighterFalso, WsLighterFalso, cfg_com, esperar_ate, market_ccxt
-from tests.test_corretoras_fase2 import CorretoraFalsa, ob, tk
+from tests.fabricas import (
+    ClienteLighterFalso,
+    CorretoraFalsa,
+    WsLighterFalso,
+    cfg_com,
+    esperar_ate,
+    market_ccxt,
+    ob,
+    tk,
+)
 
 RAIZ = Path(__file__).resolve().parent.parent
 DADOS = Path(__file__).resolve().parent / "dados"
@@ -437,3 +445,104 @@ def test_main_do_imprimir_precos_cria_a_lighter_pelo_conector(monkeypatch, capsy
     assert ferramenta.main(["lighter", "--config", str(RAIZ / "config.yaml")]) == 1
     assert criadas == ["lighter"]
     assert "parou aqui" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Correcao pos-revisao (Task 16)
+# ---------------------------------------------------------------------------
+
+
+def test_campos_novos_da_lighter_na_config(tmp_path):
+    c = Config()
+    assert (c.niveis_livro_lighter, c.tempo_max_rede_lighter_s, c.pings_sem_resposta_lighter) == (100, 10, 2)
+    assert (c.mudancas_sem_livro_completo_lighter, c.tempo_max_livro_completo_lighter_s) == (10, 10)
+    lida = carregar_config(escrever(tmp_path, "niveis_livro_lighter: 50\ntempo_max_rede_lighter_s: 5\n"
+                                              "pings_sem_resposta_lighter: 3\nmudancas_sem_livro_completo_lighter: 4\n"
+                                              "tempo_max_livro_completo_lighter_s: 20\n"))
+    assert (lida.niveis_livro_lighter, lida.tempo_max_rede_lighter_s, lida.pings_sem_resposta_lighter,
+            lida.mudancas_sem_livro_completo_lighter, lida.tempo_max_livro_completo_lighter_s) == (50, 5, 3, 4, 20)
+    chaves = yaml.safe_load((RAIZ / "config.yaml").read_text(encoding="utf-8")) or {}
+    for campo in ("niveis_livro_lighter", "tempo_max_rede_lighter_s", "pings_sem_resposta_lighter",
+                  "mudancas_sem_livro_completo_lighter", "tempo_max_livro_completo_lighter_s"):
+        assert chaves.get(campo) == getattr(c, campo), campo
+
+
+@pytest.mark.parametrize("texto, campo", [
+    ("niveis_livro_lighter: 0\n", "niveis_livro_lighter"),
+    ("niveis_livro_lighter: 2.5\n", "niveis_livro_lighter"),
+    ("pings_sem_resposta_lighter: 0\n", "pings_sem_resposta_lighter"),
+    ("pings_sem_resposta_lighter: dois\n", "pings_sem_resposta_lighter"),
+    ("mudancas_sem_livro_completo_lighter: -1\n", "mudancas_sem_livro_completo_lighter"),
+    ("tempo_max_rede_lighter_s: 0\n", "tempo_max_rede_lighter_s"),
+    ("tempo_max_livro_completo_lighter_s: -3\n", "tempo_max_livro_completo_lighter_s"),
+])
+def test_campos_novos_da_lighter_com_valor_errado(tmp_path, texto, campo):
+    with pytest.raises(ErroConfig, match=campo):
+        carregar_config(escrever(tmp_path, texto))
+
+
+def test_lighter_sem_bid_ask_no_market_stats_gera_sinal_pelos_livros(tmp_path):
+    # O market_stats real pode vir como a amostra do ccxt (sem best_bid_price/best_ask_price): a etapa 1 da
+    # Lighter passa a vir dos livros e o sinal aparece mesmo assim, com volume e variacao do market_stats.
+    sem_bid_ask = {"channel": "market_stats:all", "type": "update/market_stats", "market_stats": {
+        "1": {"market_id": 1, "mark_price": "100.5", "last_trade_price": "100.5", "current_funding_rate": "0.0010",
+              "daily_quote_token_volume": 5e8, "daily_price_change": 0.5}}}
+    livro = {"channel": "order_book:1", "type": "subscribed/order_book", "order_book": {
+        "code": 0, "nonce": 7, "bids": [{"price": "100.5", "size": "10"}], "asks": [{"price": "100.51", "size": "10"}]}}
+    ws = WsLighterFalso(respostas={"market_stats/all": [[sem_bid_ask] * 5], "order_book/1": [[livro]]})
+    lighter = ClienteLighterFalso(LIGHTER_MARKETS, [ws])
+    mexc = CorretoraFalsa([MEXC_BTC])
+    mexc.entregar(("watch_tickers", "futuro"), *[{"BTC/USDT:USDT": tk(99.99, 100.0)} for _ in range(50)])
+    mexc.entregar(("livro", "BTC/USDT:USDT"), ob(99.99, 100.0))
+    bitget = CorretoraFalsa([BITGET_USDC_USDT])
+    bitget.entregar(("watch_tickers", "spot"), *[{"USDC/USDT": tk(0.9999, 1.0001)} for _ in range(50)])
+    exchanges = {"lighter": lighter, "mexc": mexc, "bitget": bitget}
+    config = cfg_com(corretoras=["mexc", "bitget", "lighter"], banco=str(tmp_path / "s.db"), ciclo_ms=50,
+                     rp_min_lucro_pct=-5.0, mensagens_sem_bid_ask=3, pasta_logs=str(tmp_path / "logs"))
+    asyncio.run(asyncio.wait_for(
+        principal.rodar(config, criar_exchange=exchanges.__getitem__, relogio=relogio, ciclos=10), timeout=5))
+    banco = Banco(config.banco)
+    sinais = [r["sinal"] for r in banco.sinais_do_dia("1970-01-01")]
+    banco.fechar()
+    s = next(x for x in sinais if x["ponta_short"]["corretora"] == "lighter")
+    assert s["ponta_short"]["preco"] == pytest.approx(100.5) and s["aviso_cotacao"] is False
+    assert s["ponta_short"]["volume_24h_usd"] == pytest.approx(5e8) and s["ponta_short"]["variacao_24h_pct"] == 0.5
+
+
+def test_lighter_que_entra_depois_entra_de_verdade_e_gera_sinal(tmp_path, monkeypatch):
+    # Sem trocar o _trazer_de_volta: a Lighter nao carrega ao ligar, carrega na tentativa seguinte, ganha o
+    # coletor proprio, os tickers e o sinal; o laco REST do DadosLentos nao e ligado para ela.
+    acompanhadas = []
+    acompanhar_original = DadosLentos.acompanhar
+
+    async def acompanhar(self, corretora, exchange, *args, **kwargs):
+        acompanhadas.append(corretora)
+        return await acompanhar_original(self, corretora, exchange, *args, **kwargs)
+
+    monkeypatch.setattr(DadosLentos, "acompanhar", acompanhar)
+    lighter = lighter_falsa_btc(100.5, 100.51)
+    carregar_lighter = lighter.load_markets
+    falhas = [OSError("sem internet")]
+
+    async def carrega_na_segunda(reload=False, params=None):
+        if falhas:
+            raise falhas.pop()
+        return await carregar_lighter(reload=reload)
+
+    lighter.load_markets = carrega_na_segunda
+    mexc = CorretoraFalsa([MEXC_BTC])
+    mexc.entregar(("watch_tickers", "futuro"), *[{"BTC/USDT:USDT": tk(99.99, 100.0)} for _ in range(200)])
+    mexc.entregar(("livro", "BTC/USDT:USDT"), ob(99.99, 100.0))
+    bitget = CorretoraFalsa([BITGET_USDC_USDT])
+    bitget.entregar(("watch_tickers", "spot"), *[{"USDC/USDT": tk(0.9999, 1.0001)} for _ in range(200)])
+    exchanges = {"lighter": lighter, "mexc": mexc, "bitget": bitget}
+    config = cfg_com(corretoras=["mexc", "bitget", "lighter"], banco=str(tmp_path / "s.db"), ciclo_ms=50,
+                     rp_min_lucro_pct=-5.0, espera_max_reconexao_s=0.05, pasta_logs=str(tmp_path / "logs"))
+    asyncio.run(asyncio.wait_for(
+        principal.rodar(config, criar_exchange=exchanges.__getitem__, relogio=relogio, ciclos=20), timeout=5))
+    banco = Banco(config.banco)
+    sinais = [r["sinal"] for r in banco.sinais_do_dia("1970-01-01")]
+    banco.fechar()
+    assert any(s["ponta_short"]["corretora"] == "lighter" for s in sinais)
+    assert lighter.conectou == 1 and lighter.fechado
+    assert "lighter" not in acompanhadas

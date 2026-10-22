@@ -2,31 +2,29 @@
 
 A Lighter nao passa pelo ccxt: o ccxt nao cobre a Lighter Robinhood, e a especificacao pede um conector
 proprio usando a API publica dela. A conversa e pelo cliente HTTP/WebSocket do aiohttp (vem com o ccxt).
+A leitura das mensagens e a juncao do livro (funcoes puras) ficam em scanner/coletores/lighter_formatos.py;
+aqui ficam o cliente (REST + WebSocket) e o coletor. A saude, as quedas, o limite de assinaturas e os
+descartes sao os mesmos do ColetorCcxt (ColetorComSaude, em base.py).
 
 Como funciona (documentacao oficial: https://apidocs.lighter.xyz, lida em 22/10/2026):
-  - Mercados (REST, GET /api/v1/orderBookDetails): so os perpetuos (`order_book_details`) com status
-    "active". A Lighter e so futuros (especificacao, secao 2). Cada um vira um market no estilo do ccxt
-    ("ETH/USDC:USDC" na principal, "ETH/USDG:USDG" na Robinhood), para o normalizador e o resto do scanner
-    funcionarem igual as outras corretoras ("1000PEPE" vira PEPE x1000, como na MEXC).
+  - Mercados (REST, GET /api/v1/orderBookDetails): so os perpetuos com status "active", no estilo do ccxt
+    ("ETH/USDC:USDC" na principal, "ETH/USDG:USDG" na Robinhood; "1000PEPE" vira PEPE x1000, como na MEXC).
   - Uma conexao WebSocket so por instancia, sempre so leitura (?readonly=true): o scanner nunca opera, e
     assim funciona tambem a partir de regiao restrita.
-  - Etapa 1 (tickers): o canal market_stats/all (todos os mercados numa assinatura) traz o melhor bid/ask,
-    o volume do dia na moeda de cotacao, a variacao do dia e o funding. Toda mensagem registra a conexao viva.
-  - Etapa 2 (livros): o canal order_book/{market_id}. A primeira mensagem ("subscribed/order_book") e o livro
-    completo; as seguintes ("update/order_book") so as mudancas, juntadas no livro guardado (tamanho 0 = o
-    nivel sai). Continuidade: o begin_nonce de cada mudanca precisa ser o nonce da anterior; quebrou, o livro
-    sai do estado e e pedido de novo (cancelar e assinar). Cancelar = mensagem "unsubscribe".
-  - Heartbeat: {"type": "ping"} a cada intervalo_ping_lighter_s (o servidor fecha a conexao que passa 2 min
-    sem receber nada). Sem nenhuma mensagem por dois intervalos de ping (nem o pong), a conexao e dada como
-    morta e o coletor reconecta.
-  - Funding: o current_funding_rate do market_stats (estimativa da proxima cobranca), ja em %; a Lighter
-    cobra de hora em hora. Funding e taxa taker vao direto para o DadosLentos (receber_funding e
-    receber_taxas): o laco REST do DadosLentos so sabe ler as corretoras do ccxt.
-
-Robustez (especificacao, secao 8), igual ao ColetorCcxt: conexao que cai volta sozinha com espera crescente
-(1s, 2s, 4s... ate espera_max_reconexao_s), a saude e as reconexoes vao para o estado, descartes contados,
-atraso medio pelo horario que a Lighter informa, limite de assinaturas de livros pelo volume 24h e a lista de
-mercados recarregada pelo __main__ (load_markets(reload=True)).
+  - Etapa 1 (tickers): o canal market_stats/all traz o melhor bid/ask, o volume do dia, a variacao e o
+    funding. Se ele so trouxer mercados sem bid/ask (como as amostras reais do ccxt de nov/2025), a etapa 1
+    passa a vir dos LIVROS: o coletor assina o order_book de cada par da lista (dentro de
+    limites_assinatura, pelo volume) e o melhor bid/ask de cada livro vira o ticker; o volume e a variacao
+    continuam vindo do market_stats. Se o bid/ask voltar no market_stats, a etapa 1 volta a vir dele.
+  - Etapa 2 (livros): order_book/{market_id}. Livro completo ("subscribed/order_book") e mudancas
+    ("update/order_book"), juntadas no livro guardado; begin_nonce diferente do nonce anterior = sequencia
+    quebrada: o livro sai do estado e e pedido de novo (cancelar e assinar). Livro completo que nao chega
+    (tempo_max_livro_completo_lighter_s, ou a Lighter respondendo "ja assinado"/"nao assinado") tambem e
+    pedido de novo. Repetindo sem nenhuma mudanca conferida no meio, a espera cresce (1s, 2s, 4s...).
+  - Heartbeat: {"type": "ping"} a cada intervalo_ping_lighter_s; sem nenhuma mensagem por
+    pings_sem_resposta_lighter intervalos, a conexao e dada como morta e o coletor reconecta.
+  - Funding: o current_funding_rate do market_stats, ja em % (a Lighter cobra de hora em hora). Funding e
+    taxa taker vao direto para o DadosLentos (receber_funding e receber_taxas).
 
 O formato das mensagens segue a documentacao (as fixtures em tests/dados/ tambem); precisa ser conferido com
 uma mensagem real no PC do dono.
@@ -34,248 +32,60 @@ uma mensagem real no PC do dono.
 
 import asyncio
 import contextlib
-import heapq
 import json
 import logging
-import math
 import ssl
 import time
-from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
 import aiohttp
 
-from scanner.coletores.base import Coletor
-from scanner.coletores.ccxt_coletor import DICA_LIMITE, TIPOS_DE_DESCARTE
-from scanner.coletores.reconexao import (
-    MARGEM_PARA_TROCAR_LIVRO,
-    espera_reconexao,
-    parece_limite_de_assinatura,
-    selecionar_pares,
+from scanner.coletores.base import DICA_LIMITE, ColetorComSaude
+from scanner.coletores.lighter_formatos import (
+    CANAL_TICKERS,
+    COTACAO_DA_INSTANCIA,
+    CORRETORAS_LIGHTER,
+    ERROS_INOFENSIVOS,
+    IGNORADA,
+    INTERVALO_FUNDING_LIGHTER_H,
+    INVALIDA,
+    JA_ASSINADO,
+    NOME_DA_INSTANCIA,
+    QUEBRADA,
+    SEM_NONCE,
+    ErroApiLighter,
+    LivroJuntado,
+    e_lighter,
+    endereco_somente_leitura,
+    itens_do_market_stats,
+    ler_inteiro,
+    ler_numero,
+    livro_de_lighter,
+    livro_do_erro,
+    markets_de_lighter,
+    nome_da_instancia,
+    ticker_de_lighter,
 )
+from scanner.coletores.reconexao import espera_reconexao, parece_limite_de_assinatura
 from scanner.config.carregar import Config
 from scanner.estado.mercados import EstadoMercados
 from scanner.modelos import Livro, Ticker
 from scanner.normalizador import ParNormalizado, converter_livro, normalizar, prioridade_cotacao
 
+# Nomes que outros modulos e os testes importam daqui (os formatos moram em lighter_formatos.py).
+__all__ = [
+    "CORRETORAS_LIGHTER", "INTERVALO_FUNDING_LIGHTER_H", "ClienteLighter", "ColetorLighter", "ConexaoFechada",
+    "ErroApiLighter", "criar_cliente_lighter", "criar_coletor_lighter", "e_lighter", "endereco_somente_leitura",
+    "livro_de_lighter", "markets_de_lighter", "ticker_de_lighter",
+]
+
 registro = logging.getLogger("scanner.coletores")
-
-# Nome da corretora no scanner (config.yaml) -> instancia da Lighter.
-CORRETORAS_LIGHTER = {"lighter": "principal", "lighter_rh": "robinhood"}
-NOME_DA_INSTANCIA = {instancia: nome for nome, instancia in CORRETORAS_LIGHTER.items()}
-# Moeda de cotacao (e de garantia) de cada instancia: USDC na principal, USDG na Robinhood (docs/lighter-rh).
-COTACAO_DA_INSTANCIA = {"principal": "USDC", "robinhood": "USDG"}
-# A Lighter cobra funding a cada hora cheia (docs.lighter.xyz/trading/funding). O intervalo_funding_h do
-# config.yaml vale sobre este.
-INTERVALO_FUNDING_LIGHTER_H = 1
-# Canal da etapa 1: as estatisticas de todos os mercados numa assinatura so.
-CANAL_TICKERS = "market_stats/all"
-# Tempo maximo de uma chamada REST e da abertura da conexao WebSocket, em segundos (o mesmo padrao do ccxt).
-# Detalhe tecnico da conexao, nao limite de negocio.
-TEMPO_MAX_REDE_S = 10
-# Sem nenhuma mensagem por tantos intervalos de ping (nem a resposta do ping), a conexao esta morta.
-PINGS_SEM_RESPOSTA = 2
-# Niveis de cada lado que vao ao estado (os melhores). O motor so come o livro ate o tamanho de referencia
-# ($100 por padrao) e a Lighter manda o livro inteiro (milhares de niveis nos pares grandes): copiar todos a
-# cada mudanca gastaria CPU a toa. Detalhe tecnico; se o livro nao chegar ao tamanho, o sinal e descartado.
-NIVEIS_POR_LADO = 100
-# Erros que a Lighter manda e que nao sao problema: 30003 = ja estava assinado, 30002 = nao estava assinado.
-ERROS_INOFENSIVOS = frozenset({30002, 30003})
-
-
-class ErroApiLighter(Exception):
-    """A API REST da Lighter respondeu erro ou algo num formato que o scanner nao entende."""
 
 
 class ConexaoFechada(ConnectionError):
     """A conexao WebSocket da Lighter fechou (ou ficou muda)."""
-
-
-def e_lighter(nome: str) -> bool:
-    """True se a corretora usa o conector proprio da Lighter ("lighter" ou "lighter_rh")."""
-    return nome in CORRETORAS_LIGHTER
-
-
-def _nome_da_instancia(instancia: str) -> str:
-    if instancia not in NOME_DA_INSTANCIA:
-        raise ValueError(f"instancia da Lighter desconhecida: {instancia!r} (use principal ou robinhood)")
-    return NOME_DA_INSTANCIA[instancia]
-
-
-def endereco_somente_leitura(url: str) -> str:
-    """O endereco do WebSocket com ?readonly=true (so leitura; vale tambem em regiao restrita)."""
-    base, interrogacao, consulta = url.partition("?")
-    if not interrogacao:
-        return f"{url}?readonly=true"
-    if "readonly=true" in consulta.split("&"):
-        return url
-    return f"{url}&readonly=true"
-
-
-def _numero(valor) -> float | None:
-    """Numero real de um campo da Lighter (ela manda precos em texto, ex.: "2064.50"), ou None.
-
-    bool, NaN, infinito e texto que nao e numero contam como None.
-    """
-    if valor is None or isinstance(valor, bool):
-        return None
-    if isinstance(valor, (int, float)):
-        numero = float(valor)
-    elif isinstance(valor, str):
-        try:
-            numero = float(valor)
-        except ValueError:
-            return None
-    else:
-        return None
-    return numero if math.isfinite(numero) else None
-
-
-def _inteiro(valor) -> int | None:
-    """Numero inteiro (int ou texto com digitos, ex.: market_id e nonce), ou None. bool nao conta."""
-    if isinstance(valor, bool):
-        return None
-    if isinstance(valor, int):
-        return valor
-    if isinstance(valor, str) and valor.strip().lstrip("-").isdigit():
-        return int(valor)
-    return None
-
-
-def _passo(decimais) -> float | None:
-    """10^-decimais (o menor passo de preco ou tamanho), ou None se nao veio."""
-    casas = _inteiro(decimais)
-    return None if casas is None or casas < 0 else 10.0 ** -casas
-
-
-# ---------------------------------------------------------------------------
-# Formatos da API (funcoes puras)
-# ---------------------------------------------------------------------------
-
-
-def markets_de_lighter(resposta: dict, cotacao: str) -> tuple[dict, int]:
-    """Os perpetuos ativos do orderBookDetails no estilo do ccxt, e quantos inativos ficaram de fora.
-
-    cotacao: "USDC" (principal) ou "USDG" (Robinhood). Devolve ({simbolo: market}, inativos), com o simbolo
-    como o ccxt escreveria um perpetuo ("ETH/USDC:USDC"). O spot (`spot_order_book_details`) nao entra.
-    Cada market guarda o market_id em "id", a taxa taker em "taker" (fracao, como o ccxt) e os decimais em
-    "precision"; o item original fica em "info". Item malformado (sem simbolo ou sem market_id) e pulado.
-
-    Taxa: o taker_fee vem em % (como os outros campos de taxa da Lighter, ex.: liquidation_fee "1.0000" = 1%);
-    "0.0000" e a conta Standard (0%). Taxa ilegivel vira None (o motor descarta por falta de taxa).
-    """
-    detalhes = resposta.get("order_book_details") if isinstance(resposta, dict) else None
-    if not isinstance(detalhes, list):
-        raise ErroApiLighter("a resposta do orderBookDetails veio sem a lista order_book_details (a API mudou?)")
-    markets: dict[str, dict] = {}
-    inativos = 0
-    for detalhe in detalhes:
-        if not isinstance(detalhe, dict):
-            continue
-        base, ident = detalhe.get("symbol"), _inteiro(detalhe.get("market_id"))
-        if not isinstance(base, str) or not base or "/" in base or ident is None:
-            continue
-        if detalhe.get("market_type") not in (None, "perp"):
-            continue
-        if detalhe.get("status") != "active":
-            inativos += 1
-            continue
-        taxa_pct = _numero(detalhe.get("taker_fee"))
-        simbolo = f"{base}/{cotacao}:{cotacao}"
-        markets[simbolo] = {
-            "id": str(ident), "symbol": simbolo, "base": base, "quote": cotacao, "settle": cotacao,
-            "type": "swap", "spot": False, "swap": True, "future": False, "option": False,
-            "linear": True, "inverse": False, "contractSize": 1.0, "active": True,
-            "taker": taxa_pct / 100 if taxa_pct is not None and taxa_pct >= 0 else None,
-            "precision": {"amount": _passo(detalhe.get("size_decimals")),
-                          "price": _passo(detalhe.get("price_decimals"))},
-            "info": detalhe,
-        }
-    return markets, inativos
-
-
-def _niveis(lista) -> dict[float, float] | None:
-    """{preco: tamanho} dos niveis [{"price": "...", "size": "..."}] da Lighter, ou None se algum for invalido.
-
-    Preco precisa ser numero real maior que zero; tamanho, numero real maior ou igual a zero (nas mudancas,
-    0 = o nivel sai). Lado que nao veio conta como vazio.
-    """
-    if lista is None:
-        return {}
-    if not isinstance(lista, list):
-        return None
-    niveis = {}
-    for nivel in lista:
-        if not isinstance(nivel, dict):
-            return None
-        preco, tamanho = _numero(nivel.get("price")), _numero(nivel.get("size"))
-        if preco is None or tamanho is None or preco <= 0 or tamanho < 0:
-            return None
-        niveis[preco] = tamanho
-    return niveis
-
-
-def _montar_livro(corretora: str, simbolo: str, bids: dict[float, float], asks: dict[float, float],
-                  agora: float, ts_ms: float | None) -> Livro | None:
-    """O Livro com os NIVEIS_POR_LADO melhores niveis de cada lado, em ordem (melhor preco primeiro), ou None.
-
-    bids/asks: {preco: tamanho}, so com tamanho maior que zero. As mesmas regras do livro_de_ccxt: lado
-    vazio, preco <= 0 (ja barrado em _niveis) ou melhor bid maior ou igual ao melhor ask descartam o livro.
-    """
-    if not bids or not asks:
-        return None
-    precos_bids = heapq.nlargest(NIVEIS_POR_LADO, bids)
-    precos_asks = heapq.nsmallest(NIVEIS_POR_LADO, asks)
-    if precos_bids[0] >= precos_asks[0]:  # cruzado: a melhor compra paga mais que a melhor venda
-        return None
-    return Livro(corretora=corretora, mercado="futuro", simbolo_original=simbolo,
-                 bids=[(p, bids[p]) for p in precos_bids], asks=[(p, asks[p]) for p in precos_asks],
-                 recebido_em=agora, ts_corretora=None if ts_ms is None else ts_ms / 1000)  # a Lighter manda ms
-
-
-def livro_de_lighter(msg: dict, instancia: str, agora: float, simbolo: str | None = None) -> Livro | None:
-    """Transforma uma mensagem do canal order_book com o livro COMPLETO em um Livro (ou None, descartado).
-
-    msg: a primeira mensagem depois de assinar ("subscribed/order_book"), no formato documentado:
-        {"channel": "order_book:0", "order_book": {"bids": [{"price", "size"}], "asks": [...], "nonce", ...},
-         "timestamp": ms, "type": ...}.
-    instancia: "principal" (corretora "lighter") ou "robinhood" ("lighter_rh").
-    simbolo: o simbolo do scanner (ex.: "ETH/USDC:USDC"); sem ele, o market_id do canal ("0").
-    As mesmas regras de descarte do livro_de_ccxt: vazio (ou um lado so), preco zero, negativo ou invalido,
-    cruzado (bid >= ask). Os niveis sao postos em ordem; os de tamanho 0 nao entram, e so os NIVEIS_POR_LADO
-    melhores de cada lado ficam. Precos crus, como a Lighter manda (o coletor converte "1000PEPE" para 1
-    unidade do PEPE ao guardar no estado).
-    """
-    corretora = _nome_da_instancia(instancia)
-    dados = msg.get("order_book") if isinstance(msg, dict) else None
-    if not isinstance(dados, dict):
-        return None
-    bids, asks = _niveis(dados.get("bids")), _niveis(dados.get("asks"))
-    if bids is None or asks is None:
-        return None
-    if simbolo is None:
-        simbolo = str(msg.get("channel") or "").partition(":")[2]
-    return _montar_livro(corretora, simbolo, _sem_zeros(bids), _sem_zeros(asks), agora, _numero(msg.get("timestamp")))
-
-
-def _sem_zeros(niveis: dict[float, float]) -> dict[float, float]:
-    """Os niveis com tamanho maior que zero (no livro completo, tamanho 0 nao e nivel)."""
-    return {preco: tamanho for preco, tamanho in niveis.items() if tamanho > 0}
-
-
-def ticker_de_lighter(corretora: str, simbolo: str, stats: dict, agora: float) -> Ticker | None:
-    """O Ticker de um mercado do market_stats, ou None se faltar bid/ask valido (zero, cruzado, ilegivel).
-
-    Volume = daily_quote_token_volume (na moeda de cotacao, USDC ou USDG); variacao = daily_price_change (%).
-    """
-    bid, ask = _numero(stats.get("best_bid_price")), _numero(stats.get("best_ask_price"))
-    if bid is None or ask is None or bid <= 0 or ask <= 0 or bid >= ask:
-        return None
-    return Ticker(corretora=corretora, mercado="futuro", simbolo_original=simbolo, bid=bid, ask=ask, recebido_em=agora,
-                  volume_24h_usd=_numero(stats.get("daily_quote_token_volume")),
-                  variacao_24h_pct=_numero(stats.get("daily_price_change")))
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +94,12 @@ def ticker_de_lighter(corretora: str, simbolo: str, stats: dict, agora: float) -
 
 
 def _contexto_ssl() -> ssl.SSLContext:
-    """Certificados do certifi (vem com o ccxt, que usa os mesmos); sem ele, os do sistema."""
+    """Os certificados do certifi, como o ccxt usa; sem ele, os do sistema.
+
+    O certifi nao e uma biblioteca a mais: e dependencia do proprio ccxt (vem instalado com ele), e o ccxt
+    monta o contexto SSL do aiohttp exatamente assim. Usar a mesma lista de certificados faz a Lighter
+    conectar nos mesmos PCs em que as corretoras do ccxt conectam.
+    """
     try:
         import certifi
     except ImportError:  # pragma: no cover - o certifi vem com o ccxt
@@ -328,25 +143,25 @@ class ClienteLighter:
     Faz o papel do "exchange" do ccxt para o __main__: `markets`, `load_markets(reload=...)` e `close()`.
     Nao acessa a rede ao ser criado; a sessao HTTP do aiohttp nasce no primeiro uso.
     instancia: "principal" ou "robinhood". url_rest / url_ws: da Config (url_rest_lighter...). O WebSocket e
-    sempre aberto so leitura (?readonly=true).
+    sempre aberto so leitura (?readonly=true). tempo_max_s: tempo_max_rede_lighter_s da Config.
     """
 
     def __init__(self, instancia: Literal["principal", "robinhood"], url_rest: str, url_ws: str,
-                 tempo_max_s: float = TEMPO_MAX_REDE_S):
-        _nome_da_instancia(instancia)
+                 tempo_max_s: float = Config.tempo_max_rede_lighter_s):
+        nome_da_instancia(instancia)
         self.instancia = instancia
         self.cotacao = COTACAO_DA_INSTANCIA[instancia]
         self.url_rest = url_rest.rstrip("/")
         self.url_ws = endereco_somente_leitura(url_ws)
+        self.tempo_max_s = tempo_max_s
         self.markets: dict = {}  # {simbolo: market} (veja markets_de_lighter); vazio ate o primeiro load_markets
         self.has: dict = {}
-        self._tempo_max_s = tempo_max_s
         self._sessao: aiohttp.ClientSession | None = None
         self._inativos_no_log: int | None = None
 
     def _sessao_http(self) -> aiohttp.ClientSession:
         if self._sessao is None or self._sessao.closed:
-            tempo = aiohttp.ClientTimeout(total=None, connect=self._tempo_max_s, sock_connect=self._tempo_max_s)
+            tempo = aiohttp.ClientTimeout(total=None, connect=self.tempo_max_s, sock_connect=self.tempo_max_s)
             self._sessao = aiohttp.ClientSession(timeout=tempo, connector=aiohttp.TCPConnector(ssl=_contexto_ssl()))
         return self._sessao
 
@@ -359,7 +174,7 @@ class ClienteLighter:
         if self.markets and not reload:
             return self.markets
         url = f"{self.url_rest}/api/v1/orderBookDetails"
-        async with self._sessao_http().get(url, timeout=aiohttp.ClientTimeout(total=self._tempo_max_s)) as resposta:
+        async with self._sessao_http().get(url, timeout=aiohttp.ClientTimeout(total=self.tempo_max_s)) as resposta:
             texto = await resposta.text()
             if resposta.status != 200:
                 raise ErroApiLighter(f"orderBookDetails respondeu HTTP {resposta.status}: {texto[:200]}")
@@ -367,7 +182,7 @@ class ClienteLighter:
             dados = json.loads(texto)
         except ValueError as erro:
             raise ErroApiLighter(f"orderBookDetails nao respondeu JSON ({erro})") from erro
-        codigo = _inteiro(dados.get("code")) if isinstance(dados, dict) else None
+        codigo = ler_inteiro(dados.get("code")) if isinstance(dados, dict) else None
         if codigo is not None and codigo != 200:
             raise ErroApiLighter(f"orderBookDetails respondeu code {codigo}: {dados.get('message')}")
         markets, inativos = markets_de_lighter(dados, self.cotacao)
@@ -380,9 +195,9 @@ class ClienteLighter:
 
     async def conectar_ws(self) -> _ConexaoWs:
         """Abre a conexao WebSocket so leitura (no maximo tempo_max_s para abrir)."""
-        async with asyncio.timeout(self._tempo_max_s):
+        async with asyncio.timeout(self.tempo_max_s):
             ws = await self._sessao_http().ws_connect(
-                self.url_ws, autoping=True, heartbeat=None, timeout=aiohttp.ClientWSTimeout(ws_close=self._tempo_max_s))
+                self.url_ws, autoping=True, heartbeat=None, timeout=aiohttp.ClientWSTimeout(ws_close=self.tempo_max_s))
         return _ConexaoWs(ws)
 
     async def close(self) -> None:
@@ -396,15 +211,10 @@ def criar_cliente_lighter(nome: str, cfg: Config) -> ClienteLighter:
     """O ClienteLighter da corretora `nome` ("lighter" ou "lighter_rh"), com os enderecos da Config. Sem rede."""
     instancia = CORRETORAS_LIGHTER.get(nome)
     if instancia == "principal":
-        return ClienteLighter(instancia, cfg.url_rest_lighter, cfg.url_ws_lighter)
+        return ClienteLighter(instancia, cfg.url_rest_lighter, cfg.url_ws_lighter, cfg.tempo_max_rede_lighter_s)
     if instancia == "robinhood":
-        return ClienteLighter(instancia, cfg.url_rest_lighter_rh, cfg.url_ws_lighter_rh)
+        return ClienteLighter(instancia, cfg.url_rest_lighter_rh, cfg.url_ws_lighter_rh, cfg.tempo_max_rede_lighter_s)
     raise ValueError(f"'{nome}' nao e uma corretora da Lighter (use lighter ou lighter_rh)")
-
-
-def _erro_de_conexao(erro: BaseException) -> bool:
-    """True para erro da conexao (rede, tempo esgotado, a Lighter fechou): nesses casos o traceback nao ajuda."""
-    return isinstance(erro, (aiohttp.ClientError, OSError))
 
 
 # ---------------------------------------------------------------------------
@@ -414,22 +224,20 @@ def _erro_de_conexao(erro: BaseException) -> bool:
 
 @dataclass
 class _LivroAberto:
-    """O livro de um par assinado na conexao atual: o livro completo com as mudancas juntadas."""
+    """Um livro assinado na conexao atual: o livro juntado e o controle dos pedidos de livro completo."""
 
-    bids: dict[float, float] = field(default_factory=dict)  # preco -> tamanho
-    asks: dict[float, float] = field(default_factory=dict)
-    nonce: int | None = None  # nonce da ultima mensagem aplicada
-    pronto: bool = False  # ja chegou o livro completo desta assinatura (antes dele, mudanca nao vale)
+    juntado: LivroJuntado = field(default_factory=LivroJuntado)
     quebras: int = 0  # quebras seguidas sem nenhuma mudanca conferida entre elas (espera crescente)
     espera: float = 0.0  # espera antes de assinar de novo depois da ultima quebra
+    cancelar: bool = True  # cancelar antes de assinar de novo (False: a Lighter disse que nao estava assinado)
     mudancas_sem_completo: int = 0  # mudancas que chegaram antes do livro completo (para avisar no log)
+    pedido_em: float | None = None  # quando o livro foi pedido (tempo maximo do livro completo); None = esperando
 
 
-class ColetorLighter(Coletor):
-    """Acompanha uma instancia da Lighter: tickers (market_stats/all) e livros (order_book) numa conexao so.
+class ColetorLighter(ColetorComSaude):
+    """Acompanha uma instancia da Lighter: tickers (market_stats/all ou livros) e livros (order_book) numa conexao.
 
-    Oferece ao __main__ o mesmo que o ColetorCcxt: manter_tickers (com reconexao), assinar_livros,
-    simbolos_por_chave, cotacoes_dos_simbolos, markets, usar_para_cotacao, tirar_descartes e fechar.
+    Oferece ao __main__ o mesmo que o ColetorCcxt (veja ColetorDoScanner em base.py).
 
     instancia: "principal" (corretora "lighter", USDC) ou "robinhood" ("lighter_rh", USDG).
     cliente: o ClienteLighter (ou um falso nos testes): `markets` e `conectar_ws()`.
@@ -437,16 +245,18 @@ class ColetorLighter(Coletor):
         vai para la, com o ativo normalizado e o preco de 1 unidade do ativo.
     dados_lentos: o DadosLentos que recebe o funding (market_stats) e a taxa taker (orderBookDetails).
     relogio: hora atual em segundos (os testes passam um relogio falso).
-    espera_max_reconexao_s: maior espera entre duas tentativas de reconexao (da Config).
-    esperar: espera da reconexao e da nova assinatura de livro (padrao asyncio.sleep; os testes trocam).
+    esperar: espera da reconexao e do livro pedido de novo (padrao asyncio.sleep; os testes trocam).
     esperar_ping: espera entre dois pings (separada, para os testes controlarem o ping).
-    limite_assinaturas: maximo de livros abertos ao mesmo tempo (limites_assinatura da Config); None = sem limite.
-    intervalo_ping_s: intervalo_ping_lighter_s da Config.
-    mensagens_sem_bid_ask: mensagens seguidas do market_stats sem bid/ask para o log dar ERRO (uma vez).
+    Os outros vem da Config: espera_max_reconexao_s, limites_assinatura, intervalo_ping_lighter_s,
+    mensagens_sem_bid_ask, pings_sem_resposta_lighter, niveis_livro_lighter,
+    tempo_max_livro_completo_lighter_s e mudancas_sem_livro_completo_lighter.
 
     A conexao vive enquanto manter_tickers roda: se ele for reiniciado (lista de pares mudou), a conexao e
     refeita e os livros desejados sao assinados de novo (cada um com um livro completo novo).
     """
+
+    _TEXTO_DA_CONEXAO = "a conexao da lighter"
+    _ERROS_DE_CONEXAO = (aiohttp.ClientError, OSError)
 
     def __init__(
         self,
@@ -461,20 +271,23 @@ class ColetorLighter(Coletor):
         limite_assinaturas: int | None = None,
         intervalo_ping_s: float = Config.intervalo_ping_lighter_s,
         mensagens_sem_bid_ask: int = Config.mensagens_sem_bid_ask,
+        pings_sem_resposta: int = Config.pings_sem_resposta_lighter,
+        niveis_por_lado: int = Config.niveis_livro_lighter,
+        tempo_max_livro_completo_s: float = Config.tempo_max_livro_completo_lighter_s,
+        mudancas_sem_livro_completo: int = Config.mudancas_sem_livro_completo_lighter,
     ):
-        super().__init__(_nome_da_instancia(instancia))
+        super().__init__(nome_da_instancia(instancia), estado, relogio, limite_assinaturas, espera_max_reconexao_s)
         self.instancia = instancia
         self._cliente = cliente
-        self._estado = estado
-        self._relogio = relogio
         self._dados_lentos = dados_lentos
-        self._espera_max_s = espera_max_reconexao_s
         self._esperar = esperar
         self._esperar_ping = esperar_ping
-        self._limite = limite_assinaturas
         self._intervalo_ping_s = intervalo_ping_s
-        self._silencio_max_s = intervalo_ping_s * PINGS_SEM_RESPOSTA
+        self._silencio_max_s = intervalo_ping_s * pings_sem_resposta
         self._max_sem_bid_ask = mensagens_sem_bid_ask
+        self._niveis = niveis_por_lado
+        self._tempo_max_completo_s = tempo_max_livro_completo_s
+        self._max_sem_completo = mudancas_sem_livro_completo
         self._ao_atualizar: Callable[[Livro], None] | None = None
         self._ao_ticker: Callable[[Ticker], None] | None = None
         # Indice dos mercados (refeito quando o cliente recarrega a lista).
@@ -489,23 +302,24 @@ class ColetorLighter(Coletor):
         self._tarefas: set[asyncio.Task] = set()  # manter_tickers em andamento (o fechar() para)
         self._simbolos_ticker: set[str] = set()
         self._simbolos_cotacao: set[str] = set()
-        self._livros_desejados: set[str] = set()  # o que a etapa 2 pediu (sobrevive a quedas)
+        self._pedidos_etapa2: set[str] = set()  # livros que a etapa 2 pediu
+        self._livros_etapa1: set[str] = set()  # livros que sao a etapa 1 (so com a etapa 1 pelos livros)
+        self._livros_desejados: set[str] = set()  # os dois juntos, dentro do limite (sobrevive a quedas)
         self._livros: dict[str, _LivroAberto] = {}  # assinados na conexao atual
-        self._livros_no_estado: dict[str, str] = {}  # simbolo -> ativo do livro guardado no estado
-        self._reassinaturas: dict[str, asyncio.Task] = {}  # simbolo -> nova assinatura esperando (quebra repetida)
+        self._reassinaturas: dict[str, asyncio.Task] = {}  # simbolo -> nova assinatura esperando a espera
+        self._reassinar_pendentes: list[str] = []  # livros a pedir de novo depois da mensagem em tratamento
+        self._ajuste_pendente = False  # a lista de livros mudou (troca da etapa 1): assinar/cancelar a diferenca
         self._volumes_conhecidos: dict[str, float] = {}  # simbolo -> volume 24h (do market_stats)
-        # Saude e log.
-        self._ticker_desde_o_inicio = False
-        self._caiu_em: float | None = None
-        self._queda_com_traceback = False
-        self._descartes: Counter = Counter()
+        self._estatisticas: dict[str, tuple[float | None, float | None]] = {}  # simbolo -> (volume, variacao)
+        # Etapa 1 pelos livros (quando o market_stats nao traz bid/ask).
+        self._tickers_pelos_livros = False
+        self._tickers_do_livro: set[str] = set()  # simbolos cujo ticker no estado veio do livro
+        self._seguidas_sem_bid_ask = 0
+        self._pares_sem_bid_ask: set[str] = set()
+        # Log.
         self._avisados: set[str] = set()
         self._erros_avisados: set = set()
         self._traceback_tratar: set[str] = set()
-        self._traceback_ticker: set[str] = set()
-        self._fora_do_limite = 0
-        self._seguidas_sem_bid_ask = 0
-        self._avisou_sem_bid_ask = False
         self._avisou_sem_nonce = False
         self._sem_completo_avisado: set[str] = set()  # simbolos ja avisados de mudancas sem o livro completo
 
@@ -516,8 +330,8 @@ class ColetorLighter(Coletor):
 
         Queda (rede, a Lighter fechou, conexao muda): o estado esquece a corretora (marcar_desconectada), o painel
         mostra "reconectando" e o coletor espera 1s, 2s, 4s... (ate espera_max_reconexao_s). O primeiro
-        market_stats depois da queda conta a reconexao, e a proxima queda volta a esperar 1s. Os livros que a
-        etapa 2 pediu sao assinados de novo na conexao nova. Cancelamento (Ctrl+C, fechar()) sobe para quem chamou.
+        ticker depois da queda conta a reconexao, e a proxima queda volta a esperar 1s. Os livros desejados
+        sao assinados de novo na conexao nova. Cancelamento (Ctrl+C, fechar()) sobe para quem chamou.
         Sem nenhum simbolo, termina na hora (como o ColetorCcxt).
         """
         if ao_ticker is not None:
@@ -540,7 +354,7 @@ class ColetorLighter(Coletor):
                         tentativa = 0  # tinha voltado a funcionar: a espera recomeca de 1s
                     espera = espera_reconexao(tentativa, self._espera_max_s)
                     tentativa += 1
-                    self._queda(erro, espera, tentativa)
+                    self._queda_da_conexao(erro, espera, tentativa)
                     await self._esperar(espera)
         finally:
             self._tarefas.discard(tarefa)
@@ -548,6 +362,9 @@ class ColetorLighter(Coletor):
     async def _conectar_e_ler(self, simbolos_ticker: list[str]) -> None:
         """Uma conexao: abre, assina o market_stats/all e os livros desejados, e le ate cair (levanta o erro)."""
         self._simbolos_ticker = set(simbolos_ticker)
+        if self._tickers_pelos_livros:
+            self._livros_etapa1 = self._conhecidos(self._simbolos_ticker, avisar=False)
+        self._livros_desejados = self._livros_dentro_do_limite(self._pedidos_etapa2 | self._livros_etapa1)
         conexao = await self._cliente.conectar_ws()
         self._conexao = conexao
         ping = asyncio.create_task(self._pingar(conexao), name=f"ping {self.nome}")
@@ -563,6 +380,7 @@ class ColetorLighter(Coletor):
             esperando = [ping, *self._reassinaturas.values()]
             for simbolo in list(self._livros):
                 self._largar_livro(simbolo)  # esta conexao nao atualiza mais nenhum livro
+            self._reassinar_pendentes.clear()
             await asyncio.gather(*esperando, return_exceptions=True)
             with contextlib.suppress(Exception):
                 await conexao.fechar()
@@ -580,7 +398,7 @@ class ColetorLighter(Coletor):
                 await conexao.fechar()
 
     async def _ler(self, conexao) -> None:
-        """Le e trata as mensagens ate a conexao cair (ou ficar muda por mais de dois intervalos de ping)."""
+        """Le e trata as mensagens ate a conexao cair (ou ficar muda por pings_sem_resposta intervalos de ping)."""
         while True:
             try:
                 async with asyncio.timeout(self._silencio_max_s):
@@ -592,101 +410,127 @@ class ColetorLighter(Coletor):
             self._registrar_mensagem(agora)  # toda mensagem conta: a conexao esta viva
             if not isinstance(mensagem, dict):
                 registro.debug("%s: mensagem que nao e um objeto JSON; ignorada", self.nome)
-                continue
-            if mensagem.get("type") == "ping":  # o servidor tambem pode pingar: responde
+            elif mensagem.get("type") == "ping":  # o servidor tambem pode pingar: responde
                 await conexao.enviar({"type": "pong"})
-                continue
-            try:
-                reassinar = self._tratar(mensagem, agora)
-            except Exception:  # defeito ao tratar esta mensagem: so ela fica de fora
-                self._erro_ao_tratar(mensagem)
-                continue
-            if reassinar is not None:
-                await self._reassinar(conexao, reassinar)
+            else:
+                try:
+                    self._tratar(mensagem, agora)
+                except Exception:  # defeito ao tratar esta mensagem: so ela fica de fora
+                    self._erro_ao_tratar(mensagem)
+            self._conferir_livros_atrasados(agora)
+            await self._fazer_pendentes(conexao)
 
-    def _tratar(self, mensagem: dict, agora: float) -> str | None:
-        """Trata uma mensagem. Devolve o simbolo cujo livro precisa ser pedido de novo (ou None)."""
+    async def _fazer_pendentes(self, conexao) -> None:
+        """Depois de cada mensagem: ajusta a lista de livros (troca da etapa 1) e pede de novo os livros quebrados."""
+        if self._ajuste_pendente:
+            self._ajuste_pendente = False
+            await self._ajustar_livros()
+        while self._reassinar_pendentes:
+            await self._reassinar(conexao, self._reassinar_pendentes.pop(0))
+
+    def _tratar(self, mensagem: dict, agora: float) -> None:
+        """Trata uma mensagem (o que precisa mandar algo a Lighter fica nos pendentes)."""
         if "error" in mensagem:
             self._erro_do_servidor(mensagem.get("error"))
-            return None
+            return
         canal = mensagem.get("channel")
         if not isinstance(canal, str):
-            return None  # "connected", "pong", "unsubscribed"...: so contam como mensagem
+            return  # "connected", "pong", "unsubscribed"...: so contam como mensagem
         if canal.startswith("market_stats:"):
             self._tratar_estatisticas(mensagem, agora)
-            return None
-        if canal.startswith("order_book:"):
-            return self._tratar_livro(canal.partition(":")[2], mensagem, agora)
-        return None
+        elif canal.startswith("order_book:"):
+            self._tratar_livro(canal.partition(":")[2], mensagem, agora)
 
     def _tratar_estatisticas(self, mensagem: dict, agora: float) -> None:
-        """market_stats: ticker de cada par da lista, funding e volume de todos os mercados conhecidos."""
-        dados = mensagem.get("market_stats")
-        if isinstance(dados, dict) and "market_id" in dados:
-            itens = [dados]  # canal de um mercado so (market_stats/{id})
-        elif isinstance(dados, dict):
-            itens = list(dados.values())  # market_stats/all: {market_id: estatisticas}
-        else:
-            itens = []
+        """market_stats: ticker de cada par da lista (se trouxer bid/ask), funding, volume e variacao de todos."""
+        itens = itens_do_market_stats(mensagem)
         if not itens:
             return
         self._chegou_ticker(agora)
         self._indexar_se_preciso()
         total = com_bid_ask = 0
+        sem_bid_ask: list[str] = []
         for stats in itens:
-            if not isinstance(stats, dict):
-                continue
             simbolo = self._simbolo_do_id.get(str(stats.get("market_id")))
             if simbolo is None:
                 continue  # mercado fora do indice (inativo, ou novo antes da recarga da lista)
-            self._guardar_funding_e_volume(simbolo, stats)
+            self._guardar_estatisticas(simbolo, stats)
             if simbolo not in self._simbolos_ticker and simbolo not in self._simbolos_cotacao:
                 continue
             total += 1
             try:
                 ticker = ticker_de_lighter(self.nome, simbolo, stats, agora)
-                if ticker is not None or (_numero(stats.get("best_bid_price")) is not None
-                                          and _numero(stats.get("best_ask_price")) is not None):
+                if ticker is not None or (ler_numero(stats.get("best_bid_price")) is not None
+                                          and ler_numero(stats.get("best_ask_price")) is not None):
                     com_bid_ask += 1
+                else:
+                    sem_bid_ask.append(simbolo)
                 if ticker is None:
-                    self._descartes["tickers"] += 1
-                    registro.debug("%s %s: ticker descartado (sem bid/ask, preco invalido ou cruzado)",
-                                   self.nome, simbolo)
+                    if not self._tickers_pelos_livros:  # com a etapa 1 pelos livros, sem bid/ask aqui e o normal
+                        self._descartes["tickers"] += 1
+                        registro.debug("%s %s: ticker descartado (sem bid/ask, preco invalido ou cruzado)",
+                                       self.nome, simbolo)
                     continue
                 self._entregar_ticker(ticker)
             except Exception:  # defeito ao tratar este ticker: so ele fica de fora
                 self._descartes["tickers"] += 1
                 self._erro_ao_tratar_ticker(simbolo)
-        horario = _numero(mensagem.get("timestamp"))
+        horario = ler_numero(mensagem.get("timestamp"))
         if horario is not None:
             self._registrar_atraso(agora, horario / 1000)  # a Lighter manda ms
-        self._conferir_bid_ask(total, com_bid_ask)
+        self._conferir_bid_ask(total, com_bid_ask, sem_bid_ask)
 
-    def _guardar_funding_e_volume(self, simbolo: str, stats: dict) -> None:
-        volume = _numero(stats.get("daily_quote_token_volume"))
+    def _guardar_estatisticas(self, simbolo: str, stats: dict) -> None:
+        """Volume (limite de assinaturas e ticker pelos livros), variacao e funding de um mercado."""
+        volume = ler_numero(stats.get("daily_quote_token_volume"))
         if volume is not None:
-            self._volumes_conhecidos[simbolo] = volume  # para o limite de assinaturas de livros
+            self._volumes_conhecidos[simbolo] = volume
+        self._estatisticas[simbolo] = (volume, ler_numero(stats.get("daily_price_change")))
         par = self._pares.get(simbolo)
-        funding = _numero(stats.get("current_funding_rate"))  # ja em %, por hora (a proxima cobranca)
+        funding = ler_numero(stats.get("current_funding_rate"))  # ja em %, por hora (a proxima cobranca)
         if par is not None and funding is not None and self._dados_lentos is not None:
             self._dados_lentos.receber_funding(self.nome, par.ativo, funding, INTERVALO_FUNDING_LIGHTER_H)
 
-    def _conferir_bid_ask(self, total: int, com_bid_ask: int) -> None:
-        """ERRO no log (uma vez) se o market_stats parar de trazer bid/ask por mensagens_sem_bid_ask mensagens."""
+    def _conferir_bid_ask(self, total: int, com_bid_ask: int, sem_bid_ask: list[str]) -> None:
+        """Troca a etapa 1 para os livros (ou de volta) conforme o market_stats traz bid/ask ou nao.
+
+        Troca para os livros: mensagens_sem_bid_ask mensagens seguidas em que nenhum par da lista veio com
+        bid/ask, de pelo menos min(mensagens_sem_bid_ask, pares da lista) pares diferentes (um par iliquido
+        repetindo nao troca a etapa 1 de todos, como na Task 15). Volta: basta um par com bid/ask.
+        """
         if total == 0:
             return
         if com_bid_ask:
-            if self._avisou_sem_bid_ask:
-                registro.info("%s: o market_stats voltou a trazer bid/ask", self.nome)
             self._seguidas_sem_bid_ask = 0
-            self._avisou_sem_bid_ask = False
+            self._pares_sem_bid_ask.clear()
+            if self._tickers_pelos_livros:
+                self._voltar_ao_market_stats()
+            return
+        if self._tickers_pelos_livros:
             return
         self._seguidas_sem_bid_ask += 1
-        if self._seguidas_sem_bid_ask >= self._max_sem_bid_ask and not self._avisou_sem_bid_ask:
-            self._avisou_sem_bid_ask = True
-            registro.error("%s: %d mensagens seguidas do market_stats sem best_bid_price/best_ask_price: a "
-                           "corretora fica sem tickers (e sem sinais). Confira o formato com uma mensagem real",
-                           self.nome, self._seguidas_sem_bid_ask)
+        self._pares_sem_bid_ask.update(sem_bid_ask)
+        exigidos = min(self._max_sem_bid_ask, len(self._simbolos_ticker | self._simbolos_cotacao))
+        if self._seguidas_sem_bid_ask >= self._max_sem_bid_ask and len(self._pares_sem_bid_ask) >= exigidos:
+            self._passar_aos_livros()
+
+    def _passar_aos_livros(self) -> None:
+        self._tickers_pelos_livros = True
+        self._livros_etapa1 = self._conhecidos(self._simbolos_ticker, avisar=False)
+        self._ajuste_pendente = True
+        registro.warning("%s: o market_stats nao traz best_bid_price/best_ask_price (%d mensagens seguidas, %d "
+                         "pares): a etapa 1 passa a vir dos livros (order_book de cada par da lista, dentro de "
+                         "limites_assinatura); o volume e a variacao continuam vindo do market_stats. Confira o "
+                         "formato com uma mensagem real", self.nome, self._seguidas_sem_bid_ask,
+                         len(self._pares_sem_bid_ask))
+
+    def _voltar_ao_market_stats(self) -> None:
+        self._tickers_pelos_livros = False
+        self._livros_etapa1 = set()
+        self._tickers_do_livro.clear()  # os tickers agora vem do market_stats: cancelar o livro nao os apaga
+        self._ajuste_pendente = True
+        registro.info("%s: o market_stats voltou a trazer bid/ask: a etapa 1 volta a vir dele (os livros que so "
+                      "serviam a etapa 1 sao cancelados)", self.nome)
 
     def _entregar_ticker(self, ticker: Ticker) -> None:
         if self._estado is not None:
@@ -703,6 +547,24 @@ class ColetorLighter(Coletor):
         if self._ao_ticker is not None:
             self._ao_ticker(ticker)
 
+    def _ticker_do_livro(self, livro: Livro, agora: float) -> None:
+        """Etapa 1 pelos livros: o melhor bid/ask do livro vira o ticker (volume e variacao do market_stats)."""
+        volume, variacao = self._estatisticas.get(livro.simbolo_original, (None, None))
+        self._chegou_ticker(agora)
+        self._tickers_do_livro.add(livro.simbolo_original)
+        self._entregar_ticker(Ticker(corretora=self.nome, mercado="futuro", simbolo_original=livro.simbolo_original,
+                                     bid=livro.bids[0][0], ask=livro.asks[0][0], recebido_em=agora,
+                                     volume_24h_usd=volume, variacao_24h_pct=variacao))
+
+    def _esquecer_ticker_do_livro(self, simbolo: str) -> None:
+        """O livro de onde vinha o ticker parou: o ticker sai do estado tambem (nao vale mais)."""
+        if simbolo not in self._tickers_do_livro:
+            return
+        self._tickers_do_livro.discard(simbolo)
+        par = self._pares.get(simbolo)
+        if par is not None and self._estado is not None:
+            self._estado.remover_ticker(self.nome, "futuro", par.ativo, simbolo_original=simbolo)
+
     # --- etapa 2: livros -----------------------------------------------------
 
     async def iniciar(self, simbolos: list[str], ao_atualizar: Callable[[Livro], None]) -> None:
@@ -713,16 +575,17 @@ class ColetorLighter(Coletor):
         """
         self._ao_atualizar = ao_atualizar
         try:
-            self._livros_desejados = self._conhecidos(simbolos)
+            self._pedidos_etapa2 = self._conhecidos(simbolos)
             await self._conectar_e_ler([])
         finally:
             await self.fechar()
 
     async def assinar_livros(self, simbolos: set[str], ao_atualizar: Callable[[Livro], None] | None = None) -> None:
-        """Etapa 2: deixa o livro aberto exatamente para `simbolos` (os de maior volume, se houver limite).
+        """Etapa 2: deixa o livro aberto exatamente para `simbolos` (mais os da etapa 1, se ela vier dos livros).
 
         Assina os novos primeiro e cancela ("unsubscribe") os que sairam; o livro que sai deixa o estado na
         hora. Sem conexao agora, so anota: a proxima conexao assina os desejados. Pode ser chamada a cada ciclo.
+        Com limites_assinatura, ficam os de maior volume 24h.
         ao_atualizar: recebe o Livro cru (guardado; so precisa vir na primeira vez). Sem ele, precisa de estado.
         """
         if ao_atualizar is not None:
@@ -731,7 +594,12 @@ class ColetorLighter(Coletor):
             raise ValueError("assinar_livros precisa de um ao_atualizar ou de um estado para guardar os livros")
         if self._fechado:
             return
-        desejados = self._livros_dentro_do_limite(self._conhecidos(simbolos))
+        self._pedidos_etapa2 = self._conhecidos(simbolos)
+        await self._ajustar_livros()
+
+    async def _ajustar_livros(self) -> None:
+        """Recalcula os livros desejados (etapa 2 + etapa 1 pelos livros, no limite) e assina/cancela a diferenca."""
+        desejados = self._livros_dentro_do_limite(self._pedidos_etapa2 | self._livros_etapa1)
         saindo = sorted(self._livros_desejados - desejados)
         entrando = sorted(desejados - self._livros_desejados)
         self._livros_desejados = desejados
@@ -755,47 +623,35 @@ class ColetorLighter(Coletor):
             registro.debug("%s: nao consegui ajustar os livros agora (%s: %s); a conexao sera refeita",
                            self.nome, type(erro).__name__, erro)
 
-    def _conhecidos(self, simbolos) -> set[str]:
+    def _conhecidos(self, simbolos, avisar: bool = True) -> set[str]:
         """Os simbolos que a Lighter tem (e que vao ao estado); os outros avisam no log (uma vez cada)."""
         self._indexar_se_preciso()
         conhecidos = set()
         for simbolo in simbolos:
             if simbolo in self._id_do_simbolo and simbolo in self._pares:
                 conhecidos.add(simbolo)
-            elif simbolo not in self._avisados:
+            elif avisar and simbolo not in self._avisados:
                 self._avisados.add(simbolo)
                 registro.warning("%s %s: par que a %s nao tem (ou inativo); o livro dele nao e assinado",
                                  self.nome, simbolo, self.nome)
         return conhecidos
 
-    def _livros_dentro_do_limite(self, desejados: set[str]) -> set[str]:
-        """Os livros que cabem no limite de assinaturas: os de maior volume 24h, com preferencia aos ja abertos."""
-        if self._limite is None or len(desejados) <= self._limite:
-            self._avisar_limite(0, len(desejados))
-            return desejados
-        volumes = {s: self._volumes_conhecidos[s] for s in desejados if s in self._volumes_conhecidos}
-        escolhidos, fora = selecionar_pares(sorted(desejados), volumes, self._limite,
-                                            abertos=self._livros_desejados, margem=MARGEM_PARA_TROCAR_LIVRO)
-        self._avisar_limite(fora, len(desejados))
-        return set(escolhidos)
+    def _volume_conhecido(self, simbolo: str) -> float | None:
+        return self._volumes_conhecidos.get(simbolo)
 
-    def _avisar_limite(self, fora: int, total: int) -> None:
-        """Registra quantos livros ficaram de fora do limite, so quando esse numero muda."""
-        if fora == self._fora_do_limite:
-            return
-        self._fora_do_limite = fora
-        if fora:
-            registro.warning("%s: limite de %d assinaturas de livros (limites_assinatura): %d de %d pares ficaram "
-                             "de fora (os de menor volume 24h)", self.nome, self._limite, fora, total)
-        else:
-            registro.info("%s: todos os pares de livros cabem de novo no limite de assinaturas", self.nome)
+    def _livros_abertos(self) -> set[str]:
+        return set(self._livros_desejados)
 
     async def _assinar(self, conexao, simbolo: str) -> None:
         """Assina o livro do simbolo nesta conexao (se ainda for desejado e nao estiver assinado)."""
         canal = self._canal_do_livro(simbolo)
         if canal is None or simbolo in self._livros or simbolo not in self._livros_desejados:
             return
-        self._livros[simbolo] = _LivroAberto()
+        aberto = self._livros[simbolo] = _LivroAberto()
+        await self._enviar_assinatura(conexao, canal, aberto)
+
+    async def _enviar_assinatura(self, conexao, canal: str, aberto: _LivroAberto) -> None:
+        aberto.pedido_em = self._relogio()  # a partir daqui corre o tempo maximo do livro completo
         await conexao.enviar({"type": "subscribe", "channel": canal})
 
     def _largar_livro(self, simbolo: str) -> None:
@@ -803,118 +659,126 @@ class ColetorLighter(Coletor):
         tarefa = self._reassinaturas.pop(simbolo, None)
         if tarefa is not None:
             tarefa.cancel()
+        if simbolo in self._reassinar_pendentes:
+            self._reassinar_pendentes.remove(simbolo)
         self._livros.pop(simbolo, None)
         self._remover_livro_do_estado(simbolo)
+        self._esquecer_ticker_do_livro(simbolo)
 
-    def _tratar_livro(self, ident: str, mensagem: dict, agora: float) -> str | None:
-        """order_book: livro completo ou mudancas. Devolve o simbolo se o livro precisa ser pedido de novo."""
+    def _tratar_livro(self, ident: str, mensagem: dict, agora: float) -> None:
+        """order_book: livro completo ou mudancas (veja LivroJuntado em lighter_formatos.py)."""
         tipo = mensagem.get("type")
         if tipo not in ("subscribed/order_book", "update/order_book"):
-            return None  # ex.: "unsubscribed", a confirmacao do cancelamento
+            return  # ex.: "unsubscribed", a confirmacao do cancelamento
         simbolo = self._simbolo_do_id.get(ident)
-        livro = self._livros.get(simbolo) if simbolo is not None else None
-        if livro is None:
-            return None  # nao assinado (ou acabou de ser cancelado): mensagem atrasada, ignorada
+        aberto = self._livros.get(simbolo) if simbolo is not None else None
+        if aberto is None:
+            return  # nao assinado (ou acabou de ser cancelado): mensagem atrasada, ignorada
         dados = mensagem.get("order_book")
         if not isinstance(dados, dict):
             self._descartes["livros"] += 1
-            return None
+            return
         if tipo == "subscribed/order_book":  # o livro completo (o primeiro depois de assinar)
-            bids, asks = _niveis(dados.get("bids")), _niveis(dados.get("asks"))
-            if bids is None or asks is None:
-                return self._quebrou(simbolo, livro, "livro completo com nivel invalido", "livros")
-            livro.bids, livro.asks = _sem_zeros(bids), _sem_zeros(asks)
-            livro.nonce = _inteiro(dados.get("nonce"))
-            livro.pronto = True
-            livro.mudancas_sem_completo = 0
+            if not aberto.juntado.receber_completo(dados):
+                self._quebrou(simbolo, aberto, "livro completo com nivel invalido", "livros")
+                return
+            aberto.mudancas_sem_completo = 0
         else:  # "update/order_book": so as mudancas
-            if not livro.pronto:
-                self._mudanca_sem_completo(simbolo, livro)
-                return None
-            inicio = _inteiro(dados.get("begin_nonce"))
-            if inicio is None or livro.nonce is None:
+            resultado, detalhe = aberto.juntado.juntar_mudancas(dados)
+            if resultado == IGNORADA:
+                self._mudanca_sem_completo(simbolo, aberto)
+                return
+            if resultado in (QUEBRADA, INVALIDA):
+                self._quebrou(simbolo, aberto, detalhe, "sequencia_quebrada" if resultado == QUEBRADA else "livros")
+                return
+            if resultado == SEM_NONCE:
                 self._avisar_sem_nonce()
-            elif inicio != livro.nonce:
-                return self._quebrou(simbolo, livro, f"begin_nonce {inicio}, esperado {livro.nonce}",
-                                     "sequencia_quebrada")
-            bids, asks = _niveis(dados.get("bids")), _niveis(dados.get("asks"))
-            if bids is None or asks is None:
-                return self._quebrou(simbolo, livro, "mudanca com nivel invalido", "livros")
-            for lado, mudancas in ((livro.bids, bids), (livro.asks, asks)):
-                for preco, tamanho in mudancas.items():
-                    if tamanho == 0:
-                        lado.pop(preco, None)  # tamanho 0: o nivel sai
-                    else:
-                        lado[preco] = tamanho  # o tamanho e o total novo do nivel
-            livro.nonce = _inteiro(dados.get("nonce"))
-            if inicio is not None:
-                livro.quebras = 0  # a sequencia foi conferida: a proxima quebra pede o livro na hora
-        self._entregar_juntado(simbolo, livro, mensagem, agora)
-        return None
+            else:
+                aberto.quebras = 0  # a sequencia foi conferida: a proxima quebra pede o livro na hora
+        self._entregar_juntado(simbolo, aberto, mensagem, agora)
 
-    def _mudanca_sem_completo(self, simbolo: str, livro: _LivroAberto) -> None:
-        """Mudanca antes do livro completo: ignorada. Muitas seguidas (mensagens_sem_bid_ask) avisam uma vez.
+    def _mudanca_sem_completo(self, simbolo: str, aberto: _LivroAberto) -> None:
+        """Mudanca antes do livro completo: ignorada. Muitas seguidas (mudancas_sem_livro_completo) avisam uma vez.
 
         Depois de pedir o livro de novo, umas poucas mudancas velhas ainda chegam (normal). Muitas querem dizer
         que a Lighter nao manda o livro completo como "subscribed/order_book" (formato a conferir).
         """
-        livro.mudancas_sem_completo += 1
+        aberto.mudancas_sem_completo += 1
         registro.debug("%s %s: mudanca antes do livro completo; ignorada", self.nome, simbolo)
-        if livro.mudancas_sem_completo == self._max_sem_bid_ask and simbolo not in self._sem_completo_avisado:
+        if aberto.mudancas_sem_completo == self._max_sem_completo and simbolo not in self._sem_completo_avisado:
             self._sem_completo_avisado.add(simbolo)
             registro.warning("%s %s: %d mudancas de livro sem o livro completo (subscribed/order_book) antes: o livro "
                              "nao entra no scanner. Confira o formato com uma mensagem real", self.nome, simbolo,
-                             livro.mudancas_sem_completo)
+                             aberto.mudancas_sem_completo)
 
     def _avisar_sem_nonce(self) -> None:
         if not self._avisou_sem_nonce:
             self._avisou_sem_nonce = True
-            registro.warning("%s: mudanca de livro sem begin_nonce/nonce: nao da para conferir a sequencia "
-                             "(confira o formato com uma mensagem real); as mudancas sao aplicadas assim mesmo",
-                             self.nome)
+            registro.warning("%s: mudanca de livro sem begin_nonce/nonce: a continuidade do livro NAO esta sendo "
+                             "conferida (uma mudanca perdida nao seria percebida); as mudancas sao aplicadas assim "
+                             "mesmo. Confira o formato com uma mensagem real", self.nome)
 
-    def _quebrou(self, simbolo: str, livro: _LivroAberto, motivo: str, tipo: str) -> str:
-        """O livro deixou de ser confiavel: sai do estado, o guardado e esquecido e um livro completo novo e pedido.
+    def _quebrou(self, simbolo: str, aberto: _LivroAberto, motivo: str, tipo: str | None,
+                 cancelar: bool = True) -> None:
+        """O livro deixou de ser confiavel (ou nao chegou): sai do estado e um livro completo novo e pedido.
 
+        tipo: o descarte contado ("sequencia_quebrada", "livros") ou None (o livro completo nao chegou).
+        cancelar: cancelar antes de assinar de novo (False quando a Lighter disse que nao estava assinado).
         Pede na hora; se quebrar de novo sem nenhuma mudanca conferida no meio, espera 1s, 2s, 4s... (ate
         espera_max_reconexao_s) antes de pedir, para nao ficar pedindo sem parar.
         """
-        self._descartes[tipo] += 1
+        if tipo is not None:
+            self._descartes[tipo] += 1
         self._remover_livro_do_estado(simbolo)
-        livro.bids, livro.asks, livro.nonce, livro.pronto = {}, {}, None, False
-        livro.espera = 0.0 if livro.quebras == 0 else espera_reconexao(livro.quebras - 1, self._espera_max_s)
-        livro.quebras += 1
-        quando = "agora" if livro.espera <= 0 else f"em {livro.espera:g}s"
+        self._esquecer_ticker_do_livro(simbolo)
+        aberto.juntado.esvaziar()
+        aberto.mudancas_sem_completo = 0
+        aberto.espera = 0.0 if aberto.quebras == 0 else espera_reconexao(aberto.quebras - 1, self._espera_max_s)
+        aberto.quebras += 1
+        aberto.cancelar = cancelar
+        aberto.pedido_em = None  # o tempo maximo do livro completo recomeca quando o pedido sair
+        quando = "agora" if aberto.espera <= 0 else f"em {aberto.espera:g}s"
         if tipo == "sequencia_quebrada":
-            registro.warning("%s %s: sequencia do livro quebrada (%s); o livro saiu do scanner e um livro completo "
-                             "novo sera pedido %s", self.nome, simbolo, motivo, quando)
+            texto = "sequencia do livro quebrada (%s); o livro saiu do scanner e um livro completo novo sera pedido %s"
+        elif tipo == "livros":
+            texto = "livro com dado invalido (%s); o livro saiu do scanner e um livro completo novo sera pedido %s"
         else:
-            registro.warning("%s %s: livro com dado invalido (%s); o livro saiu do scanner e um livro completo novo "
-                             "sera pedido %s", self.nome, simbolo, motivo, quando)
-        return simbolo
+            texto = "%s; o livro completo sera pedido de novo %s"
+        registro.warning("%s %s: " + texto, self.nome, simbolo, motivo, quando)
+        if simbolo not in self._reassinar_pendentes:
+            self._reassinar_pendentes.append(simbolo)
+
+    def _conferir_livros_atrasados(self, agora: float) -> None:
+        """Livro pedido ha mais de tempo_max_livro_completo_lighter_s sem o livro completo: pede de novo."""
+        for simbolo, aberto in list(self._livros.items()):
+            if aberto.juntado.pronto or aberto.pedido_em is None or simbolo in self._reassinaturas:
+                continue
+            if agora - aberto.pedido_em > self._tempo_max_completo_s:
+                self._quebrou(simbolo, aberto, f"o livro completo nao chegou em {self._tempo_max_completo_s:g}s", None)
 
     async def _reassinar(self, conexao, simbolo: str) -> None:
-        """Cancela e assina de novo o livro (a Lighter recusa assinar por cima de uma assinatura viva)."""
-        livro = self._livros.get(simbolo)
+        """Pede o livro de novo: cancela (se for o caso) e assina, na hora ou depois da espera."""
+        aberto = self._livros.get(simbolo)
         canal = self._canal_do_livro(simbolo)
-        if livro is None or canal is None:
+        if aberto is None or canal is None or conexao is not self._conexao:
             return
-        await conexao.enviar({"type": "unsubscribe", "channel": canal})
-        if livro.espera <= 0:
-            await conexao.enviar({"type": "subscribe", "channel": canal})
+        if aberto.cancelar:  # a Lighter recusa assinar por cima de uma assinatura viva
+            await conexao.enviar({"type": "unsubscribe", "channel": canal})
+        if aberto.espera <= 0:
+            await self._enviar_assinatura(conexao, canal, aberto)
             return
         anterior = self._reassinaturas.pop(simbolo, None)
         if anterior is not None:
             anterior.cancel()
-        self._reassinaturas[simbolo] = asyncio.create_task(self._assinar_depois(conexao, simbolo, livro.espera),
+        self._reassinaturas[simbolo] = asyncio.create_task(self._assinar_depois(conexao, simbolo, aberto.espera),
                                                            name=f"livro {self.nome} {simbolo}")
 
     async def _assinar_depois(self, conexao, simbolo: str, espera: float) -> None:
         try:
             await self._esperar(espera)
-            canal = self._canal_do_livro(simbolo)
-            if conexao is self._conexao and simbolo in self._livros and canal is not None and not self._fechado:
-                await conexao.enviar({"type": "subscribe", "channel": canal})
+            aberto, canal = self._livros.get(simbolo), self._canal_do_livro(simbolo)
+            if conexao is self._conexao and aberto is not None and canal is not None and not self._fechado:
+                await self._enviar_assinatura(conexao, canal, aberto)
         except Exception as erro:  # a conexao caiu: a proxima assina os desejados
             registro.debug("%s %s: nao consegui pedir o livro de novo (%s: %s)", self.nome, simbolo,
                            type(erro).__name__, erro)
@@ -922,9 +786,9 @@ class ColetorLighter(Coletor):
             if self._reassinaturas.get(simbolo) is asyncio.current_task():
                 del self._reassinaturas[simbolo]
 
-    def _entregar_juntado(self, simbolo: str, livro: _LivroAberto, mensagem: dict, agora: float) -> None:
-        """Monta o Livro com o que esta guardado e entrega (se for valido)."""
-        pronto = _montar_livro(self.nome, simbolo, livro.bids, livro.asks, agora, _numero(mensagem.get("timestamp")))
+    def _entregar_juntado(self, simbolo: str, aberto: _LivroAberto, mensagem: dict, agora: float) -> None:
+        """Monta o Livro guardado e entrega (se for valido); com a etapa 1 pelos livros, o ticker tambem."""
+        pronto = aberto.juntado.montar(self.nome, simbolo, agora, ler_numero(mensagem.get("timestamp")), self._niveis)
         if pronto is None:
             self._descartes["livros"] += 1
             registro.debug("%s %s: livro descartado (vazio, preco invalido ou cruzado)", self.nome, simbolo)
@@ -932,17 +796,19 @@ class ColetorLighter(Coletor):
         if pronto.ts_corretora is not None:
             self._registrar_atraso(agora, pronto.ts_corretora)
         self._entregar_livro(pronto)
+        if self._tickers_pelos_livros and simbolo in self._simbolos_ticker:
+            self._ticker_do_livro(pronto, agora)
 
     def _entregar_livro(self, livro: Livro) -> None:
         if self._estado is not None:
             par = self._pares.get(livro.simbolo_original)
             if par is not None:
                 self._estado.atualizar_livro(converter_livro(livro, par), ativo=par.ativo)
-                self._livros_no_estado[livro.simbolo_original] = par.ativo
+                self._livros_no_estado[livro.simbolo_original] = ("futuro", par.ativo)
         if self._ao_atualizar is not None:
             self._ao_atualizar(livro)
 
-    # --- interface que o __main__ usa (igual ao ColetorCcxt) -------------------
+    # --- interface que o __main__ usa (veja ColetorDoScanner em base.py) --------
 
     def simbolos_por_chave(self) -> dict[tuple[str, str], str]:
         """Para cada ("futuro", ativo), o simbolo cujos dados vao ao estado.
@@ -964,12 +830,6 @@ class ColetorLighter(Coletor):
     def usar_para_cotacao(self, simbolos) -> None:
         """Simbolos cujo ticker tambem alimenta as cotacoes (a Lighter nao tem spot: na pratica, nenhum)."""
         self._simbolos_cotacao = set(simbolos)
-
-    def tirar_descartes(self) -> dict[str, int]:
-        """Quantos livros e tickers foram descartados (e sequencias quebradas) desde a ultima vez; zera a conta."""
-        resumo = {tipo: self._descartes[tipo] for tipo in TIPOS_DE_DESCARTE}
-        self._descartes.clear()
-        return resumo
 
     async def fechar(self) -> None:
         """Para tudo, fecha a conexao e o cliente. Depois disso nada novo comeca."""
@@ -1026,57 +886,26 @@ class ColetorLighter(Coletor):
         self._pares = {simbolo: par for _, simbolo, par in melhores.values()}
         # Mercado que saiu da lista (recarga): o livro dele sai do estado e deixa de ser desejado. A assinatura
         # na Lighter morre com a conexao; as mensagens dele sao ignoradas (o market_id nao esta mais no indice).
-        for simbolo in sorted(self._livros_desejados - set(self._pares)):
+        validos = set(self._pares)
+        self._pedidos_etapa2 &= validos
+        self._livros_etapa1 &= validos
+        for simbolo in sorted(self._livros_desejados - validos):
             self._livros_desejados.discard(simbolo)
             self._largar_livro(simbolo)
         if self._dados_lentos is not None:
             self._dados_lentos.receber_taxas(self.nome, markets)
 
-    def _remover_livro_do_estado(self, simbolo: str) -> None:
-        ativo = self._livros_no_estado.pop(simbolo, None)
-        if ativo is not None and self._estado is not None:
-            self._estado.remover_livro(self.nome, "futuro", ativo, simbolo_original=simbolo)
-
-    def _registrar_mensagem(self, agora: float) -> None:
-        if self._estado is not None:
-            self._estado.registrar_mensagem(self.nome, agora)
-
-    def _registrar_atraso(self, agora: float, horario_da_corretora: float) -> None:
-        if self._estado is not None:
-            self._estado.registrar_atraso(self.nome, agora - horario_da_corretora, agora)
-
-    def _chegou_ticker(self, agora: float) -> None:
-        """Chegou um market_stats: se a corretora estava fora, conta a reconexao (o estado so conta uma vez)."""
-        self._ticker_desde_o_inicio = True
-        if self._estado is not None:
-            self._estado.marcar_reconectada(self.nome)
-        if self._caiu_em is not None:
-            fora_s = agora - self._caiu_em
-            self._caiu_em = None
-            registro.info("%s: tickers de volta depois de %.1fs fora", self.nome, fora_s)
-
-    def _queda(self, erro: Exception, espera: float, tentativa: int) -> None:
-        """A conexao caiu: o estado esquece a corretora e o log registra a queda e a espera."""
-        if self._caiu_em is None:
-            self._caiu_em = self._relogio()
-        if self._estado is not None:
-            self._estado.marcar_desconectada(self.nome)
-        self._livros_no_estado.clear()  # o estado ja apagou os livros da corretora
-        dica = DICA_LIMITE if parece_limite_de_assinatura(erro) else ""
-        # Erro que nao e de conexao pode ser defeito do proprio scanner: traceback na primeira vez.
-        com_traceback = not _erro_de_conexao(erro) and not self._queda_com_traceback
-        if com_traceback:
-            self._queda_com_traceback = True
-        registro.warning("%s: a conexao da lighter caiu (%s: %s); tentando de novo em %gs (tentativa %d).%s",
-                         self.nome, type(erro).__name__, erro, espera, tentativa, dica,
-                         exc_info=erro if com_traceback else False)
-
     def _erro_do_servidor(self, erro) -> None:
-        """Mensagem de erro da Lighter ({"error": {"code", "message"}}): vai ao log, uma vez por codigo."""
-        codigo = _inteiro(erro.get("code")) if isinstance(erro, dict) else None
+        """Mensagem de erro da Lighter ({"error": {"code", "message"}}): vai ao log, uma vez por codigo.
+
+        30003 (ja assinado) e 30002 (nao assinado) sao normais, salvo se citarem o livro de um par que ainda
+        espera o livro completo: entao o livro e pedido de novo (o completo nao vira sozinho).
+        """
+        codigo = ler_inteiro(erro.get("code")) if isinstance(erro, dict) else None
         texto = str(erro.get("message")) if isinstance(erro, dict) else str(erro)
         if codigo in ERROS_INOFENSIVOS:
-            registro.debug("%s: aviso da Lighter sem problema (codigo %s: %s)", self.nome, codigo, texto)
+            registro.debug("%s: aviso da Lighter (codigo %s: %s)", self.nome, codigo, texto)
+            self._livro_citado_no_aviso(codigo, texto)
             return
         chave = codigo if codigo is not None else texto[:80]
         if chave in self._erros_avisados:
@@ -1086,6 +915,17 @@ class ColetorLighter(Coletor):
         dica = DICA_LIMITE if parece_limite_de_assinatura(Exception(texto)) else ""
         registro.warning("%s: a Lighter respondeu com erro (codigo %s: %s); os proximos com este codigo so aparecem "
                          "no log detalhado.%s", self.nome, codigo, texto, dica)
+
+    def _livro_citado_no_aviso(self, codigo: int, texto: str) -> None:
+        ident = livro_do_erro(texto)
+        simbolo = self._simbolo_do_id.get(ident) if ident is not None else None
+        aberto = self._livros.get(simbolo) if simbolo is not None else None
+        if aberto is None or aberto.juntado.pronto or aberto.pedido_em is None or simbolo in self._reassinaturas:
+            return
+        ja_assinado = codigo == JA_ASSINADO
+        motivo = ("a Lighter diz que o livro ja estava assinado" if ja_assinado
+                  else "a Lighter diz que o livro nao estava assinado") + " e o livro completo nao chegou"
+        self._quebrou(simbolo, aberto, motivo, None, cancelar=ja_assinado)
 
     def _erro_ao_tratar(self, mensagem: dict) -> None:
         """Log do erro ao tratar uma mensagem: com traceback na primeira vez do canal; depois so no log detalhado."""
@@ -1097,14 +937,6 @@ class ColetorLighter(Coletor):
         registro.warning("%s: erro ao tratar uma mensagem do canal %s; ela foi descartada e a conexao segue (os "
                          "proximos erros deste canal so aparecem no log detalhado)", self.nome, canal, exc_info=True)
 
-    def _erro_ao_tratar_ticker(self, simbolo: str) -> None:
-        if simbolo in self._traceback_ticker:
-            registro.debug("%s %s: erro ao tratar o ticker de novo; descartado", self.nome, simbolo)
-            return
-        self._traceback_ticker.add(simbolo)
-        registro.warning("%s %s: erro ao tratar o ticker; so ele foi descartado e o resto segue (os proximos erros "
-                         "deste par so aparecem no log detalhado)", self.nome, simbolo, exc_info=True)
-
 
 def criar_coletor_lighter(nome: str, cliente, cfg: Config, estado: EstadoMercados | None, dados_lentos,
                           relogio: Callable[[], float] = time.time) -> ColetorLighter:
@@ -1115,4 +947,7 @@ def criar_coletor_lighter(nome: str, cliente, cfg: Config, estado: EstadoMercado
         CORRETORAS_LIGHTER[nome], cliente, estado=estado, relogio=relogio, dados_lentos=dados_lentos,
         espera_max_reconexao_s=cfg.espera_max_reconexao_s, limite_assinaturas=cfg.limites_assinatura.get(nome),
         intervalo_ping_s=cfg.intervalo_ping_lighter_s, mensagens_sem_bid_ask=cfg.mensagens_sem_bid_ask,
+        pings_sem_resposta=cfg.pings_sem_resposta_lighter, niveis_por_lado=cfg.niveis_livro_lighter,
+        tempo_max_livro_completo_s=cfg.tempo_max_livro_completo_lighter_s,
+        mudancas_sem_livro_completo=cfg.mudancas_sem_livro_completo_lighter,
     )

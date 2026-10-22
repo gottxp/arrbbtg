@@ -27,7 +27,7 @@ from decimal import Decimal
 from scanner.coletores.base import Coletor
 from scanner.coletores.ccxt_coletor import ColetorCcxt, mercado_do_simbolo
 from scanner.coletores.fabrica import criar_corretora
-from scanner.coletores.lighter import CORRETORAS_LIGHTER, ColetorLighter, e_lighter
+from scanner.coletores.lighter import criar_coletor_lighter, e_lighter
 from scanner.config.carregar import MERCADOS, Config, ErroConfig, carregar_config
 from scanner.modelos import Livro
 
@@ -60,9 +60,8 @@ async def preparar(exchanges: dict, cfg: Config) -> tuple[list[ColetorCcxt], dic
             erros.append(f"{nome}: nao consegui carregar a lista de mercados ({type(resultado).__name__}: {resultado})")
             await exchanges[nome].close()
             continue
-        if e_lighter(nome):  # Task 16: conector proprio da Lighter (so futuros)
-            coletor = ColetorLighter(CORRETORAS_LIGHTER[nome], exchanges[nome],
-                                     intervalo_ping_s=cfg.intervalo_ping_lighter_s)
+        if e_lighter(nome):  # Task 16: conector proprio da Lighter (so futuros), com os ajustes da config
+            coletor = criar_coletor_lighter(nome, exchanges[nome], cfg, estado=None, dados_lentos=None)
         else:
             coletor = ColetorCcxt(nome, exchanges[nome], mercados=cfg.mercados_da_corretora(nome))
         pares = simbolos_da_corretora(coletor)

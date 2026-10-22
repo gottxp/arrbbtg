@@ -31,6 +31,7 @@ from collections.abc import Awaitable, Callable
 
 from scanner.api import conferir_painel, criar_app, servir_api
 from scanner.armazenamento import Banco
+from scanner.coletores.base import ColetorDoScanner
 from scanner.coletores.ccxt_coletor import ColetorCcxt
 from scanner.coletores.dados_lentos import DadosLentos
 from scanner.coletores.fabrica import criar_corretora
@@ -76,8 +77,8 @@ async def _carregar_mercados(exchanges: dict) -> list[str]:
     return carregadas
 
 
-async def _acompanhar_tickers(coletor: ColetorCcxt, simbolos: list[str]) -> None:
-    """Etapa 1 de uma corretora, com reconexao (veja ColetorCcxt.manter_tickers).
+async def _acompanhar_tickers(coletor: ColetorDoScanner, simbolos: list[str]) -> None:
+    """Etapa 1 de uma corretora, com reconexao (veja manter_tickers do ColetorCcxt e do ColetorLighter).
 
     Qualquer erro dentro do stream (queda de conexao, erro da corretora ou defeito do proprio scanner)
     e tratado pelo coletor: espera crescente e tenta de novo; o que nao e queda de conexao sai no log
@@ -91,7 +92,7 @@ async def _acompanhar_tickers(coletor: ColetorCcxt, simbolos: list[str]) -> None
                            "reiniciar o scanner", coletor.nome)
 
 
-def _listas_de_tickers(coletores: dict[str, ColetorCcxt],
+def _listas_de_tickers(coletores: dict[str, ColetorDoScanner],
                        dados_lentos: DadosLentos | None = None) -> tuple[dict[str, list[str]], dict]:
     """Os simbolos da etapa 1 de cada corretora e, de cada uma, o simbolo que ocupa cada chave do estado.
 
@@ -123,7 +124,7 @@ class _Tickers:
     `cotacao`: o DadosLentos que escolhe os pares de cotacao que entram nas listas (None = nenhum).
     """
 
-    def __init__(self, coletores: dict[str, ColetorCcxt], cotacao: DadosLentos | None = None):
+    def __init__(self, coletores: dict[str, ColetorDoScanner], cotacao: DadosLentos | None = None):
         self._coletores = coletores
         self.cotacao = cotacao
         self.tarefas: dict[str, asyncio.Task] = {}
@@ -146,7 +147,7 @@ class _Tickers:
         )
 
     @staticmethod
-    async def _comecar(coletor: ColetorCcxt, simbolos: list[str], anterior: asyncio.Task | None) -> None:
+    async def _comecar(coletor: ColetorDoScanner, simbolos: list[str], anterior: asyncio.Task | None) -> None:
         """Espera a tarefa anterior (ja cancelada) terminar de verdade e so entao abre o stream novo.
 
         Os dois streams dividem o estado de reconexao do coletor; sem esperar, por um instante os dois
@@ -165,7 +166,7 @@ class _Tickers:
             await asyncio.gather(tarefa, return_exceptions=True)
 
 
-async def _recarregar_mercados(exchanges: dict, coletores: dict[str, ColetorCcxt], tickers: _Tickers,
+async def _recarregar_mercados(exchanges: dict, coletores: dict[str, ColetorDoScanner], tickers: _Tickers,
                                estado: EstadoMercados) -> None:
     """Recarrega a lista de mercados de todas as corretoras (especificacao, secao 8: mudancas nas corretoras).
 
@@ -182,7 +183,7 @@ async def _recarregar_mercados(exchanges: dict, coletores: dict[str, ColetorCcxt
     await _ajustar_tickers(coletores, tickers, estado)
 
 
-async def _ajustar_tickers(coletores: dict[str, ColetorCcxt], tickers: _Tickers, estado: EstadoMercados) -> None:
+async def _ajustar_tickers(coletores: dict[str, ColetorDoScanner], tickers: _Tickers, estado: EstadoMercados) -> None:
     """Recalcula os simbolos da etapa 1 de todas as corretoras e ajusta os streams.
 
     - o stream de tickers so reinicia nas corretoras cuja lista mudou (ex.: uma corretora nova entrou e
@@ -212,8 +213,8 @@ async def _ajustar_tickers(coletores: dict[str, ColetorCcxt], tickers: _Tickers,
                 tickers.iniciar(nome, lista)
 
 
-async def _trazer_de_volta(nome: str, exchange, coletores: dict[str, ColetorCcxt], tickers: _Tickers,
-                           estado: EstadoMercados, criar_coletor: Callable[[str], ColetorCcxt],
+async def _trazer_de_volta(nome: str, exchange, coletores: dict[str, ColetorDoScanner], tickers: _Tickers,
+                           estado: EstadoMercados, criar_coletor: Callable[[str], ColetorDoScanner],
                            ao_entrar: Callable[[str], None], espera_max_s: float,
                            esperar: Callable[[float], Awaitable] = asyncio.sleep) -> None:
     """Corretora que nao carregou a lista de mercados ao ligar: tenta de novo sozinha ate conseguir.
@@ -258,7 +259,7 @@ async def _trazer_de_volta(nome: str, exchange, coletores: dict[str, ColetorCcxt
         return
 
 
-async def _recarregar_mercados_sempre(exchanges: dict, coletores: dict[str, ColetorCcxt], tickers: _Tickers,
+async def _recarregar_mercados_sempre(exchanges: dict, coletores: dict[str, ColetorDoScanner], tickers: _Tickers,
                                       estado: EstadoMercados, intervalo_s: float,
                                       esperar: Callable[[float], Awaitable] = asyncio.sleep) -> None:
     """A cada `intervalo_s` (recarregar_mercados_s), recarrega a lista de mercados. Erro vai ao log e o laco segue."""
@@ -270,7 +271,7 @@ async def _recarregar_mercados_sempre(exchanges: dict, coletores: dict[str, Cole
             registro.exception("erro ao recarregar a lista de mercados; tento de novo em %ss", intervalo_s)
 
 
-def _resumo_dos_descartes(coletores: dict[str, ColetorCcxt], intervalo_s: float) -> str:
+def _resumo_dos_descartes(coletores: dict[str, ColetorDoScanner], intervalo_s: float) -> str:
     """Linha do log com os descartes de cada corretora desde o ultimo resumo (e zera os contadores)."""
     partes = []
     for nome, coletor in coletores.items():
@@ -281,7 +282,7 @@ def _resumo_dos_descartes(coletores: dict[str, ColetorCcxt], intervalo_s: float)
     return f"descartes nos ultimos {intervalo_s:g}s: {'; '.join(partes) if partes else 'nenhum'}"
 
 
-async def _registrar_recursos(motor: Motor, coletores: dict[str, ColetorCcxt], intervalo_s: float,
+async def _registrar_recursos(motor: Motor, coletores: dict[str, ColetorDoScanner], intervalo_s: float,
                               esperar: Callable[[float], Awaitable] = asyncio.sleep,
                               medidor: MedidorCpu | None = None) -> None:
     """A cada `intervalo_s` (intervalo_log_recursos_s), registra no log memoria, CPU e o resumo dos descartes.
@@ -300,7 +301,7 @@ async def _registrar_recursos(motor: Motor, coletores: dict[str, ColetorCcxt], i
             registro.exception("erro ao registrar memoria e CPU no log")
 
 
-async def _ajustar_livros_da_corretora(coletor: ColetorCcxt, simbolos: set[str], com_traceback: set[str]) -> None:
+async def _ajustar_livros_da_corretora(coletor: ColetorDoScanner, simbolos: set[str], com_traceback: set[str]) -> None:
     """Etapa 2 de uma corretora: abre e cancela livros conforme a selecao do motor.
 
     Erro vai para o log (com traceback na primeira vez de cada corretora; depois uma linha) e o proximo
@@ -315,7 +316,7 @@ async def _ajustar_livros_da_corretora(coletor: ColetorCcxt, simbolos: set[str],
                        coletor.nome, type(erro).__name__, erro, exc_info=primeira)
 
 
-def _iniciar_ajustes(coletores: dict[str, ColetorCcxt], selecao: dict[str, set[str]],
+def _iniciar_ajustes(coletores: dict[str, ColetorDoScanner], selecao: dict[str, set[str]],
                      ajustes: dict[str, asyncio.Task], com_traceback: set[str]) -> None:
     """Comeca o ajuste de livros de cada corretora cujo ajuste anterior ja terminou.
 
@@ -351,7 +352,7 @@ async def _servir_painel(app, cfg: Config) -> None:
         registro.error("o painel parou (%s: %s); o scanner segue sem painel ate reiniciar", type(erro).__name__, erro)
 
 
-async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorCcxt], cfg: Config,
+async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorDoScanner], cfg: Config,
                          relogio: Callable[[], float], ciclos: int | None,
                          publicar: Callable[[list[Evento]], None] | None = None) -> None:
     """A cada `ciclo_ms`: roda o ciclo do motor, transmite os eventos ao painel e ajusta os livros abertos (etapa 2).
@@ -399,7 +400,7 @@ async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorCcxt], cfg: C
         await asyncio.gather(*ajustes.values(), return_exceptions=True)
 
 
-async def _encerrar(tarefas: list[asyncio.Task], coletores: dict[str, ColetorCcxt], exchanges: dict,
+async def _encerrar(tarefas: list[asyncio.Task], coletores: dict[str, ColetorDoScanner], exchanges: dict,
                     banco: Banco | None) -> None:
     """Para tudo e libera as conexoes e o banco. Um erro ao fechar uma coisa nao impede fechar as outras."""
     for tarefa in tarefas:
@@ -437,7 +438,7 @@ async def rodar(
         fontes_cotacao=cfg.fontes_cotacao, faixa_cotacao_pct=cfg.faixa_cotacao_pct, relogio=relogio,
     )
     exchanges: dict = {}
-    coletores: dict[str, ColetorCcxt] = {}
+    coletores: dict[str, ColetorDoScanner] = {}
     tickers = _Tickers(coletores, dados_lentos)
     tarefas: list[asyncio.Task] = []
     banco: Banco | None = None
@@ -453,7 +454,7 @@ async def rodar(
         if not carregadas:
             raise RuntimeError("nenhuma corretora carregou a lista de mercados; confira a internet e o config.yaml")
 
-        def criar_coletor(nome: str) -> ColetorCcxt:
+        def criar_coletor(nome: str) -> ColetorDoScanner:
             if e_lighter(nome):  # Task 16: conector proprio (funding e taxa vao direto ao DadosLentos)
                 return criar_coletor_lighter(nome, exchanges[nome], cfg, estado, dados_lentos, relogio)
             return ColetorCcxt(
