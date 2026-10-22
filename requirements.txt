@@ -3,3 +3,5 @@ fastapi==0.159.1
 uvicorn==0.54.0
 PyYAML==6.0.3
 websockets==17.3
+# O spot da MEXC (ccxt 4.5.89) manda as mensagens do WebSocket em protobuf; sem ele, nada chega.
+protobuf==5.29.5
