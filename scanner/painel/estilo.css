@@ -343,7 +343,9 @@ input.invalido { border-color: var(--vermelho) !important; }
 
 /* Moeda */
 .moeda-linha { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 6px; }
-.moeda-base { font-weight: 700; font-size: 14px; }
+/* min-width + overflow-wrap: nome comprido sem espaco (vem da corretora) quebra dentro da celula em vez de
+   passar por cima da coluna ao lado. */
+.moeda-base { font-weight: 700; font-size: 14px; min-width: 0; overflow-wrap: anywhere; }
 .moeda-cotacao { font-size: 10px; color: var(--texto-2); margin-left: -4px; }
 .etiqueta {
   font-size: 9.5px; font-weight: 700; letter-spacing: 0.3px;

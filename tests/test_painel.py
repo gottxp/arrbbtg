@@ -26,6 +26,7 @@ from scanner.armazenamento import Banco
 from scanner.filtros import Filtros
 from scanner.motor import chave_de, texto_da_chave
 from tests.fabricas import motor_falso
+from tests.test_api import ClienteDoPainel
 
 # Horario do estado criado pelo motor_falso (as pontas "chegaram" em t = 10 s).
 AGORA = 10.0
@@ -36,6 +37,9 @@ ARQUIVOS_DO_PAINEL = ("index.html", "app.js", "estilo.css")
 
 # A unica biblioteca externa do painel, com a versao fixa (decisao do projeto).
 URL_GRAFICOS = "https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"
+# Hash SRI desse arquivo (sha384 em base64), calculado do pacote npm lightweight-charts@4.2.3 (o unpkg serve o
+# mesmo arquivo do pacote). Se o arquivo do CDN mudar, o navegador recusa o script e o grafico avisa.
+SRI_GRAFICOS = "sha384-stKllnUqA9AD0gsKCuUtf5XlqAW7PwIgDagoNsTWkjkBmJ/GZ/uHTgEBxdLV2VSK"
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +65,7 @@ def motor(banco):
 def montar_cliente(motor, banco, painel=None) -> TestClient:
     """TestClient da API com o painel; `painel` troca campos do bloco painel da Config (usuario, senha)."""
     config = replace(motor.cfg, painel={**motor.cfg.painel, **(painel or {})})
-    return TestClient(criar_app(motor, banco, config, relogio=lambda: AGORA))
+    return ClienteDoPainel(criar_app(motor, banco, config, relogio=lambda: AGORA))  # em http://localhost:8000
 
 
 @pytest.fixture
@@ -226,6 +230,19 @@ def test_o_painel_so_usa_nomes_de_campos_que_existem_nos_filtros():
     assert usados - {c.name for c in dataclasses.fields(Filtros)} == set()
 
 
+def test_script_do_grafico_com_sri_e_aviso_se_nao_carregar():
+    # SRI: o navegador so roda o arquivo do CDN se o hash bater (um CDN invadido nao roda codigo no painel).
+    # crossorigin="anonymous" e exigido pelo SRI em script de outro endereco (o unpkg libera com CORS).
+    tags = re.findall(r"<script\b[^>]*>", ler("index.html"))
+    grafico = [tag for tag in tags if URL_GRAFICOS in tag]
+    assert len(grafico) == 1
+    tag = grafico[0]
+    assert f'integrity="{SRI_GRAFICOS}"' in tag
+    assert 'crossorigin="anonymous"' in tag
+    # Hash diferente (ou sem internet) dispara o onerror: o modal do grafico avisa e o resto do painel funciona.
+    assert 'onerror="window.falhaBibliotecaGraficos = true"' in tag and " async " in tag
+
+
 def test_nenhum_recurso_externo_alem_do_lightweight_charts():
     externos = set(re.findall(r"""(?:src|href)\s*=\s*["']((?:https?:)?//[^"']+)""", ler("index.html")))
     assert externos == {URL_GRAFICOS}
@@ -367,3 +384,96 @@ def test_ordenacao_do_painel():
 def test_chave_do_sinal_igual_a_do_motor():
     sinal = sinal_para_ordenar("BTC/USDT", 0.1)
     assert rodar_no_node("console.log(JSON.stringify(painel.chaveDoSinal(dados)));", sinal) == CHAVE_TEXTO
+
+
+# ---------------------------------------------------------------------------
+# Revisao final: corretoras e mercados, funding com 4 casas e textos
+# ---------------------------------------------------------------------------
+
+
+def no_node(expressao: str, dados=None):
+    """O valor (JSON) de uma expressao com as funcoes do app.js (`painel`) e os `dados`."""
+    return rodar_no_node(f"console.log(JSON.stringify({expressao}));", dados)
+
+
+@sem_node
+def test_nomes_das_corretoras_diferenciam_as_duas_kraken_e_a_robinhood():
+    nomes = ["kraken", "krakenfutures", "lighter", "lighter_rh", "hyperliquid", "corretora_nova"]
+    assert no_node("dados.map(painel.nomeCorretora)", nomes) == [
+        "Kraken Pro spot", "Kraken Futuros", "Lighter", "Lighter Robinhood", "Hyperliquid", "corretora_nova"]
+
+
+@sem_node
+def test_opcoes_de_corretoras_so_com_os_mercados_ligados():
+    # Revisao final, I2: a lista vinha com spot e futuro de toda corretora (opcoes que nao casam com nenhum
+    # sinal) e com duas "Kraken Pro futuros" iguais.
+    status = {
+        "gate": {"estado": "conectada", "mercados": ["spot", "futuro"]},
+        "hyperliquid": {"estado": "conectada", "mercados": ["futuro"]},
+        "kraken": {"estado": "conectada", "mercados": ["spot"]},
+        "krakenfutures": {"estado": "reconectando", "mercados": ["futuro"]},
+        "lighter_rh": {"estado": "atrasada", "mercados": ["futuro"]},
+        "antigo": {"estado": "conectada"},  # scanner sem o campo mercados: as duas opcoes, como antes
+    }
+    opcoes = no_node("painel.opcoesDasCorretoras(painel.corretorasDoStatus(dados))", status)
+    assert [(o["valor"], o["rotulo"]) for o in opcoes] == [
+        ("gate:spot", "Gate spot"), ("gate:futuro", "Gate futuros"),
+        ("hyperliquid:futuro", "Hyperliquid futuros"),
+        ("kraken:spot", "Kraken Pro spot"),
+        ("krakenfutures:futuro", "Kraken Futuros"),
+        ("lighter_rh:futuro", "Lighter Robinhood futuros"),
+        ("antigo:spot", "antigo spot"), ("antigo:futuro", "antigo futuros"),
+    ]
+    rotulos = [o["rotulo"] for o in opcoes]
+    assert len(set(rotulos)) == len(rotulos)  # nenhum nome repetido
+
+
+@sem_node
+def test_valor_salvo_que_nao_esta_mais_ligado_aparece_marcado_como_desligado():
+    # Um grupo salvo com "kraken:futuro" (opcao antiga, que nao casa com nada) esconderia sinais sem aviso.
+    corretoras = [{"nome": "kraken", "mercados": ["spot"]}, {"nome": "gate", "mercados": ["spot", "futuro"]}]
+    rotulos = no_node("dados.valores.map((v) => painel.rotuloDoValorSalvo(v, dados.corretoras))",
+                      {"valores": ["kraken:futuro", "xt:spot", "gate", "gate:spot"], "corretoras": corretoras})
+    assert rotulos == ["kraken:futuro (desligado)", "xt:spot (desligado)", "Gate (todos)", "Gate spot"]
+
+
+@sem_node
+def test_mercado_nao_se_repete_quando_ja_esta_no_nome():
+    casos = [["kraken", "spot"], ["krakenfutures", "futuro"], ["gate", "spot"], ["lighter", "futuro"]]
+    assert no_node("dados.map(([c, m]) => painel.rotuloCorretoraMercado(c + ':' + m))", casos) == [
+        "Kraken Pro spot", "Kraken Futuros", "Gate spot", "Lighter futuros"]
+    # Na celula da ponta o mercado vai num pedaco separado: some quando o nome ja diz qual e.
+    assert no_node("dados.map(([c, m]) => painel.mercadoNaPonta(c, m))", casos) == ["", "", "spot", "futuros"]
+
+
+@sem_node
+def test_funding_com_4_casas_e_rp_com_2():
+    # Revisao final, Minor 1: o funding de 1h (0,0012%) aparecia como 0,00%.
+    valores = [0.0012, 0.000012, -0.0012, 0.0149, 0.005, 0, None]
+    assert no_node("dados.map(painel.pctFunding)", valores) == [
+        "+0,0012%", "0,0000%", "-0,0012%", "+0,0149%", "+0,0050%", "0,0000%", "—"]
+    # RP e spreads continuam com 2 casas (o sinal some quando arredonda para zero).
+    assert no_node("dados.map(painel.pct)", [0.4, -0.09, 0.0012]) == ["+0,40%", "-0,09%", "0,00%"]
+
+
+@sem_node
+def test_reconexoes_no_singular_e_no_plural():
+    assert no_node("dados.map(painel.textoReconexoes)", [0, 1, 2, 3]) == [
+        "0 reconexões", "1 reconexão", "2 reconexões", "3 reconexões"]
+
+
+@sem_node
+def test_dica_do_rp_liquido_mostra_taxas_margem_de_slippage_e_funding():
+    sinal = {"rp_bruto_pct": 0.63, "custo_taxas_pct": 0.24, "funding_esperado_pct": 0.0125, "rp_liquido_pct": 0.3025}
+    texto = no_node("painel.tituloRpLiquido(dados)", sinal)
+    assert texto == ("RP líquido = RP bruto − taxas (0,24%) − margem de slippage (0,10%)"
+                     " + funding esperado (+0,0125%)")
+    sem_margem = {"rp_bruto_pct": 0.1 + 0.2, "custo_taxas_pct": 0.24, "funding_esperado_pct": 0.0,
+                  "rp_liquido_pct": 0.1 + 0.2 - 0.24}
+    assert "margem de slippage (0,00%)" in no_node("painel.tituloRpLiquido(dados)", sem_margem)
+
+
+@sem_node
+def test_aviso_de_cotacao_cita_tambem_o_usd():
+    # O USD dos futuros da Kraken tambem e convertido pela cotacao (e vai 1:1 sem ela).
+    assert "USDC/USDG/USD" in no_node("painel.TITULO_AVISO_COTACAO")

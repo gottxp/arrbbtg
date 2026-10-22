@@ -40,14 +40,19 @@ const FUSO = "America/Sao_Paulo";      // horario de Brasilia
 const GUARDADO_GRUPO = "scanner.grupo";
 const GUARDADO_FILTROS_RECOLHIDOS = "scanner.filtrosRecolhidos";
 
-// Nome bonito de cada corretora (a que nao estiver aqui aparece com o nome do config.yaml).
+// Nome bonito de cada corretora, com a chave do config.yaml (a que nao estiver aqui aparece com o nome
+// do config.yaml). A Kraken Pro sao duas corretoras: kraken (so spot) e krakenfutures (so futuros).
 const NOMES_CORRETORAS = {
   mexc: "MEXC", gate: "Gate", bitget: "Bitget", bingx: "BingX", xt: "XT", hyperliquid: "Hyperliquid",
-  kraken: "Kraken Pro", krakenfutures: "Kraken Pro", lighter: "Lighter", lighter_robinhood: "Lighter Robinhood",
+  kraken: "Kraken Pro spot", krakenfutures: "Kraken Futuros", lighter: "Lighter", lighter_rh: "Lighter Robinhood",
   deepcoin: "Deepcoin",
 };
 const NOMES_MERCADOS = { spot: "spot", futuro: "futuros" };
+const MERCADOS = ["spot", "futuro"];   // os dois mercados, para scanner antigo que nao informa os ligados
 const NOMES_TIPOS = { spot_futuro: "SPOT — FUTUROS", futuro_futuro: "FUTUROS — FUTUROS" };
+
+// Etiqueta "COTAÇÃO 1:1" (sinal com aviso_cotacao): a moeda de cotacao da ponta ficou sem cotacao para USDT.
+const TITULO_AVISO_COTACAO = "Sem cotação USDC/USDG/USD para USDT: o preço foi convertido 1:1";
 
 // Opcoes das listas com caixinhas (o atributo data-opcoes do index.html escolhe qual).
 const OPCOES_FIXAS = {
@@ -159,6 +164,21 @@ function pct(valor) {
   return numeroValido(valor) ? formatoPct.format(valor) + "%" : "—";
 }
 
+// Funding com 4 casas: o de 1h (Hyperliquid, Lighter, Kraken Futuros) fica perto de 0,0012%.
+const formatoFunding = new Intl.NumberFormat("pt-BR", {
+  minimumFractionDigits: 4, maximumFractionDigits: 4, signDisplay: "exceptZero",
+});
+
+/** Funding (FR, FR Yield, funding esperado) com sinal e 4 casas: 0.0012 -> "+0,0012%". Sem valor: "—". */
+function pctFunding(valor) {
+  return numeroValido(valor) ? formatoFunding.format(valor) + "%" : "—";
+}
+
+/** "1 reconexão", "3 reconexões". */
+function textoReconexoes(quantidade) {
+  return `${formatoInteiro.format(quantidade)} ${quantidade === 1 ? "reconexão" : "reconexões"}`;
+}
+
 /** Classe de cor: verde para positivo, vermelho para negativo. */
 function classeSinal(valor) {
   if (!numeroValido(valor) || valor === 0) return "neutro";
@@ -227,11 +247,56 @@ function nomeCorretora(id) {
   return NOMES_CORRETORAS[texto.toLowerCase()] || texto;
 }
 
+/**
+ * O mercado escrito ao lado do nome da corretora ("spot" ou "futuros"). Vazio quando o nome ja diz qual e
+ * ("Kraken Pro spot", "Kraken Futuros"), para nao aparecer "Kraken Futuros futuros".
+ */
+function mercadoNaPonta(corretora, mercado) {
+  const texto = NOMES_MERCADOS[mercado] || String(mercado || "");
+  return nomeCorretora(corretora).toLowerCase().endsWith(" " + texto.toLowerCase()) ? "" : texto;
+}
+
 /** Rotulo de uma opcao "corretora:mercado" ("gate:spot" -> "Gate spot"; "gate" -> "Gate (todos)"). */
 function rotuloCorretoraMercado(valor) {
   const [corretora, mercado] = String(valor).split(":");
   if (!mercado) return `${nomeCorretora(corretora)} (todos)`;
-  return `${nomeCorretora(corretora)} ${NOMES_MERCADOS[mercado] || mercado}`;
+  const texto = mercadoNaPonta(corretora, mercado);
+  return texto ? `${nomeCorretora(corretora)} ${texto}` : nomeCorretora(corretora);
+}
+
+/**
+ * As corretoras do /api/status, cada uma com os mercados ligados: [{nome, mercados: ["spot", "futuro"]}].
+ * Scanner antigo, sem o campo `mercados`: os dois mercados.
+ */
+function corretorasDoStatus(status) {
+  return Object.entries(status || {}).map(([nome, dados]) => {
+    const informados = dados && Array.isArray(dados.mercados) ? dados.mercados.filter((m) => MERCADOS.includes(m)) : [];
+    return { nome, mercados: informados.length ? MERCADOS.filter((m) => informados.includes(m)) : MERCADOS.slice() };
+  });
+}
+
+/** Opcoes de "Corretoras 1/2": so os mercados ligados de cada corretora ({valor: "gate:spot", rotulo}). */
+function opcoesDasCorretoras(corretoras) {
+  const opcoes = [];
+  for (const { nome, mercados } of corretoras) {
+    for (const mercado of mercados) {
+      const valor = `${nome}:${mercado}`;
+      opcoes.push({ valor, rotulo: rotuloCorretoraMercado(valor) });
+    }
+  }
+  return opcoes;
+}
+
+/**
+ * Rotulo de um valor salvo num grupo que nao esta nas opcoes. "gate" (sem mercado) = spot e futuro.
+ * "kraken:futuro" com a kraken so no spot (ou com a corretora desligada) nao casa com nenhum sinal: aparece
+ * como esta salvo, com "(desligado)", para o dono ver por que os sinais sumiram e desmarcar.
+ */
+function rotuloDoValorSalvo(valor, corretoras) {
+  const [corretora, mercado] = String(valor).split(":");
+  if (!mercado || !corretoras.length) return rotuloCorretoraMercado(valor);
+  const ligada = corretoras.find((c) => c.nome === corretora);
+  return ligada && ligada.mercados.includes(mercado) ? rotuloCorretoraMercado(valor) : `${valor} (desligado)`;
 }
 
 // Como o numero aparece no campo depois de lido (o dono ve o que valeu). Os dois formatos sao lidos
@@ -298,7 +363,7 @@ const estado = {
   ultimaMensagemMs: null, // quando chegou a ultima mensagem do WebSocket
   carregado: false,       // o formulario ja foi preenchido com a sessao e os grupos do servidor?
                           // Ate isso acontecer, o painel nao grava nada (nem sessao, nem grupo).
-  corretoras: [],         // nomes das corretoras (do /api/status)
+  corretoras: [],         // corretoras do /api/status com os mercados ligados: [{nome, mercados}]
   saude: null,            // ultima resposta do /api/status
   saudeFalhou: false,
   visiveis: 0,
@@ -485,23 +550,14 @@ function controleMulti(caixa) {
 
   function opcoes() {
     const tipo = caixa.dataset.opcoes;
-    let base;
-    if (tipo === "corretoras") {
-      base = [];
-      for (const corretora of estado.corretoras) {
-        for (const mercado of ["spot", "futuro"]) {
-          const valor = `${corretora}:${mercado}`;
-          base.push({ valor, rotulo: rotuloCorretoraMercado(valor) });
-        }
-      }
-    } else {
-      base = OPCOES_FIXAS[tipo] || [];
-    }
+    // Corretoras: so os mercados ligados de cada uma (do /api/status).
+    const base = tipo === "corretoras" ? opcoesDasCorretoras(estado.corretoras) : (OPCOES_FIXAS[tipo] || []).slice();
     // Um valor salvo que nao esta nas opcoes (ex.: "gate" sem mercado) continua aparecendo.
     const conhecidos = new Set(base.map((opcao) => String(opcao.valor)));
     for (const valor of marcados) {
       if (!conhecidos.has(String(valor))) {
-        base.push({ valor, rotulo: tipo === "corretoras" ? rotuloCorretoraMercado(valor) : String(valor) });
+        const rotulo = tipo === "corretoras" ? rotuloDoValorSalvo(valor, estado.corretoras) : String(valor);
+        base.push({ valor, rotulo });
       }
     }
     return base;
@@ -1100,11 +1156,13 @@ function prepararGrupos() {
 //   {"tipo": "snapshot", "sinais": [...]}       substitui a tabela inteira (ao conectar)
 //   {"tipo": "novo" | "atualizado", "sinal": {...}}  poe ou troca o sinal pela chave
 //   {"tipo": "encerrado", "sinal": {...}}        tira o sinal
+//   {"tipo": "vivo"}                             sinal de vida (a cada 5 s sem eventos): so a "Ultima atualizacao"
 // Caiu a conexao: tenta de novo em 1 s, 2 s, 4 s... ate 30 s. A espera so volta a 1 s depois que o
 // snapshot chega (um servidor que aceita e fecha logo em seguida nao vira uma tentativa por segundo).
 // Nao da para saber pelo codigo de fechamento se foi senha errada: no servidor de verdade isso chega
 // como uma falha comum.
-// Depois de uma queda, os filtros sao lidos de novo do scanner (ele pode ter reiniciado).
+// Depois de uma queda, os filtros sao lidos de novo do scanner (ele pode ter reiniciado). Se essa leitura
+// falhar, tenta de novo a cada pergunta de saude (INTERVALO_STATUS_MS) ate conseguir.
 
 let conexao = null;
 let esperaReconexaoMs = RECONEXAO_INICIAL_MS;
@@ -1133,6 +1191,18 @@ function conectar() {
   });
 }
 
+/**
+ * Le de novo a sessao e os grupos do scanner depois de uma queda (ele pode ter reiniciado com a sessao
+ * padrao). Se falhar, volta a marcar a queda: o acompanharSaude tenta de novo na proxima pergunta de saude.
+ */
+function ressincronizar() {
+  caiuDesdeOUltimoSnapshot = false;
+  sincronizar().catch((erro) => {
+    caiuDesdeOUltimoSnapshot = true;
+    mostrarErroFiltros(`Não deu para ler os filtros do scanner: ${erro.message}. Tentando de novo…`);
+  });
+}
+
 function agendarReconexao() {
   caiuDesdeOUltimoSnapshot = true;
   estado.conexao = "reconectando";
@@ -1152,15 +1222,16 @@ function receberMensagem(texto) {
     return;
   }
   estado.ultimaMensagemMs = Date.now();
+  if (mensagem.tipo === "vivo") {
+    atualizarBarra();  // so o horario muda: a tabela fica como esta
+    return;
+  }
   if (mensagem.tipo === "snapshot") {
     const novos = new Map();
     for (const sinal of mensagem.sinais || []) novos.set(chaveDoSinal(sinal), sinal);
     estado.sinais = novos;
     esperaReconexaoMs = RECONEXAO_INICIAL_MS;  // a conexao funcionou de verdade
-    if ((caiuDesdeOUltimoSnapshot || semConexaoNoEnvio) && estado.carregado) {
-      caiuDesdeOUltimoSnapshot = false;
-      sincronizar().catch((erro) => mostrarErroFiltros("Não deu para ler os filtros do scanner: " + erro.message));
-    }
+    if ((caiuDesdeOUltimoSnapshot || semConexaoNoEnvio) && estado.carregado) ressincronizar();
   } else if (mensagem.tipo === "novo" || mensagem.tipo === "atualizado") {
     estado.sinais.set(chaveDoSinal(mensagem.sinal), mensagem.sinal);
   } else if (mensagem.tipo === "encerrado") {
@@ -1336,7 +1407,7 @@ function celulaMoeda(sinal) {
   }
   if (sinal.aviso_cotacao) {
     const marca = criar("span", "etiqueta etiqueta-cotacao", "COTAÇÃO 1:1");
-    marca.title = "Sem cotação USDC/USDG: o preço foi convertido 1:1 para USDT";
+    marca.title = TITULO_AVISO_COTACAO;
     linha1.appendChild(marca);
   }
   const tipo = criar("div", "tipo tipo-" + sinal.tipo, NOMES_TIPOS[sinal.tipo] || sinal.tipo);
@@ -1350,9 +1421,10 @@ function celulaPonta(ponta, lado) {
   const td = criar("td", "col-ponta");
   if (!ponta) return td;
   const linha1 = criar("div", "ponta-linha1");
+  linha1.appendChild(criar("span", "corretora", nomeCorretora(ponta.corretora)));
+  const mercado = mercadoNaPonta(ponta.corretora, ponta.mercado);  // vazio em "Kraken Futuros" (ja diz qual e)
+  if (mercado) linha1.appendChild(criar("span", "mercado", mercado));
   linha1.append(
-    criar("span", "corretora", nomeCorretora(ponta.corretora)),
-    criar("span", "mercado", NOMES_MERCADOS[ponta.mercado] || ponta.mercado),
     criar("span", "preco", preco(ponta.preco)),
     criar("span", "lado " + (lado === "long" ? "positivo" : "negativo"), lado === "long" ? "(Long)" : "(Short)"),
     criar("span", "lote", usdCompacto(ponta.lote_usd)),
@@ -1363,9 +1435,10 @@ function celulaPonta(ponta, lado) {
 
   const linha2 = criar("div", "ponta-linha2");
   linha2.appendChild(pedaco("VOL:", usdCompacto(ponta.volume_24h_usd)));
-  // Na ponta spot nao ha funding: aparece "—".
+  // Na ponta spot nao ha funding: aparece "—". Funding com 4 casas (o de 1h fica perto de 0,0012%).
   const temFunding = ponta.mercado === "futuro" && numeroValido(ponta.funding_pct);
-  const fr = pedaco("FR:", temFunding ? pct(ponta.funding_pct) : "—", temFunding ? classeSinal(ponta.funding_pct) : null);
+  const fr = pedaco("FR:", temFunding ? pctFunding(ponta.funding_pct) : "—",
+    temFunding ? classeSinal(ponta.funding_pct) : null);
   if (temFunding && numeroValido(ponta.funding_intervalo_h)) {
     fr.appendChild(document.createTextNode(` (${formatoUmaCasa.format(ponta.funding_intervalo_h)}h)`));
   }
@@ -1383,7 +1456,7 @@ function celulaResultado(sinal) {
     spreads.appendChild(span);
   }
   const yieldFr = criar("div", "menor");
-  yieldFr.appendChild(pedaco("FR Yield:", pct(sinal.fr_yield_8h_pct), classeSinal(sinal.fr_yield_8h_pct)));
+  yieldFr.appendChild(pedaco("FR Yield:", pctFunding(sinal.fr_yield_8h_pct), classeSinal(sinal.fr_yield_8h_pct)));
   yieldFr.title = "Funding das duas pontas normalizado para 8h";
 
   // Destaque: RP liquido; no modo comparacao, o RP bruto (sem custos, como o Arbimax).
@@ -1394,7 +1467,7 @@ function celulaResultado(sinal) {
   const destaque = criar("span", "rp-destaque " + classeSinal(principal), (destaqueBruto ? "RP bruto " : "RP líq. ") + pct(principal));
   destaque.title = destaqueBruto
     ? "RP bruto = A atual + F da métrica (sem taxas, slippage e funding)"
-    : `RP líquido = RP bruto − taxas (${pct(sinal.custo_taxas_pct)}) + funding esperado (${pct(sinal.funding_esperado_pct)})`;
+    : tituloRpLiquido(sinal);
   linhaRp.append(destaque, criar("span", "rp-secundario", (destaqueBruto ? "líq. " : "bruto ") + pct(secundario)));
   td.append(spreads, yieldFr, linhaRp);
 
@@ -1406,6 +1479,24 @@ function celulaResultado(sinal) {
     td.appendChild(custo);
   }
   return td;
+}
+
+/**
+ * A dica do RP liquido: RP bruto − taxas − margem de slippage + funding esperado. O sinal nao traz a margem
+ * (margem_slippage_pct do config.yaml): ela sai da propria conta (bruto − taxas + funding − liquido).
+ */
+function tituloRpLiquido(sinal) {
+  const partes = [sinal.rp_bruto_pct, sinal.custo_taxas_pct, sinal.funding_esperado_pct, sinal.rp_liquido_pct];
+  let margem = null;
+  if (partes.every(numeroValido)) {
+    const [bruto, taxas, funding, liquido] = partes;
+    margem = Math.round((bruto - taxas + funding - liquido) * 1e6) / 1e6 + 0;  // tira o ruido da conta (e o -0)
+  }
+  const semSinal = (valor) => (numeroValido(valor) ? formatoPctSemSinal.format(valor) + "%" : "—");
+  const margemTexto = semSinal(margem);
+  const taxasTexto = semSinal(sinal.custo_taxas_pct);
+  return `RP líquido = RP bruto − taxas (${taxasTexto}) − margem de slippage (${margemTexto})` +
+    ` + funding esperado (${pctFunding(sinal.funding_esperado_pct)})`;
 }
 
 function celulaHistorico(sinal) {
@@ -1571,7 +1662,7 @@ function desenharSaude() {
     if (situacao !== "conectada") item.appendChild(criar("span", "saude-estado", TEXTOS_SAUDE[situacao] || String(dados && dados.estado)));
     const partes = [`${nomeCorretora(corretora)}: ${TEXTOS_SAUDE[situacao] || dados.estado}`];
     if (dados && numeroValido(dados.atraso_medio_ms)) partes.push(`atraso médio ${formatoInteiro.format(dados.atraso_medio_ms)} ms`);
-    if (dados && numeroValido(dados.reconexoes)) partes.push(`${dados.reconexoes} reconexões`);
+    if (dados && numeroValido(dados.reconexoes)) partes.push(textoReconexoes(dados.reconexoes));
     if (estado.saudeFalhou) partes.push("(sem resposta agora; mostrando a última)");
     item.title = partes.join(" · ");
     caixa.appendChild(item);
@@ -1585,9 +1676,14 @@ async function acompanharSaude() {
     estado.saudeFalhou = false;
     // O scanner respondeu: se uma mudanca de filtro nao tinha chegado nele, manda de novo agora.
     if (semConexaoNoEnvio && estado.carregado && !enviando && temporizadorEnvio === null) agendarEnvio(0);
-    const nomes = Object.keys(estado.saude || {});
-    if (textoEstavel(nomes) !== textoEstavel(estado.corretoras)) {
-      estado.corretoras = nomes;
+    // Uma leitura dos filtros depois de uma queda falhou: tenta de novo (so com o WebSocket ao vivo, para
+    // ler o scanner que voltou, e nao o que esta caindo).
+    if (caiuDesdeOUltimoSnapshot && estado.carregado && estado.conexao === "ao_vivo" && !sincronizacaoEmAndamento) {
+      ressincronizar();
+    }
+    const corretoras = corretorasDoStatus(estado.saude);
+    if (textoEstavel(corretoras) !== textoEstavel(estado.corretoras)) {
+      estado.corretoras = corretoras;
       for (const lista of listasMulti) lista.atualizarOpcoes();
     }
   } catch (erro) {
@@ -1637,7 +1733,7 @@ const grafico = {
 };
 
 function rotuloPonta(ponta) {
-  return ponta ? `${nomeCorretora(ponta.corretora)} ${NOMES_MERCADOS[ponta.mercado] || ponta.mercado}` : "";
+  return ponta ? rotuloCorretoraMercado(`${ponta.corretora}:${ponta.mercado}`) : "";
 }
 
 function abrirGrafico(chave, botao) {
@@ -1954,5 +2050,9 @@ function iniciar() {
 if (typeof document !== "undefined") {
   iniciar();
 } else if (typeof module !== "undefined" && module.exports) {
-  module.exports = { lerNumeroDigitado, numeroParaCampo, ordenar, valorParaOrdenar, chaveDoSinal, estado };
+  module.exports = {
+    lerNumeroDigitado, numeroParaCampo, ordenar, valorParaOrdenar, chaveDoSinal, estado,
+    nomeCorretora, mercadoNaPonta, rotuloCorretoraMercado, corretorasDoStatus, opcoesDasCorretoras, rotuloDoValorSalvo,
+    pct, pctFunding, textoReconexoes, tituloRpLiquido, TITULO_AVISO_COTACAO,
+  };
 }

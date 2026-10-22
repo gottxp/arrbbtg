@@ -462,11 +462,14 @@ def test_api_status_mostra_os_dados_de_verdade(tmp_path):
     m.estado.marcar_reconectada("gate")
     m.estado.marcar_desconectada("gate")
     banco = Banco(str(tmp_path / "a.db"))
-    corpo = TestClient(criar_app(m, banco, m.cfg, relogio=relogio)).get("/api/status").json()
+    # base_url: sem senha, o painel so aceita os nomes da propria maquina no Host (revisao final da interface).
+    corpo = TestClient(criar_app(m, banco, m.cfg, relogio=relogio), base_url="http://localhost:8000").get(
+        "/api/status").json()
     banco.fechar()
-    assert corpo["gate"] == {"estado": "reconectando", "atraso_medio_ms": None, "reconexoes": 1}
-    assert corpo["bitget"] == {"estado": "conectada", "atraso_medio_ms": 250.0, "reconexoes": 0}
-    assert corpo["mexc"] == {"estado": "atrasada", "atraso_medio_ms": None, "reconexoes": 0}
+    dois = ["spot", "futuro"]  # os mercados ligados de cada corretora (revisao final da interface, I2)
+    assert corpo["gate"] == {"estado": "reconectando", "atraso_medio_ms": None, "reconexoes": 1, "mercados": dois}
+    assert corpo["bitget"] == {"estado": "conectada", "atraso_medio_ms": 250.0, "reconexoes": 0, "mercados": dois}
+    assert corpo["mexc"] == {"estado": "atrasada", "atraso_medio_ms": None, "reconexoes": 0, "mercados": dois}
 
 
 # ---------------------------------------------------------------------------

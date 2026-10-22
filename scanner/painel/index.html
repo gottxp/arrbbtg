@@ -19,8 +19,13 @@
   <title>Scanner de Arbitragem</title>
   <link rel="stylesheet" href="estilo.css">
   <!-- Biblioteca do grafico (versao fixa). "async": se nao carregar (sem internet), o resto do
-       painel funciona igual; so o grafico mostra um aviso. -->
+       painel funciona igual; so o grafico mostra um aviso.
+       integrity (SRI): o navegador so roda o arquivo se ele for exatamente o do pacote npm
+       lightweight-charts@4.2.3 (sha384 do dist/lightweight-charts.standalone.production.js). Arquivo
+       diferente (CDN invadido ou trocado) e recusado como se nao tivesse carregado: o grafico avisa.
+       crossorigin="anonymous": exigido pelo integrity num arquivo de outro endereco. -->
   <script async src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"
+          integrity="sha384-stKllnUqA9AD0gsKCuUtf5XlqAW7PwIgDagoNsTWkjkBmJ/GZ/uHTgEBxdLV2VSK" crossorigin="anonymous"
           onerror="window.falhaBibliotecaGraficos = true"></script>
   <script defer src="app.js"></script>
 </head>

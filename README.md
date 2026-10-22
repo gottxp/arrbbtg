@@ -149,7 +149,7 @@ Use uma VPS com **Ubuntu 24.04** (já vem com o Python 3.12). Nos comandos, troq
    nano config.yaml
    ```
 
-2. No bloco `painel:` (perto do fim do arquivo), troque `usuario: null` e `senha: null` pelo seu usuário e senha. Use só letras e números, ou ponha a senha entre aspas. Deixe `host: 127.0.0.1` para usar o túnel SSH (recomendado, parte 3.5); só troque para `host: 0.0.0.0` se for abrir a porta na internet (parte 3.5, opção B). Fica assim (as linhas de comentário com `#` entre os itens podem ficar):
+2. No bloco `painel:` (perto do fim do arquivo), troque `usuario: null` e `senha: null` pelo seu usuário e senha. Use só letras e números, ou ponha a senha entre aspas. Deixe `host: 127.0.0.1` para usar o túnel SSH (recomendado, parte 3.5); só troque para `host: 0.0.0.0` se for abrir a porta na internet (parte 3.5, opção B). Com `host: 0.0.0.0` sem usuário e senha, o scanner não liga. Fica assim (as linhas de comentário com `#` entre os itens podem ficar):
 
 ```yaml
 painel:
@@ -355,6 +355,9 @@ Com o scanner ligado, abra <http://localhost:8000> e confira:
 6. **Corretoras:** no rodapé, todas com bolinha verde (conectada). Laranja = reconectando; vermelha = atrasada.
 7. **PEPE:** digite `PEPE` em **Buscar moeda**. Se aparecer um sinal entre o futuro da Hyperliquid (kPEPE) e a MEXC ou BingX (1000PEPE), os preços das duas pontas têm que estar próximos (é o mesmo ativo, já ajustado).
 8. **Farm com Lighter:** clique em **Farm**. Os sinais com ponta na Lighter mostram `Custo a cada $1.000`, e os preços batem com o app da Lighter.
+9. **Última atualização sem sinais:** com a tabela vazia (ex.: digite `99` em **Spread mín. (A atual)**), o horário de `Última atualização` muda a cada 5 s. Apague o `99`.
+10. **Corretoras 2 (ponta short):** abra a lista. Só aparecem os mercados ligados: `Hyperliquid futuros` sim, `Hyperliquid spot` não; `Kraken Pro spot` e `Kraken Futuros` (com a krakenfutures ligada) aparecem uma vez cada.
+11. **Funding com 4 casas:** num sinal com ponta na Hyperliquid ou na Lighter, o `FR` aparece com 4 casas, ex.: `+0,0012% (1h)`.
 
 ### Marco 4: testes técnicos (especificação, seção 9)
 
@@ -586,7 +589,7 @@ Tem que aparecer `recursos: memoria NNN.N MB (atual), ...`. Se aparecer `memoria
 
 | Bloco | Campo | O que faz |
 | --- | --- | --- |
-| Corretoras | Corretoras 1 (ponta long) | só sinais com a ponta long nessas corretoras (`Gate spot` = só o spot; `Gate (todos)` = spot e futuro). Vazio = todas |
+| Corretoras | Corretoras 1 (ponta long) | só sinais com a ponta long nessas corretoras (`Gate spot` = só o spot; `Gate (todos)` = spot e futuro). A lista mostra só os mercados ligados de cada corretora. Marcado com `(desligado)` (ex.: `kraken:futuro (desligado)`, de um grupo antigo) não pega nenhum sinal: desmarque. Vazio = todas |
 | Corretoras | Corretoras 2 (ponta short) | o mesmo para a ponta short |
 | Corretoras | Tipos de oportunidade | Spot — Futuros e/ou Futuros — Futuros |
 | Geral | Período das métricas (h) | janela do Histórico e das métricas. Vazio = o do `config.yaml` (4 h). Mudar zera as janelas |
@@ -623,12 +626,12 @@ Verde = positivo; vermelho = negativo. Linha com faixa amarela à esquerda = fix
   - `desde HH:MM:SS`: quando o sinal apareceu (Brasília; passe o mouse para ver o dia).
 - **Ponta long / Ponta short**:
   - linha 1: corretora, mercado (`spot` ou `futuros`), preço (já em USDT), `(Long)` ou `(Short)`, lote agora em $ e, entre parênteses, o lote médio do período. Passe o mouse para ver o símbolo na corretora e a taxa taker usada;
-  - linha 2: `VOL` volume 24h; `FR` funding com o intervalo, ex.: `+0,01% (8h)` (`—` no spot); `MAX` limite de ordem (`—` na v1); `VAR` variação 24h;
-  - `Kraken Pro` aparece tanto para a kraken (spot) quanto para a krakenfutures (futuros): diferencie pelo mercado.
+  - linha 2: `VOL` volume 24h; `FR` funding com o intervalo e 4 casas, ex.: `+0,0100% (8h)` (`—` no spot); `MAX` limite de ordem (`—` na v1); `VAR` variação 24h;
+  - nomes: `Kraken Pro spot` = a kraken; `Kraken Futuros` = a krakenfutures; `Lighter Robinhood` = a lighter_rh.
 - **Resultado**:
   - `A` spread de abertura agora; `F` spread de fechamento agora;
-  - `FR Yield`: funding líquido (recebido na short menos pago na long), normalizado para 8h;
-  - destaque `RP líq.` (RP bruto − taxas − slippage extra + funding esperado), com o `bruto` ao lado. No modo comparação o destaque é o `RP bruto`, com o `líq.` ao lado. Passe o mouse para ver as taxas e o funding esperado;
+  - `FR Yield`: funding líquido (recebido na short menos pago na long), normalizado para 8h, com 4 casas;
+  - destaque `RP líq.` (RP bruto − taxas − slippage extra + funding esperado), com o `bruto` ao lado. No modo comparação o destaque é o `RP bruto`, com o `líq.` ao lado. Passe o mouse para ver as taxas, a margem de slippage e o funding esperado;
   - modo Farm: `Custo a cada $1.000` de volume (vermelho = você gasta; verde = você ganha).
 - **Histórico (4h)**:
   - `N invertidas` no período;
@@ -638,11 +641,11 @@ Verde = positivo; vermelho = negativo. Linha com faixa amarela à esquerda = fix
 
 ### 5.4 Barra de status (rodapé)
 
-- `Última atualização`: horário de Brasília, com milissegundos, da última mensagem que o painel recebeu.
+- `Última atualização`: horário de Brasília, com milissegundos, da última mensagem que o painel recebeu do scanner. Sem sinais, o scanner manda um sinal de vida a cada 5 s, então o horário continua andando. `Ao vivo` com o horário parado há mais de 10 s = a conexão travou: aperte F5.
 - `N oportunidades` (ou `X de N oportunidades` quando a busca esconde alguns).
 - Conexão do painel com o scanner: `Ao vivo`; `Sem conexão: tentando de novo em Ns` (a tabela fica apagada). Não é a internet das corretoras: é o scanner desligado ou o túnel caído.
 - `PAUSADO`: a tabela está parada (botão **Pausar**).
-- Uma bolinha por corretora: verde = conectada; laranja = reconectando; vermelha = atrasada (sem mensagem há mais de 2 s). Passe o mouse para ver o atraso médio em ms e as reconexões.
+- Uma bolinha por corretora: verde = conectada; laranja = reconectando; vermelha = atrasada (sem mensagem há mais de 2 s). Passe o mouse para ver o atraso médio em ms e as reconexões. `Kraken Pro spot` e `Kraken Futuros` são bolinhas separadas.
 - **Buscar moeda**: filtra só a tela, pela moeda (`BTC` acha `BTC/USDT`).
 - **Pausar / Continuar**: congela a tabela; os dados continuam chegando por trás.
 
@@ -655,7 +658,7 @@ Verde = positivo; vermelho = negativo. Linha com faixa amarela à esquerda = fix
 - Duas linhas: preço da ponta long (azul) e da short (vermelha).
 - Mouse em cima: horário, preço e lote de cada ponta, spread naquele ponto e `Spread médio HH:MM – HH:MM` (daquele ponto até agora).
 - `Esc` ou o X fecha.
-- `Não deu para carregar a biblioteca do gráfico`: o gráfico vem da internet (unpkg.com); o resto do painel funciona.
+- `Não deu para carregar a biblioteca do gráfico`: o gráfico vem da internet (unpkg.com); o resto do painel funciona. O navegador só aceita o arquivo exato da versão 4.2.3 (conferido pelo hash); se o arquivo do unpkg mudar, o gráfico fica desligado (veja a parte 8).
 
 ### 5.6 Limitações conhecidas (o que você vê e é assim mesmo)
 
@@ -664,7 +667,6 @@ Verde = positivo; vermelho = negativo. Linha com faixa amarela à esquerda = fix
 - O "dia" da validação é o dia UTC de quando o sinal apareceu: vira às 21:00 de Brasília. Sinal das 22:00 de Brasília conta no dia seguinte.
 - Várias abas com o mesmo grupo de filtros: a aba aberta há mais tempo, ao mudar um filtro, grava o formulário velho dela no grupo inteiro. Use o painel numa aba só. O último navegador aberto define os filtros do scanner.
 - As colunas `MAX` e a etiqueta `STOCK` ficam vazias na v1.
-- O filtro de corretoras mostra uma opção `spot` também para corretoras só de futuros (Hyperliquid, XT, Lighter); ela não pega nenhum sinal.
 - `Funding sincronizado` só confere se as pontas têm o mesmo intervalo de cobrança (não o horário da próxima cobrança).
 
 ---
@@ -737,7 +739,7 @@ painel:
   senha: "troque-por-uma-senha-forte"
 ```
 
-Sem senha: `usuario: null` e `senha: null`. Usuário sem senha (ou o contrário) impede o scanner de ligar.
+Sem senha: `usuario: null` e `senha: null`, só com `host: 127.0.0.1` (ou `localhost`). Usuário sem senha (ou o contrário), ou `host: 0.0.0.0` sem usuário e senha, impede o scanner de ligar.
 
 ### Todos os campos
 
@@ -791,7 +793,7 @@ O padrão vale quando a linha não está no `config.yaml`.
 | `tempo_max_livro_completo_lighter_s` | `10` | s | livro completo que não chega é pedido de novo |
 | `mudancas_sem_livro_completo_lighter` | `10` | mensagens | mudanças sem livro completo para avisar no log |
 | `tempo_min_modo_etapa1_lighter_s` | `300` | s | tempo mínimo em cada modo da etapa 1 da Lighter |
-| `painel.host` | `127.0.0.1` | — | endereço do painel (0.0.0.0 = internet) |
+| `painel.host` | `127.0.0.1` | — | endereço do painel (0.0.0.0 = internet, só com usuário e senha) |
 | `painel.porta` | `8000` | — | porta do painel |
 | `painel.usuario` | `null` | — | usuário do painel (null = sem senha) |
 | `painel.senha` | `null` | — | senha do painel |
@@ -875,4 +877,8 @@ Para qualquer erro fora desta tabela: copie a mensagem inteira (e as linhas em v
 | `o pacote 'websockets' nao esta instalado: o painel ao vivo (/ws/sinais) nao vai funcionar. Instale com: pip install websockets` (o painel fica em `Sem conexão: tentando de novo em Ns`) | Rode `.venv\Scripts\python -m pip install -r requirements.txt` (VPS: `.venv/bin/python -m pip install -r requirements.txt`) e religue. |
 | `Could not request local forwarding.` ao abrir o túnel SSH | A porta 8000 do PC está ocupada (o scanner do PC ligado). Use `ssh -L 8001:127.0.0.1:8000 usuario@IP` e abra <http://localhost:8001>. |
 | O navegador pede usuário e senha e não aceita | Use exatamente o `painel.usuario` e o `painel.senha` do `config.yaml` da VPS (maiúsculas contam). |
+| `Erro na configuracao: painel.host 0.0.0.0 abre o painel para fora desta maquina, e ele esta sem senha: ...` | Escolha um: preencha `painel.usuario` e `painel.senha` (parte 3.2); ou volte para `host: 127.0.0.1` e abra o painel pelo túnel SSH (parte 3.5, opção A). Rode `--validar` até dar `config ok`. |
+| `Invalid host header` no navegador | O painel sem senha só abre por <http://localhost:8000> ou <http://127.0.0.1:8000> (proteção contra sites que se passam pelo seu PC). Abra por um desses endereços. |
+| `pedido recusado: veio de uma pagina de outro site` na caixa vermelha dos filtros | O painel só aceita mudanças vindas dele mesmo. Abra o painel direto pelo endereço (<http://localhost:8000>, ou `http://IP:8000` na opção B) e aperte F5. |
+| Gráfico com `Não deu para carregar a biblioteca do gráfico` e a internet funcionando | Aperte F12 > aba **Console**. Se aparecer `Failed to find a valid digest in the 'integrity' attribute`, o arquivo do gráfico no unpkg.com mudou e foi bloqueado por segurança: o resto do painel funciona; mande a mensagem ao desenvolvedor. |
 | Testes com `failed` ou `error` | Não ligue o scanner. Copie a saída inteira do `pytest` e mande. |

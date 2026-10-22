@@ -265,8 +265,8 @@ tempo_min_modo_etapa1_lighter_s: 300
 #   Quando mexer: no PC deixe como esta; na VPS preencha usuario e senha (veja o README, parte 3).
 painel:
   # Endereco onde o painel escuta: 127.0.0.1 = so a propria maquina (no PC e na VPS com tunel SSH); 0.0.0.0 =
-  #   aberto para a internet (so com usuario e senha). Unidade: endereco IP. Padrao: 127.0.0.1.
-  #   Quando mexer: so na VPS, para abrir a porta na internet (README, parte 3.5, opcao B).
+  #   aberto para a internet (so com usuario e senha: sem eles, o scanner nao liga). Unidade: endereco IP.
+  #   Padrao: 127.0.0.1. Quando mexer: so na VPS, para abrir a porta na internet (README, parte 3.5, opcao B).
   host: 127.0.0.1
   # Porta do painel (http://localhost:8000). Unidade: numero inteiro de 1 a 65535. Padrao: 8000.
   #   Quando mexer: se o log disser que a porta ja esta em uso.

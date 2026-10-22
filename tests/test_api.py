@@ -14,15 +14,19 @@ import signal
 import socket
 import time
 from dataclasses import replace
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from starlette.testclient import WebSocketDenialResponse
 from starlette.websockets import WebSocketDisconnect
+from websockets.asyncio.client import connect as conectar_ws
+from websockets.exceptions import InvalidStatus
 
 import scanner.__main__ as principal
 from scanner.api import Transmissor, conferir_painel, criar_app, servir_api
+from scanner.api import app as modulo_app
 from scanner.api import servidor as modulo_servidor
 from scanner.armazenamento import Banco
 from scanner.config.carregar import ErroConfig
@@ -81,10 +85,26 @@ def motor(banco):
     return m
 
 
+# O endereco que o navegador usa no PC (e pelo tunel SSH). Sem senha, o painel so aceita os nomes da
+# propria maquina no cabecalho Host (o "testserver" padrao do TestClient seria recusado).
+BASE = "http://localhost:8000"
+OUTRO_SITE = "http://site-de-fora.test"
+
+
+class ClienteDoPainel(TestClient):
+    """TestClient no endereco BASE, inclusive no WebSocket (o original sempre usa ws://testserver)."""
+
+    def __init__(self, app, **opcoes):
+        super().__init__(app, base_url=BASE, **opcoes)
+
+    def websocket_connect(self, url, *argumentos, **opcoes):
+        return super().websocket_connect(urljoin(BASE.replace("http", "ws", 1), url), *argumentos, **opcoes)
+
+
 def montar_cliente(motor, banco, painel=None, relogio=lambda: AGORA, **extras) -> TestClient:
     """TestClient da API do `motor`; `painel` troca campos do bloco painel da Config (usuario, senha...)."""
     config = replace(motor.cfg, painel={**motor.cfg.painel, **(painel or {})})
-    return TestClient(criar_app(motor, banco, config, relogio=relogio, **extras))
+    return ClienteDoPainel(criar_app(motor, banco, config, relogio=relogio, **extras))
 
 
 @pytest.fixture
@@ -455,9 +475,10 @@ def test_status_por_corretora_tem_formato_estavel(cliente, motor):
     corpo = cliente.get("/api/status").json()
     assert set(corpo) == set(motor.cfg.corretoras) == {"mexc", "gate", "bitget"}
     # gate e bitget mandaram mensagem em t = 10 s (agora do teste); a mexc nunca mandou.
-    assert corpo["gate"] == {"estado": "conectada", "atraso_medio_ms": None, "reconexoes": 0}
-    assert corpo["bitget"] == {"estado": "conectada", "atraso_medio_ms": None, "reconexoes": 0}
-    assert corpo["mexc"] == {"estado": "atrasada", "atraso_medio_ms": None, "reconexoes": 0}
+    dois = ["spot", "futuro"]
+    assert corpo["gate"] == {"estado": "conectada", "atraso_medio_ms": None, "reconexoes": 0, "mercados": dois}
+    assert corpo["bitget"] == {"estado": "conectada", "atraso_medio_ms": None, "reconexoes": 0, "mercados": dois}
+    assert corpo["mexc"] == {"estado": "atrasada", "atraso_medio_ms": None, "reconexoes": 0, "mercados": dois}
 
 
 def test_status_usa_o_relogio_da_api(motor, banco):
@@ -473,8 +494,23 @@ def test_status_repassa_o_que_o_motor_informar(cliente, motor, monkeypatch):
         "bitget": {"estado": "conectada"},
     })
     assert cliente.get("/api/status").json() == {
-        "gate": {"estado": "reconectando", "atraso_medio_ms": 123.5, "reconexoes": 3},
-        "bitget": {"estado": "conectada", "atraso_medio_ms": None, "reconexoes": 0},
+        "gate": {"estado": "reconectando", "atraso_medio_ms": 123.5, "reconexoes": 3, "mercados": ["spot", "futuro"]},
+        "bitget": {"estado": "conectada", "atraso_medio_ms": None, "reconexoes": 0, "mercados": ["spot", "futuro"]},
+    }
+
+
+def test_status_manda_os_mercados_ligados_de_cada_corretora(motor, banco, monkeypatch):
+    # O painel monta as opcoes de "Corretoras 1/2" so com estes mercados (revisao final, I2).
+    nomes = ["gate", "hyperliquid", "kraken", "krakenfutures", "lighter", "lighter_rh"]
+    config = replace(motor.cfg, corretoras=nomes, mercados_por_corretora={
+        "hyperliquid": ("futuro",), "kraken": ("spot",), "krakenfutures": ("futuro",),
+        "lighter_rh": ("spot", "futuro"),  # a Lighter so tem futuros, mesmo que o config diga outra coisa
+    })
+    monkeypatch.setattr(motor, "status", lambda agora: {nome: {"estado": "conectada"} for nome in nomes})
+    corpo = ClienteDoPainel(criar_app(motor, banco, config)).get("/api/status").json()
+    assert {nome: corpo[nome]["mercados"] for nome in nomes} == {
+        "gate": ["spot", "futuro"], "hyperliquid": ["futuro"], "kraken": ["spot"], "krakenfutures": ["futuro"],
+        "lighter": ["futuro"], "lighter_rh": ["futuro"],
     }
 
 
@@ -565,6 +601,12 @@ def test_senha_vale_para_todas_as_rotas_da_api(cliente_com_senha, metodo, caminh
     r = cliente_com_senha.request(metodo, caminho, json={})
     assert r.status_code == 401
     assert r.headers["www-authenticate"].startswith("Basic")
+
+
+def test_pedido_de_senha_avisa_que_a_senha_vai_em_utf8(cliente_com_senha):
+    # Sem o charset, alguns navegadores mandam a senha com acento em latin-1 e ela nunca confere.
+    r = cliente_com_senha.get("/api/sinais")
+    assert r.headers["www-authenticate"] == 'Basic realm="scanner", charset="UTF-8"'
 
 
 @pytest.mark.parametrize("auth", [("jr", "errada"), ("outro", "segredo"), ("jr", ""), ("", ""), ("JR", "segredo"),
@@ -669,6 +711,147 @@ def test_main_recusa_usuario_sem_senha_antes_de_conectar(tmp_path, capsys, monke
     assert principal.main(["--config", str(arquivo), "--validar"]) == 1  # o --validar tambem acusa
 
 
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.0.10", "203.0.113.5", "::", "meu-pc.local"])
+def test_nao_sobe_com_host_aberto_para_fora_sem_senha(motor, banco, host):
+    # Revisao final, I1: na VPS, host 0.0.0.0 sem usuario e senha deixaria qualquer um trocar a sessao do motor.
+    config = replace(motor.cfg, painel={**motor.cfg.painel, "host": host})
+    with pytest.raises(ErroConfig, match="painel.host") as erro:
+        conferir_painel(config)
+    mensagem = str(erro.value)
+    assert host in mensagem and "painel.usuario" in mensagem and "painel.senha" in mensagem  # como resolver
+    assert "127.0.0.1" in mensagem and "tunel SSH" in mensagem  # ou o outro jeito
+    with pytest.raises(ErroConfig, match="painel.host"):
+        criar_app(motor, banco, config)
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "LocalHost", "::1", "127.0.0.2"])
+def test_host_da_propria_maquina_sem_senha_sobe(motor, host):
+    conferir_painel(replace(motor.cfg, painel={**motor.cfg.painel, "host": host}))
+
+
+def test_host_aberto_com_usuario_e_senha_sobe(motor):
+    conferir_painel(replace(motor.cfg, painel={**motor.cfg.painel, "host": "0.0.0.0", "usuario": "jr", "senha": "x"}))
+
+
+def test_main_recusa_host_aberto_sem_senha_inclusive_no_validar(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(principal, "rodar", lambda *a, **k: pytest.fail("nao deveria subir o scanner"))
+    arquivo = tmp_path / "config.yaml"
+    arquivo.write_text("painel:\n  host: 0.0.0.0\n")
+    assert principal.main(["--config", str(arquivo)]) == 1
+    assert "painel.host" in capsys.readouterr().err
+    assert principal.main(["--config", str(arquivo), "--validar"]) == 1
+    assert "painel.host" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Pedidos de outro site (Origin) e nome do endereco (Host)
+# ---------------------------------------------------------------------------
+#
+# Um site aberto no mesmo navegador consegue mandar pedidos ao painel (o navegador anexa a senha
+# guardada) e abrir o WebSocket. O cabecalho Origin diz de que pagina o pedido veio: se veio de outra,
+# mudancas (PUT, POST, DELETE) e o WebSocket sao recusados. Sem Origin (curl, scripts) passa.
+
+MUDANCAS = [
+    ("PUT", "/api/sessao", {"modo": "lucro", "filtros": {"apenas_mostrar": ["NADA"]}, "comparacao": False}),
+    ("POST", "/api/filtros/Roubado", {"lista_negra": ["ETH"]}),
+    ("DELETE", "/api/filtros/Default", None),
+]
+ORIGENS_DE_FORA = [OUTRO_SITE, "http://localhost:9999", "https://localhost:8000.site-de-fora.test", "null"]
+
+
+@pytest.mark.parametrize("metodo, caminho, corpo", MUDANCAS)
+@pytest.mark.parametrize("origem", ORIGENS_DE_FORA)
+def test_mudanca_pedida_por_outro_site_da_403_e_nao_muda_nada(cliente, motor, banco, metodo, caminho, corpo, origem):
+    assert cliente.post("/api/filtros/Default", json={"volume_min_usd": 1}).status_code == 200  # sem Origin: passa
+    antes = sessao_em_uso(motor)
+    r = cliente.request(metodo, caminho, json=corpo, headers={"Origin": origem})
+    assert r.status_code == 403 and "outro site" in r.json()["detail"]
+    conferir_sessao_intacta(cliente, motor, antes)
+    assert banco.listar_grupos() == {"Default": Filtros(volume_min_usd=1).para_dict()}
+
+
+@pytest.mark.parametrize("metodo, caminho, corpo", MUDANCAS)
+def test_outro_site_com_a_senha_guardada_no_navegador_tambem_e_recusado(motor, banco, metodo, caminho, corpo):
+    cliente = montar_cliente(motor, banco, painel={"usuario": "jr", "senha": "segredo"})
+    antes = sessao_em_uso(motor)
+    r = cliente.request(metodo, caminho, json=corpo, headers={"Origin": OUTRO_SITE}, auth=("jr", "segredo"))
+    assert r.status_code == 403
+    assert motor.sessao is antes and "Roubado" not in banco.listar_grupos()
+
+
+def test_mudanca_pedida_pelo_proprio_painel_passa(cliente, motor):
+    # O navegador manda o Origin da pagina do painel: o mesmo endereco do Host (maiusculas nao contam).
+    proprio = {"Origin": "http://localhost:8000"}
+    r = cliente.put("/api/sessao", json={"modo": "farm", "filtros": {}, "comparacao": True}, headers=proprio)
+    assert r.status_code == 200 and motor.sessao.modo == "farm"
+    assert cliente.post("/api/filtros/G", json={}, headers={"Origin": "http://LOCALHOST:8000"}).status_code == 200
+    assert cliente.delete("/api/filtros/G", headers=proprio).status_code == 200
+
+
+def test_mudanca_sem_origin_passa(cliente, motor):
+    # Ferramentas como o curl nao mandam Origin (e nao carregam a senha guardada no navegador).
+    r = cliente.put("/api/sessao", json={"modo": "farm", "filtros": {}, "comparacao": False})
+    assert r.status_code == 200 and motor.sessao.modo == "farm"
+
+
+def test_leitura_com_origin_de_fora_nao_e_barrada_aqui(cliente):
+    # GET e HEAD nao mudam nada, e o navegador nao entrega a resposta a outro site (o painel nao libera CORS).
+    assert cliente.get("/api/sinais", headers={"Origin": OUTRO_SITE}).status_code == 200
+
+
+@pytest.mark.parametrize("origem", ORIGENS_DE_FORA)
+def test_ws_aberto_por_outro_site_e_recusado_antes_de_aceitar(cliente, origem):
+    with pytest.raises(WebSocketDisconnect) as erro:
+        with cliente.websocket_connect("/ws/sinais", headers={"Origin": origem}):
+            pass
+    assert erro.value.code == 1008  # no uvicorn de verdade o navegador recebe HTTP 403
+    assert cliente.app.state.transmissor.clientes == 0
+
+
+def test_ws_de_outro_site_com_a_senha_certa_tambem_e_recusado(cliente_com_senha):
+    with pytest.raises(WebSocketDisconnect) as erro:
+        cabecalhos = {**basic("jr", "segredo"), "Origin": OUTRO_SITE}
+        with cliente_com_senha.websocket_connect("/ws/sinais", headers=cabecalhos):
+            pass
+    assert erro.value.code == 1008
+
+
+def test_ws_aberto_pelo_proprio_painel_conecta(cliente, cliente_com_senha):
+    with cliente.websocket_connect("/ws/sinais", headers={"Origin": "http://localhost:8000"}) as ws:
+        assert ws.receive_json()["tipo"] == "snapshot"
+    cabecalhos = {**basic("jr", "segredo"), "Origin": "http://localhost:8000"}
+    with cliente_com_senha.websocket_connect("/ws/sinais", headers=cabecalhos) as ws:
+        assert ws.receive_json()["tipo"] == "snapshot"
+
+
+@pytest.mark.parametrize("host", ["localhost:8000", "localhost", "127.0.0.1:8000", "127.0.0.1", "[::1]:8000", "[::1]",
+                                  "LOCALHOST:8001"])
+def test_sem_senha_aceita_os_nomes_da_propria_maquina(cliente, host):
+    # O tunel SSH chega como localhost:8000 (ou a porta do PC escolhida no ssh -L).
+    assert cliente.get("/api/sinais", headers={"Host": host}).status_code == 200
+
+
+@pytest.mark.parametrize("host", ["site-de-fora.test", "site-de-fora.test:8000", "192.168.0.10:8000",
+                                  "127.0.0.1.nip.io:8000", "localhost.site-de-fora.test"])
+def test_sem_senha_recusa_outro_nome_no_host(cliente, motor, host):
+    # DNS rebinding: um site cujo nome passa a apontar para 127.0.0.1 fala com o painel como se fosse ele mesmo
+    # (o Origin e o Host batem). Sem senha, so os nomes da propria maquina sao aceitos.
+    antes = sessao_em_uso(motor)
+    corpo = {"modo": "lucro", "filtros": {}, "comparacao": False}
+    assert cliente.put("/api/sessao", json=corpo, headers={"Host": host}).status_code == 400
+    assert cliente.get("/api/sinais", headers={"Host": host}).status_code == 400
+    with pytest.raises((WebSocketDisconnect, WebSocketDenialResponse)):
+        with cliente.websocket_connect("/ws/sinais", headers={"Host": host}) as ws:
+            ws.receive_json()
+    conferir_sessao_intacta(cliente, motor, antes)
+
+
+def test_com_senha_o_nome_do_endereco_nao_importa(cliente_com_senha):
+    # Com senha (VPS, host 0.0.0.0) o painel e aberto pelo IP ou por um nome do dono: quem protege e a senha.
+    r = cliente_com_senha.get("/api/sinais", auth=("jr", "segredo"), headers={"Host": "203.0.113.5:8000"})
+    assert r.status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # WebSocket /ws/sinais
 # ---------------------------------------------------------------------------
@@ -755,6 +938,37 @@ def test_ws_exige_senha(cliente_com_senha):
 def test_ws_com_senha_certa_conecta(cliente_com_senha):
     with cliente_com_senha.websocket_connect("/ws/sinais", headers=basic("jr", "segredo")) as ws:
         assert ws.receive_json()["tipo"] == "snapshot"
+
+
+def test_ws_manda_sinal_de_vida_quando_nao_ha_eventos(motor, banco):
+    # Revisao final, Minor 9: sem sinais nao ha eventos, e a "Ultima atualizacao" do painel congelava.
+    cliente = montar_cliente(motor, banco, intervalo_vivo_s=0.05)
+    with cliente.websocket_connect("/ws/sinais") as ws:
+        assert ws.receive_json()["tipo"] == "snapshot"
+        assert ws.receive_json() == {"tipo": "vivo"}
+        assert ws.receive_json() == {"tipo": "vivo"}
+
+
+def test_ws_sinal_de_vida_nao_atrapalha_os_eventos(motor, banco):
+    cliente = montar_cliente(motor, banco, intervalo_vivo_s=0.05)
+    with cliente:
+        with cliente.websocket_connect("/ws/sinais") as ws:
+            assert ws.receive_json()["tipo"] == "snapshot"
+            eventos = [Evento("novo", {"id": str(i)}, True) for i in range(3)]
+            publicar(cliente, eventos)
+            recebidos = []
+            while len(recebidos) < 3:
+                mensagem = ws.receive_json()
+                if mensagem["tipo"] != "vivo":
+                    recebidos.append(mensagem)
+    assert recebidos == [{"tipo": "novo", "sinal": {"id": str(i)}} for i in range(3)]  # nada perdido, na ordem
+
+
+def test_sinal_de_vida_padrao_a_cada_poucos_segundos(motor, banco):
+    assert 1 <= modulo_app.INTERVALO_VIVO_S <= 10
+    assert inspect.signature(criar_app).parameters["intervalo_vivo_s"].default == modulo_app.INTERVALO_VIVO_S
+    with pytest.raises(ValueError, match="intervalo_vivo_s"):
+        criar_app(motor, banco, motor.cfg, intervalo_vivo_s=0)
 
 
 # ---------------------------------------------------------------------------
@@ -969,6 +1183,52 @@ def test_servir_api_sobe_responde_e_para_limpo_ao_ser_cancelado(motor, banco):
         assert signal.getsignal(signal.SIGINT) is sigint_antes
 
     asyncio.run(asyncio.wait_for(cenario(), timeout=15))
+
+
+def test_uvicorn_de_verdade_recusa_outro_site_e_outro_nome_e_aceita_o_painel(motor, banco):
+    # No uvicorn de verdade o WebSocket recusado chega ao navegador como HTTP 403 (nao como o codigo 1008).
+    porta = porta_livre()
+    config = replace(motor.cfg, painel={"host": "127.0.0.1", "porta": porta, "usuario": None, "senha": None})
+    app = criar_app(motor, banco, config, relogio=lambda: AGORA, intervalo_vivo_s=0.2)
+    endereco = f"ws://127.0.0.1:{porta}/ws/sinais"
+
+    async def cenario():
+        tarefa = asyncio.create_task(servir_api(app, config))
+        # trust_env=False e proxy=None: sem passar por proxy da maquina (o nome de fora nao existe de verdade).
+        async with httpx.AsyncClient(trust_env=False) as http:
+            for _ in range(200):  # espera ate ~10 s o servidor abrir a porta
+                try:
+                    await http.get(f"http://127.0.0.1:{porta}/api/sinais")
+                    break
+                except httpx.ConnectError:
+                    assert not tarefa.done(), tarefa.exception()
+                    await asyncio.sleep(0.05)
+            corpo = {"modo": "farm", "filtros": {}, "comparacao": False}
+            de_fora = await http.put(f"http://127.0.0.1:{porta}/api/sessao", json=corpo, headers={"Origin": OUTRO_SITE})
+            assert de_fora.status_code == 403
+            outro_nome = await http.get(f"http://127.0.0.1:{porta}/api/sinais", headers={"Host": "site-de-fora.test"})
+            assert outro_nome.status_code == 400
+            assert (await http.get(f"http://localhost:{porta}/api/sinais")).status_code == 200  # o tunel SSH
+        assert motor.sessao.modo == "lucro"
+
+        async with conectar_ws(endereco, origin=f"http://127.0.0.1:{porta}", proxy=None) as ws:  # o proprio painel
+            assert json.loads(await ws.recv())["tipo"] == "snapshot"
+            assert json.loads(await ws.recv()) == {"tipo": "vivo"}
+        with pytest.raises(InvalidStatus) as erro:
+            async with conectar_ws(endereco, origin=OUTRO_SITE, proxy=None):
+                pass
+        assert erro.value.response.status_code == 403
+        with pytest.raises(InvalidStatus) as erro:  # nome de fora no Host (DNS rebinding)
+            async with conectar_ws(f"ws://site-de-fora.test:{porta}/ws/sinais", host="127.0.0.1", port=porta,
+                                   proxy=None):
+                pass
+        assert erro.value.response.status_code == 400
+        assert app.state.transmissor.clientes == 0
+        tarefa.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tarefa
+
+    asyncio.run(asyncio.wait_for(cenario(), timeout=20))
 
 
 def test_servir_api_avisa_quando_falta_a_biblioteca_de_websocket(monkeypatch, caplog):

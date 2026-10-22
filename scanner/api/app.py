@@ -10,11 +10,17 @@
 - GET    /api/sessao, PUT /api/sessao   modo, filtros e comparacao em uso pelo motor
 - GET    /api/status                 saude de cada corretora
 - GET    /api/validacao?dia=AAAA-MM-DD   metricas de validacao do dia UTC (padrao: hoje), por modo e corretora
-- WS     /ws/sinais                  um retrato dos sinais ao conectar e depois cada evento do motor
+- WS     /ws/sinais                  um retrato dos sinais ao conectar, depois cada evento do motor e, sem
+                                     evento por INTERVALO_VIVO_S, um {"tipo": "vivo"}
 - GET    /                           o painel web (arquivos de scanner/painel: index.html, app.js, estilo.css)
 
-Senha: com `painel.usuario` no config.yaml, TUDO exige HTTP Basic (rotas /api, WebSocket e os
-arquivos do painel). A conferencia e um middleware, entao rotas e arquivos novos ja nascem protegidos.
+Protecoes (middlewares: rotas e arquivos novos ja nascem protegidos):
+- Senha: com `painel.usuario` no config.yaml, TUDO exige HTTP Basic (rotas /api, WebSocket e os
+  arquivos do painel). Sem senha, o painel so sobe com host da propria maquina (veja `conferir_painel`).
+- Outro site: mudancas (PUT, POST, DELETE) e o WebSocket pedidos por uma pagina de outro site sao
+  recusados (veja `RecusarOutroSite`).
+- Sem senha, o cabecalho Host precisa ser um nome da propria maquina (localhost, 127.0.0.1, [::1]):
+  protege contra DNS rebinding (um site cujo nome passa a apontar para 127.0.0.1).
 
 Threads: as rotas que leem ou mudam o motor sao `async def`, ou seja, rodam no laco do asyncio,
 o mesmo do motor, e nunca no meio de um ciclo. As que so falam com o banco (que tem trava propria)
@@ -26,8 +32,10 @@ com `anyio.from_thread.run_sync`.
 import asyncio
 import base64
 import heapq
+import ipaddress
 import json
 import logging
+import math
 import mimetypes
 import secrets
 import time
@@ -35,16 +43,19 @@ from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import anyio
 from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, StrictBool
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from scanner.api.transmissor import Transmissor
 from scanner.armazenamento import Banco
+from scanner.coletores.lighter_formatos import e_lighter
 from scanner.config.carregar import Config, ErroConfig
 from scanner.filtros import Filtros
 from scanner.metricas.janela import MAIORES_N
@@ -53,10 +64,26 @@ from scanner.validacao import dia_utc, resumo_do_dia
 
 registro = logging.getLogger("scanner.api")
 
-# Fechamento do WebSocket: 1008 = violacao de politica (senha errada); 1013 = "tente de novo mais tarde"
-# (painel lento demais, derrubado pelo Transmissor: ele reconecta e recebe o snapshot de novo).
-CODIGO_SENHA_ERRADA = 1008
+# Codigos de fechamento do WebSocket.
+# CODIGO_RECUSADO (1008, "violacao de politica"): senha errada ou pedido de outro site, fechado ANTES de
+#   aceitar. So o TestClient mostra o 1008: no uvicorn de verdade o navegador recebe HTTP 403 e o painel
+#   ve uma falha comum de conexao.
+# CODIGO_PAINEL_LENTO (1013, "tente de novo mais tarde"): painel lento demais, derrubado pelo Transmissor
+#   (ele reconecta e recebe o snapshot de novo).
+CODIGO_RECUSADO = 1008
 CODIGO_PAINEL_LENTO = 1013
+
+# Sem nenhum evento por tanto tempo, o WebSocket manda {"tipo": "vivo"} ao painel: a "Ultima atualizacao"
+# continua andando sem sinais, e uma conexao que morreu calada aparece (o horario para). Em segundos.
+# Detalhe interno do servidor (como o TAMANHO_FILA_PADRAO do Transmissor), nao um limite de negocio.
+INTERVALO_VIVO_S = 5
+MENSAGEM_VIVO = json.dumps({"tipo": "vivo"})
+
+# Sem senha, so estes nomes sao aceitos no cabecalho Host (com qualquer porta): os da propria maquina.
+NOMES_DA_MAQUINA = ["localhost", "127.0.0.1", "[::1]"]
+
+# Metodos que so leem: passam mesmo com Origin de outro site (o navegador nao entrega a resposta a ele).
+METODOS_DE_LEITURA = ("GET", "HEAD")
 
 # A pasta do painel, achada a partir deste arquivo (scanner/api/app.py -> scanner/painel): funciona
 # de qualquer pasta em que o scanner for iniciado, no Windows e no Linux.
@@ -75,17 +102,38 @@ mimetypes.add_type("text/html", ".html")
 # ---------------------------------------------------------------------------
 
 
+def host_da_propria_maquina(host: str) -> bool:
+    """True para "localhost" e enderecos de loopback (127.x.x.x, ::1): so a propria maquina alcanca o painel.
+
+    Qualquer outro endereco (0.0.0.0, o IP da rede, um nome como "meu-pc.local") pode ser aberto de fora.
+    """
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:  # nao e um IP (e um nome): pode apontar para fora
+        return False
+
+
 def conferir_painel(cfg: Config) -> None:
     """Recusa (ErroConfig) um bloco `painel` que deixaria o painel aberto sem o dono querer.
 
-    Usuario sem senha, senha sem usuario e usuario vazio ou com ":" (o HTTP Basic nao aceita) param o scanner
-    com uma mensagem clara, em vez de subir sem protecao ou trancar o dono para fora.
+    Param o scanner com uma mensagem clara, em vez de subir sem protecao ou trancar o dono para fora:
+    - host que abre o painel para fora da maquina (ex.: 0.0.0.0) sem usuario e senha (especificacao, secao 10);
+    - usuario sem senha ou senha sem usuario;
+    - usuario vazio ou com ":" (o HTTP Basic nao aceita).
+    Vale ao ligar e no --validar (o __main__ chama esta funcao antes de conectar em qualquer coisa).
     """
     usuario, senha = cfg.painel.get("usuario"), cfg.painel.get("senha")
     if usuario is None:
         if senha:
             raise ErroConfig("painel.usuario: a senha esta preenchida mas falta o usuario; preencha painel.usuario "
                              "no config.yaml (ou apague painel.senha para deixar o painel aberto)")
+        host = cfg.painel["host"]
+        if not host_da_propria_maquina(host):
+            raise ErroConfig(f"painel.host {host} abre o painel para fora desta maquina, e ele esta sem senha: "
+                             "preencha painel.usuario e painel.senha no config.yaml (especificacao, secao 10), "
+                             "ou use host: 127.0.0.1 e abra o painel pelo tunel SSH (README, parte 3.5)")
         return
     if not usuario or ":" in usuario:
         raise ErroConfig("painel.usuario: precisa ser um texto nao vazio e sem o caractere ':'")
@@ -98,8 +146,9 @@ class ExigirSenha:
     """Middleware ASGI: so deixa passar quem mandou o usuario e a senha certos (HTTP Basic).
 
     Vale para pedidos HTTP (resposta 401 com o cabecalho que faz o navegador pedir a senha) e para o
-    inicio de conexoes WebSocket (fechadas com o codigo 1008 antes de aceitar). O navegador reenvia a
-    senha digitada sozinho nas conexoes WebSocket do mesmo endereco.
+    inicio de conexoes WebSocket (fechadas antes de aceitar: no uvicorn de verdade o navegador recebe
+    HTTP 403; so o TestClient mostra o codigo 1008, CODIGO_RECUSADO). O navegador reenvia a senha
+    digitada sozinho nas conexoes WebSocket do mesmo endereco.
     """
 
     def __init__(self, app: ASGIApp, usuario: str, senha: str):
@@ -111,10 +160,11 @@ class ExigirSenha:
         if scope["type"] not in ("http", "websocket") or self._autorizado(scope):
             await self.app(scope, receive, send)
         elif scope["type"] == "websocket":
-            await send({"type": "websocket.close", "code": CODIGO_SENHA_ERRADA})
+            await send({"type": "websocket.close", "code": CODIGO_RECUSADO})
         else:
+            # charset="UTF-8": o navegador manda a senha com acento em UTF-8 (sem isso, alguns usam latin-1).
             resposta = JSONResponse({"detail": "usuario ou senha invalidos"}, status_code=401,
-                                    headers={"WWW-Authenticate": 'Basic realm="scanner"'})
+                                    headers={"WWW-Authenticate": 'Basic realm="scanner", charset="UTF-8"'})
             await resposta(scope, receive, send)
 
     def _autorizado(self, scope: Scope) -> bool:
@@ -134,6 +184,57 @@ class ExigirSenha:
         return usuario_certo and senha_certa
 
 
+def _cabecalho(scope: Scope, nome: bytes) -> str | None:
+    """O valor do cabecalho `nome` (em minusculas, ex.: b"origin") do pedido, ou None se nao veio."""
+    return next((valor.decode("latin-1") for chave, valor in scope["headers"] if chave == nome), None)
+
+
+def pedido_de_outro_site(scope: Scope) -> bool:
+    """True se o pedido traz o cabecalho Origin e o endereco dele (host:porta) nao e o do cabecalho Host.
+
+    O navegador manda o Origin da pagina que fez o pedido. O painel aberto em http://localhost:8000 manda
+    "http://localhost:8000", igual ao Host "localhost:8000". Origin "null" (pagina sem endereco) nunca bate.
+    Sem Origin (curl, scripts, a barra de endereco) nao e de outro site.
+    """
+    origem = _cabecalho(scope, b"origin")
+    if origem is None:
+        return False
+    endereco = urlsplit(origem).netloc.lower() if "://" in origem else ""
+    host = (_cabecalho(scope, b"host") or "").lower()
+    return not endereco or endereco != host
+
+
+class RecusarOutroSite:
+    """Middleware ASGI: recusa mudancas e o WebSocket pedidos por uma pagina de outro site.
+
+    Um site aberto no mesmo navegador consegue mandar pedidos ao painel (o navegador anexa a senha que
+    guardou) e abrir o WebSocket, e cada versao do FastAPI barra uma parte diferente disso. Aqui a regra e
+    explicita, para qualquer versao:
+    - WebSocket de outro site: fechado antes de aceitar (no uvicorn de verdade, HTTP 403);
+    - PUT, POST, DELETE (e qualquer metodo que nao seja GET/HEAD) de outro site: HTTP 403, nada muda.
+    GET e HEAD passam: nao mudam nada, e o navegador nao entrega a resposta a outro site (o painel nao
+    libera CORS). Sem Origin tambem passa (veja `pedido_de_outro_site`).
+    """
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        confere = scope["type"] == "websocket" or (
+            scope["type"] == "http" and scope["method"] not in METODOS_DE_LEITURA)
+        if not confere or not pedido_de_outro_site(scope):
+            await self.app(scope, receive, send)
+            return
+        registro.debug("pedido de outro site recusado: %s %s (Origin %s)", scope.get("method", "WebSocket"),
+                       scope["path"], _cabecalho(scope, b"origin"))
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": CODIGO_RECUSADO})
+            return
+        resposta = JSONResponse({"detail": "pedido recusado: veio de uma pagina de outro site (cabecalho Origin "
+                                           "diferente do endereco do painel)"}, status_code=403)
+        await resposta(scope, receive, send)
+
+
 class ArquivosDoPainel(StaticFiles):
     """Os arquivos do painel, com `Cache-Control: no-cache`: o navegador pode guardar uma copia, mas
     confere com o servidor antes de usar (resposta 304 se nao mudou). Assim, depois de atualizar o
@@ -149,6 +250,15 @@ class ArquivosDoPainel(StaticFiles):
 # ---------------------------------------------------------------------------
 # Apoio das rotas
 # ---------------------------------------------------------------------------
+
+
+def mercados_ligados(cfg: Config, corretora: str) -> tuple[str, ...]:
+    """Os mercados da corretora que entram no scanner ("spot" e/ou "futuro").
+
+    A Lighter (lighter e lighter_rh, conector proprio) so le futuros; as outras usam os de
+    mercados_por_corretora (ou os dois, se ela nao estiver la).
+    """
+    return ("futuro",) if e_lighter(corretora) else cfg.mercados_da_corretora(corretora)
 
 
 class CorpoSessao(BaseModel):
@@ -214,22 +324,32 @@ def criar_app(
     cfg: Config,
     transmissor: Transmissor | None = None,
     relogio: Callable[[], float] = time.time,
+    intervalo_vivo_s: float = INTERVALO_VIVO_S,
 ) -> FastAPI:
     """Monta a API do painel.
 
     transmissor: quem entrega os eventos aos paineis; sem ele, cria um (fica em `app.state.transmissor`,
         e o `__main__` chama `publicar` nele a cada ciclo do motor).
     relogio: hora atual em segundos desde 1970 (os testes passam um relogio fixo).
+    intervalo_vivo_s: segundos sem evento ate o WebSocket mandar {"tipo": "vivo"} (veja INTERVALO_VIVO_S).
     Levanta ErroConfig se o bloco `painel` da Config for inseguro (veja `conferir_painel`).
     """
     conferir_painel(cfg)
+    if isinstance(intervalo_vivo_s, bool) or not (isinstance(intervalo_vivo_s, (int, float)) and
+                                                  0 < intervalo_vivo_s < math.inf):
+        raise ValueError(f"intervalo_vivo_s precisa ser um numero maior que zero (recebi {intervalo_vivo_s!r})")
     transmissor = transmissor if transmissor is not None else Transmissor()
 
     # Sem /docs, /redoc e /openapi.json: a documentacao automatica ficaria aberta mesmo com senha.
     app = FastAPI(title="Scanner de arbitragem", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.motor, app.state.banco, app.state.transmissor = motor, banco, transmissor
+    # Middlewares: o ultimo acrescentado e o primeiro a ver o pedido. Ordem: Host, outro site, senha.
     if cfg.painel.get("usuario") is not None:
         app.add_middleware(ExigirSenha, usuario=cfg.painel["usuario"], senha=cfg.painel["senha"])
+    app.add_middleware(RecusarOutroSite)
+    if cfg.painel.get("usuario") is None:
+        # Sem senha o host e da propria maquina (conferir_painel garante): so os nomes dela valem no Host.
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=NOMES_DA_MAQUINA)
 
     # --- Sinais e historico --------------------------------------------------
 
@@ -311,16 +431,18 @@ def criar_app(
 
     @app.get("/api/status")
     async def status() -> dict[str, dict]:
-        """Por corretora: estado (conectada | reconectando | atrasada), atraso medio em ms e reconexoes.
+        """Por corretora: estado (conectada | reconectando | atrasada), atraso medio em ms, reconexoes e mercados.
 
         Os dados vem do estado dos mercados (Motor.status -> EstadoMercados.saude). atraso_medio_ms e
-        null quando a corretora nao informa o horario dos dados.
+        null quando a corretora nao informa o horario dos dados. `mercados`: os ligados (veja
+        mercados_ligados), ex.: ["spot"] na kraken; o painel monta as opcoes de "Corretoras 1/2" com eles.
         """
         return {
             corretora: {
                 "estado": dados["estado"],
                 "atraso_medio_ms": dados.get("atraso_medio_ms"),
                 "reconexoes": dados.get("reconexoes", 0),
+                "mercados": list(mercados_ligados(cfg, corretora)),
             }
             for corretora, dados in motor.status(relogio()).items()
         }
@@ -360,7 +482,8 @@ def criar_app(
         try:
             # Enviar e escutar ao mesmo tempo: escutar serve so para perceber quando o painel fecha a aba
             # (sem isso um painel parado ficaria na lista ate o proximo evento).
-            await _ate_um_terminar(lambda: _enviar(ws, fila, retrato), lambda: _esperar_desconexao(ws))
+            await _ate_um_terminar(lambda: _enviar(ws, fila, retrato, intervalo_vivo_s),
+                                   lambda: _esperar_desconexao(ws))
         finally:
             transmissor.remover(fila)
 
@@ -387,12 +510,20 @@ async def _ate_um_terminar(*funcoes: Callable[[], Any]) -> None:
             grupo.start_soon(executar, funcao)
 
 
-async def _enviar(ws: WebSocket, fila: asyncio.Queue, retrato: str) -> None:
-    """Manda o retrato e depois cada mensagem da fila. `None` na fila = o Transmissor derrubou este painel."""
+async def _enviar(ws: WebSocket, fila: asyncio.Queue, retrato: str, intervalo_vivo_s: float) -> None:
+    """Manda o retrato e depois cada mensagem da fila. `None` na fila = o Transmissor derrubou este painel.
+
+    Fila vazia por `intervalo_vivo_s`: manda {"tipo": "vivo"} (o painel atualiza a "Ultima atualizacao").
+    Nada se perde na espera: a mensagem que chegar continua na fila para a proxima volta.
+    """
     try:
         await ws.send_text(retrato)
         while True:
-            mensagem = await fila.get()
+            try:
+                mensagem = await asyncio.wait_for(fila.get(), intervalo_vivo_s)
+            except TimeoutError:
+                await ws.send_text(MENSAGEM_VIVO)
+                continue
             if mensagem is None:
                 await ws.close(code=CODIGO_PAINEL_LENTO)
                 return

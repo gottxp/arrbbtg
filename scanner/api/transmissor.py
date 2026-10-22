@@ -2,7 +2,8 @@
 
 O laco do motor chama `publicar(eventos)` depois de cada ciclo. Cada painel conectado tem a sua
 propria fila de mensagens (`asyncio.Queue` com tamanho maximo); a rota do WebSocket le a fila e
-manda as mensagens ao navegador.
+manda as mensagens ao navegador (e, com a fila vazia por alguns segundos, um {"tipo": "vivo"}: veja
+INTERVALO_VIVO_S em scanner/api/app.py).
 
 Regra de ouro: o motor nunca espera por um painel. Por isso:
 - `publicar` e uma funcao comum (nao `async`) que so poe mensagens nas filas, sem esperar nada;
