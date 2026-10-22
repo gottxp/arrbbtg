@@ -52,6 +52,9 @@ taxas: {}
 intervalo_dados_lentos_s: 60
 # Intervalo para recarregar a lista de mercados, em segundos.
 recarregar_mercados_s: 3600
+# Tempo maximo esperando a corretora confirmar que cancelou a assinatura de um livro, em segundos.
+# Passou disso, registra no log e segue (o livro ja foi tirado do scanner).
+timeout_desassinar_s: 5
 
 # Painel web. Na VPS, preencha usuario e senha.
 painel:

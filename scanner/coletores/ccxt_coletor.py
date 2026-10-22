@@ -132,6 +132,11 @@ class ColetorCcxt(Coletor):
         inversos ficam de fora) e, se um ativo tem mais de uma moeda de cotacao no mesmo
         mercado, so a preferida (USDT, depois USDC, USDG): a chave do estado e unica.
     relogio: devolve a hora atual em segundos; os testes trocam por um relogio falso.
+    timeout_desassinar_s: tempo maximo esperando a corretora confirmar o cancelamento de um
+        livro (timeout_desassinar_s da Config); passou disso, avisa no log e segue.
+
+    Livro que deixa de ser acompanhado (saiu da lista ou a assinatura caiu) sai do estado na
+    hora: o ultimo livro recebido nao pode continuar valendo como se fosse atual.
 
     Os callbacks (`ao_atualizar`, `ao_ticker`) recebem os dados CRUS, como a corretora
     entrega (ex.: preco de "1000PEPE" sem dividir por 1000); sao opcionais com `estado`.
@@ -143,6 +148,7 @@ class ColetorCcxt(Coletor):
         exchange,
         estado: EstadoMercados | None = None,
         relogio: Callable[[], float] = time.time,
+        timeout_desassinar_s: float = 5,
     ):
         super().__init__(nome)
         self._exchange = exchange
@@ -156,6 +162,8 @@ class ColetorCcxt(Coletor):
         self._vencedor_da_chave: dict[tuple[str, str], str] = {}  # (mercado, ativo) -> simbolo que ocupa a chave
         self._avisados: set[str] = set()  # simbolos ja avisados no log (um aviso so por simbolo)
         self._sem_un_watch = False  # a corretora nao sabe cancelar assinatura de livro (avisado uma vez)
+        self._timeout_desassinar_s = timeout_desassinar_s
+        self._livros_no_estado: dict[str, tuple[str, str]] = {}  # simbolo -> (mercado, ativo) do livro guardado
 
     # --- etapa 1: tickers ----------------------------------------------------
 
@@ -282,6 +290,8 @@ class ColetorCcxt(Coletor):
         desejados = set(simbolos)
         saindo = {s: self._tarefas_livro.pop(s) for s in list(self._tarefas_livro) if s not in desejados}
         await self._cancelar(list(saindo.values()))
+        for simbolo in saindo:  # parou de chegar: o ultimo livro nao vale mais (nem enquanto o un_watch demora)
+            self._remover_livro_do_estado(simbolo)
         # Cancelar a tarefa nao basta: o ccxt guarda a assinatura ate o un_watch_order_book, e sem ele
         # as assinaturas se acumulam ate o limite da conexao. Vai em paralelo para nao somar esperas.
         await asyncio.gather(*(self._desassinar_livro(s) for s in saindo))
@@ -296,12 +306,17 @@ class ColetorCcxt(Coletor):
 
         Verifica o metodo e nao `exchange.has`: a Bitget tem `un_watch_order_book` mas `has` diz None.
         O ccxt base levanta NotSupported nas corretoras sem suporte; nesse caso avisa uma vez e para de tentar.
+        Espera a confirmacao da corretora no maximo `timeout_desassinar_s`: sem resposta, avisa e segue
+        (a tarefa local ja foi cancelada e o livro ja saiu do estado).
         """
         metodo = getattr(self._exchange, "un_watch_order_book", None)
         if metodo is None or self._sem_un_watch:
             return
         try:
-            await metodo(simbolo)
+            await asyncio.wait_for(metodo(simbolo), timeout=self._timeout_desassinar_s)
+        except TimeoutError:
+            registro.warning("%s %s: a corretora nao confirmou o cancelamento do livro em %ss; seguindo sem esperar",
+                             self.nome, simbolo, self._timeout_desassinar_s)
         except NotSupported:
             if not self._sem_un_watch:
                 self._sem_un_watch = True
@@ -329,8 +344,11 @@ class ColetorCcxt(Coletor):
             registro.warning("%s %s: livro parou (%s: %s); volta na proxima assinatura se o par continuar na lista",
                              self.nome, simbolo, type(erro).__name__, erro, exc_info=True)
         finally:
+            # So mexe se esta tarefa ainda e a dona do simbolo. Se saiu da lista, quem cancelou ja
+            # removeu; se outra tarefa ja assumiu o simbolo, o livro guardado e o dela.
             if self._tarefas_livro.get(simbolo) is asyncio.current_task():
                 del self._tarefas_livro[simbolo]
+                self._remover_livro_do_estado(simbolo)  # caiu: o ultimo livro nao vale mais
 
     async def _acompanhar_livro(self, simbolo: str) -> None:
         """Repete para sempre: espera o livro mudar e entrega o livro novo, se for valido."""
@@ -350,10 +368,19 @@ class ColetorCcxt(Coletor):
             par = self._par_do_simbolo(livro.simbolo_original)
             if par is not None:
                 self._estado.atualizar_livro(converter_livro(livro, par), ativo=par.ativo)
+                self._livros_no_estado[livro.simbolo_original] = (livro.mercado, par.ativo)
         if self._ao_atualizar is not None:
             self._ao_atualizar(livro)
 
     # --- apoio ---------------------------------------------------------------
+
+    def _remover_livro_do_estado(self, simbolo: str) -> None:
+        """Tira do estado o livro que este simbolo entregou (se entregou algum)."""
+        chave = self._livros_no_estado.pop(simbolo, None)
+        if chave is not None and self._estado is not None:
+            mercado, ativo = chave
+            # Com o simbolo: se outro simbolo do mesmo ativo ja ocupa a chave, o livro dele fica.
+            self._estado.remover_livro(self.nome, mercado, ativo, simbolo_original=simbolo)
 
     def simbolos_por_chave(self) -> dict[tuple[str, str], str]:
         """Para cada (mercado, ativo), o simbolo do ccxt cujos dados vao para o estado.

@@ -56,6 +56,9 @@ class Config:
     intervalo_dados_lentos_s: float = 60
     recarregar_mercados_s: float = 3600
 
+    # Tempo maximo esperando a corretora confirmar o cancelamento da assinatura de um livro.
+    timeout_desassinar_s: float = 5
+
     # Painel web.
     painel: dict = field(default_factory=_painel_padrao)
 
@@ -77,6 +80,7 @@ CAMPOS_POSITIVOS = (
     "tempo_operacao_h",
     "intervalo_dados_lentos_s",
     "recarregar_mercados_s",
+    "timeout_desassinar_s",
 )
 
 # Campos numericos que aceitam qualquer valor (inclusive zero ou negativo).

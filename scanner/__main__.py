@@ -61,10 +61,28 @@ async def _acompanhar_tickers(coletor: ColetorCcxt, simbolos: list[str]) -> None
                        coletor.nome, type(erro).__name__, erro)
 
 
+async def _ajustar_livros(coletores: dict[str, ColetorCcxt], selecao: dict[str, set[str]]) -> None:
+    """Etapa 2 de todas as corretoras: abre e cancela livros conforme a selecao do motor.
+
+    Todas recebem a lista (vazia tambem), para cancelar os livros que sairam. Erro de uma
+    corretora vai para o log e nao atrapalha as outras.
+    """
+    nomes = list(coletores)
+    resultados = await asyncio.gather(
+        *(coletores[n].assinar_livros(selecao.get(n, set())) for n in nomes), return_exceptions=True
+    )
+    for nome, resultado in zip(nomes, resultados):
+        if isinstance(resultado, Exception):
+            registro.error("%s: erro ao ajustar os livros (%s: %s); tentando de novo no proximo ciclo",
+                           nome, type(resultado).__name__, resultado)
+
+
 async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorCcxt], cfg: Config,
                          relogio: Callable[[], float], ciclos: int | None) -> None:
     """A cada `ciclo_ms`: roda o ciclo do motor e ajusta os livros abertos (etapa 2).
 
+    O ajuste dos livros roda numa tarefa propria, fora do ritmo do motor: se a corretora demorar
+    para responder, o motor continua rodando e o proximo ajuste so comeca quando o anterior acabar.
     ciclos: quantos ciclos rodar (os testes usam 2); None = ate ser cancelado (Ctrl+C).
     Um erro num ciclo vai para o log e o proximo ciclo tenta de novo.
     """
@@ -72,23 +90,32 @@ async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorCcxt], cfg: C
     relogio_do_laco = asyncio.get_running_loop().time  # relogio que nao pula (so para marcar o ritmo)
     proximo = relogio_do_laco() + intervalo_s  # espera um ciclo antes do primeiro: da tempo dos tickers chegarem
     ultimo_log: float | None = None
+    ajuste_livros: asyncio.Task | None = None  # ajuste de livros em andamento (fora do ritmo do motor)
     feitos = 0
-    while ciclos is None or feitos < ciclos:
-        await asyncio.sleep(max(0.0, proximo - relogio_do_laco()))
-        # Ritmo fixo de ciclo_ms, descontando o tempo gasto no ciclo; se atrasar, segue sem "recuperar" ciclos.
-        proximo = max(proximo + intervalo_s, relogio_do_laco())
-        agora = relogio()
-        try:
-            motor.ciclo(agora)
-            selecao = motor.selecao_livros(agora)
-            # Todas as corretoras recebem a lista (vazia tambem), para cancelar os livros que sairam.
-            await asyncio.gather(*(c.assinar_livros(selecao.get(nome, set())) for nome, c in coletores.items()))
-        except Exception:
-            registro.exception("erro no ciclo do motor; tentando de novo no proximo ciclo")
-        feitos += 1
-        if ultimo_log is None or agora - ultimo_log >= INTERVALO_LOG_SINAIS_S:
-            ultimo_log = agora
-            registro.info("sinais ativos: %d", len(motor.sinais_ativos()))
+    try:
+        while ciclos is None or feitos < ciclos:
+            await asyncio.sleep(max(0.0, proximo - relogio_do_laco()))
+            # Ritmo fixo de ciclo_ms, descontando o tempo gasto no ciclo; se atrasar, segue sem "recuperar" ciclos.
+            proximo = max(proximo + intervalo_s, relogio_do_laco())
+            agora = relogio()
+            try:
+                motor.ciclo(agora)
+                selecao = motor.selecao_livros(agora)
+            except Exception:
+                registro.exception("erro no ciclo do motor; tentando de novo no proximo ciclo")
+            else:
+                if ajuste_livros is None or ajuste_livros.done():
+                    ajuste_livros = asyncio.create_task(_ajustar_livros(coletores, selecao), name="ajuste de livros")
+                else:
+                    registro.debug("o ajuste de livros anterior ainda nao terminou; este ciclo nao abre outro")
+            feitos += 1
+            if ultimo_log is None or agora - ultimo_log >= INTERVALO_LOG_SINAIS_S:
+                ultimo_log = agora
+                registro.info("sinais ativos: %d", len(motor.sinais_ativos()))
+    finally:
+        if ajuste_livros is not None:
+            ajuste_livros.cancel()
+            await asyncio.gather(ajuste_livros, return_exceptions=True)
 
 
 async def _encerrar(tarefas: list[asyncio.Task], coletores: dict[str, ColetorCcxt], exchanges: dict,
@@ -133,7 +160,11 @@ async def rodar(
         carregadas = await _carregar_mercados(exchanges)
         if not carregadas:
             raise RuntimeError("nenhuma corretora carregou a lista de mercados; confira a internet e o config.yaml")
-        coletores = {nome: ColetorCcxt(nome, exchanges[nome], estado=estado, relogio=relogio) for nome in carregadas}
+        coletores = {
+            nome: ColetorCcxt(nome, exchanges[nome], estado=estado, relogio=relogio,
+                              timeout_desassinar_s=cfg.timeout_desassinar_s)
+            for nome in carregadas
+        }
 
         # Etapa 1: tickers so dos pares que formam alguma combinacao spot x futuro.
         simbolos = simbolos_para_tickers({nome: c.simbolos_por_chave() for nome, c in coletores.items()})

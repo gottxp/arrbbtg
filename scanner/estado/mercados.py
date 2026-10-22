@@ -66,6 +66,20 @@ class EstadoMercados:
         chave = (livro.corretora, livro.mercado, ativo if ativo is not None else livro.simbolo_original)
         self._livros[chave] = livro
 
+    def remover_livro(self, corretora: str, mercado: str, ativo: str, simbolo_original: str | None = None) -> None:
+        """Apaga o livro do par: o coletor parou de recebe-lo (assinatura cancelada ou caiu).
+
+        Sem isso, o ultimo livro continuaria valendo por ate `max_idade_livro_s` (o stream de
+        tickers mantem a conexao viva) e o motor leria precos congelados.
+        simbolo_original: se informado, so apaga se o livro guardado veio desse simbolo, para
+        nao apagar o livro que outro simbolo do mesmo ativo esteja entregando agora.
+        Livro que nao existe: nao faz nada. O ticker do par nao e tocado.
+        """
+        chave = (corretora, mercado, ativo)
+        livro = self._livros.get(chave)
+        if livro is not None and (simbolo_original is None or livro.simbolo_original == simbolo_original):
+            del self._livros[chave]
+
     def marcar_desconectada(self, corretora: str) -> None:
         """A conexao caiu: apaga tudo da corretora.
 

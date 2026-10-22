@@ -12,6 +12,7 @@ import pytest
 
 import scanner.__main__ as principal
 from scanner.armazenamento import Banco
+from scanner.coletores.ccxt_coletor import ColetorCcxt
 from scanner.estado import EstadoMercados
 from scanner.filtros import Filtros
 from scanner.motor import Motor, Sessao, chave_de, pares_spot_futuro, simbolos_para_tickers
@@ -713,6 +714,33 @@ class ExchangeFalsa:
         self.fechada = True
 
 
+def test_livro_que_deixou_de_chegar_nao_gera_sinal_falso():
+    # Repro da revisao: a etapa 2 largou o livro do spot da gate (congelado em t=10), mas o ticker
+    # da gate segue chegando e mantem a conexao viva. Em t=25 o mercado subiu ~2%: o futuro da bitget
+    # vende a 103,02 e o spot real custa 102 (A real ~1%). O livro congelado (ask 100) daria A = 3,02%
+    # e um "novo" falso; o livro tem que sair do estado quando a assinatura acaba.
+    m = motor_falso(spot=("gate", "BTC", 100.0), futuro=("bitget", "BTC", 101.0), f_medio=0.0)
+    gate = ExchangeFalsa({"BTC/USDT": market_ccxt("BTC/USDT", "BTC")},
+                         livros={"BTC/USDT": {"bids": [[99.9, 10.0]], "asks": [[100.0, 10.0]], "timestamp": None}})
+    gate.markets = gate._markets
+    coletor = ColetorCcxt("gate", gate, estado=m.estado, relogio=lambda: 10.0)
+
+    async def cenario():
+        await coletor.assinar_livros({"BTC/USDT"})
+        while len(gate.livros_pedidos) < 2:  # o 1o livro ja foi entregue e o coletor espera o proximo
+            await asyncio.sleep(0)
+        assert len(m.candidatos(agora=10)) == 1  # com o livro vivo, ha candidato
+        await coletor.assinar_livros(set())  # a etapa 2 largou o par
+        await coletor.fechar()
+
+    asyncio.run(cenario())
+    m.estado.atualizar_ticker("gate", "spot", "BTC", 101.9, 102.0, 25.0, simbolo_original="BTC/USDT", cotacao="USDT")
+    m.estado.registrar_mensagem("gate", 25.0)
+    colocar_ponta(m.estado, "bitget", "futuro", "BTC", 103.02, "short", 25.0)
+    assert m.candidatos(agora=25) == []
+    assert [e for e in m.ciclo(agora=25) if e.tipo == "novo"] == []
+
+
 def exchanges_falsas(gate_erro=None) -> dict:
     """Gate com o spot de BTC (ask 100) e Bitget com o futuro de BTC (bid 101): A = 1%."""
     return {
@@ -813,6 +841,75 @@ def test_rodar_erro_no_ciclo_vai_para_o_log_e_continua(tmp_path, caplog, monkeyp
             timeout=5))
     assert len(chamadas) == 2
     assert any("ciclo" in r.getMessage() for r in caplog.records if r.levelno == logging.ERROR)
+
+
+def contar_ciclos(monkeypatch) -> list:
+    """Troca Motor.ciclo por uma versao que anota cada chamada e depois roda o ciclo de verdade."""
+    feitos = []
+    original = Motor.ciclo
+
+    def ciclo_contando(self, agora):
+        feitos.append(agora)
+        return original(self, agora)
+
+    monkeypatch.setattr(Motor, "ciclo", ciclo_contando)
+    return feitos
+
+
+def test_laco_do_motor_segue_enquanto_o_ajuste_de_livros_trava(tmp_path, monkeypatch):
+    # Ex.: un_watch sem confirmacao da corretora. O motor nao pode parar de rodar por causa disso.
+    exchanges = exchanges_falsas()
+    ciclos_feitos = contar_ciclos(monkeypatch)
+    chamadas = []
+
+    async def assinar_que_trava(self, simbolos, ao_atualizar=None):
+        chamadas.append((self.nome, set(simbolos)))
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(ColetorCcxt, "assinar_livros", assinar_que_trava)
+    asyncio.run(asyncio.wait_for(principal.rodar(
+        config_servico(tmp_path), criar_exchange=exchanges.__getitem__, relogio=lambda: 1000.0, ciclos=4),
+        timeout=5))
+    assert len(ciclos_feitos) == 4
+    # So a primeira rodada de ajuste (uma chamada por corretora) comecou: as outras esperam ela acabar.
+    assert sorted(nome for nome, _ in chamadas) == ["bitget", "gate"]
+    assert all(ex.fechada for ex in exchanges.values())  # a rodada presa foi cancelada no fim
+
+
+def test_ajuste_de_livros_roda_a_cada_ciclo_quando_termina_e_erro_vai_ao_log(tmp_path, monkeypatch, caplog):
+    exchanges = exchanges_falsas()
+    chamadas = []
+
+    async def assinar_com_erro(self, simbolos, ao_atualizar=None):
+        chamadas.append(self.nome)
+        if self.nome == "gate":
+            raise RuntimeError("defeito na gate")
+
+    monkeypatch.setattr(ColetorCcxt, "assinar_livros", assinar_com_erro)
+    with caplog.at_level(logging.ERROR, logger="scanner"):
+        asyncio.run(asyncio.wait_for(principal.rodar(
+            config_servico(tmp_path), criar_exchange=exchanges.__getitem__, relogio=lambda: 1000.0, ciclos=3),
+            timeout=5))
+    # Uma rodada por ciclo, mesmo com erro na anterior. A rodada criada no 3o (ultimo) ciclo e
+    # cancelada no encerramento antes de comecar: ficam as dos ciclos 1 e 2.
+    assert sorted(chamadas) == ["bitget"] * 2 + ["gate"] * 2
+    assert any("defeito na gate" in r.getMessage() or "defeito na gate" in str(r.exc_info) for r in caplog.records)
+
+
+def test_rodar_passa_o_timeout_de_desassinar_da_config(tmp_path, monkeypatch):
+    exchanges = exchanges_falsas()
+    recebidos = []
+    original = ColetorCcxt.__init__
+
+    def init_anotando(self, *args, **kwargs):
+        recebidos.append(kwargs.get("timeout_desassinar_s"))
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ColetorCcxt, "__init__", init_anotando)
+    asyncio.run(asyncio.wait_for(principal.rodar(
+        config_servico(tmp_path, timeout_desassinar_s=1.5), criar_exchange=exchanges.__getitem__,
+        relogio=lambda: 1000.0, ciclos=1), timeout=5))
+    assert recebidos == [1.5, 1.5]
 
 
 def escrever_config(tmp_path, texto="corretoras: [bitget]\n"):

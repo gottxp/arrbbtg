@@ -610,3 +610,27 @@ def test_ticker_guardado_ignora_idade_e_conexao_mas_some_ao_desconectar():
     assert e.ticker_guardado("gate", "futuro", "BTC") is None
     e.marcar_desconectada("gate")
     assert e.ticker_guardado("gate", "spot", "BTC") is None
+
+
+def test_remover_livro_apaga_so_o_livro_do_par():
+    # Revisao da Task 10: livro que parou de chegar (assinatura cancelada ou caiu) sai do estado.
+    e = EstadoMercados()
+    e.atualizar_livro(livro("gate", "spot", "BTC", recebido_em=100.0))
+    e.atualizar_livro(livro("gate", "spot", "ETH", recebido_em=100.0))
+    e.atualizar_ticker("gate", "spot", "BTC", 100.0, 100.1, recebido_em=100.0)
+    e.registrar_mensagem("gate", 100.0)
+    e.remover_livro("gate", "spot", "BTC")
+    assert e.obter_livro("gate", "spot", "BTC", agora=100.0) is None
+    assert e.obter_livro("gate", "spot", "ETH", agora=100.0) is not None
+    assert e.obter_ticker("gate", "spot", "BTC", agora=100.0) is not None  # o ticker (etapa 1) continua
+    e.remover_livro("gate", "spot", "BTC")  # livro que nao existe: nao faz nada
+
+
+def test_remover_livro_com_simbolo_so_apaga_se_o_livro_veio_dele():
+    e = EstadoMercados()
+    e.atualizar_livro(livro("gate", "spot", "BTC/USDT", recebido_em=100.0), ativo="BTC")
+    e.registrar_mensagem("gate", 100.0)
+    e.remover_livro("gate", "spot", "BTC", simbolo_original="BTC/USDC")  # outro simbolo ocupa a chave
+    assert e.obter_livro("gate", "spot", "BTC", agora=100.0) is not None
+    e.remover_livro("gate", "spot", "BTC", simbolo_original="BTC/USDT")
+    assert e.obter_livro("gate", "spot", "BTC", agora=100.0) is None

@@ -10,7 +10,7 @@ import logging
 import pytest
 from ccxt.base.errors import NotSupported
 
-from scanner.coletores.ccxt_coletor import ColetorCcxt, mercado_do_simbolo
+from scanner.coletores.ccxt_coletor import ColetorCcxt, livro_de_ccxt, mercado_do_simbolo
 from scanner.estado.mercados import EstadoMercados
 from scanner.modelos import Livro, Ticker
 from tests.fabricas import market_ccxt
@@ -948,3 +948,96 @@ def test_simbolos_por_chave_acompanha_markets_recarregados():
     assert coletor.simbolos_por_chave() == {}
     ex.markets = markets_com_cotacoes("USDT", derivativo=False)
     assert coletor.simbolos_por_chave() == {("spot", "BTC"): "BTC/USDT"}
+
+
+# ---------------------------------------------------------------------------
+# Livro que deixa de chegar sai do estado; un_watch com tempo limite (revisao da Task 10)
+# ---------------------------------------------------------------------------
+
+def test_livro_que_sai_da_lista_e_removido_do_estado():
+    # Sem isso o ultimo livro continuaria valendo ate 30s (o ticker mantem a conexao viva) e o
+    # motor leria um preco congelado.
+    ex = ExchangeDuasEtapas(roteiro={("watch_order_book", "BTC/USDT"): [ob(100.0, 100.1)],
+                                     ("watch_order_book", "ETH/USDT"): [ob(10.0, 10.1)]})
+    estado = EstadoMercados()
+    coletor = ColetorCcxt("gate", ex, estado=estado, relogio=relogio_fixo(500.0))
+    livro_de = lambda ativo: estado.obter_livro("gate", "spot", ativo, agora=500.0)
+
+    async def cenario():
+        await coletor.assinar_livros({"BTC/USDT", "ETH/USDT"})
+        await esperar_ate(lambda: livro_de("BTC") is not None and livro_de("ETH") is not None)
+        await coletor.assinar_livros({"ETH/USDT"})
+        assert livro_de("BTC") is None and livro_de("ETH") is not None
+        await coletor.fechar()
+
+    asyncio.run(cenario())
+
+
+def test_livro_que_parou_com_erro_e_removido_do_estado():
+    ex = ExchangeDuasEtapas(roteiro={("watch_order_book", "BTC/USDT"): [ob(100.0, 100.1), ErroDaCorretora("caiu")]})
+    estado = EstadoMercados()
+    recebidos = []
+    coletor = ColetorCcxt("gate", ex, estado=estado, relogio=relogio_fixo(500.0))
+
+    async def cenario():
+        await coletor.assinar_livros({"BTC/USDT"}, recebidos.append)
+        await esperar_ate(lambda: recebidos and "BTC/USDT" not in coletor._tarefas_livro)
+        await coletor.fechar()
+
+    asyncio.run(cenario())
+    assert recebidos  # o livro chegou e foi guardado antes de a assinatura cair
+    assert estado.obter_livro("gate", "spot", "BTC", agora=500.0) is None
+
+
+def test_tarefa_velha_que_termina_nao_apaga_o_livro_da_tarefa_nova():
+    liberar = asyncio.Event()
+
+    async def cai_quando_liberar():
+        await liberar.wait()
+        raise ErroDaCorretora("a velha caiu")
+
+    ex = ExchangeDuasEtapas(roteiro={("watch_order_book", "BTC/USDT"): [ob(100.0, 100.1), cai_quando_liberar]})
+    estado = EstadoMercados()
+    coletor = ColetorCcxt("gate", ex, estado=estado, relogio=relogio_fixo(500.0))
+
+    async def cenario():
+        await coletor.assinar_livros({"BTC/USDT"})
+        await esperar_ate(lambda: estado.obter_livro("gate", "spot", "BTC", agora=500.0) is not None)
+        velha = coletor._tarefas_livro["BTC/USDT"]
+        nova = asyncio.create_task(asyncio.sleep(3600))  # outra tarefa ja assumiu o simbolo...
+        coletor._tarefas_livro["BTC/USDT"] = nova
+        estado.atualizar_livro(livro_de_ccxt("gate", "spot", "BTC/USDT", ob(200.0, 200.1), 501.0), ativo="BTC")
+        liberar.set()  # ...e so depois a velha termina
+        await asyncio.wait([velha])
+        assert estado.obter_livro("gate", "spot", "BTC", agora=501.0).bids[0][0] == 200.0
+        await coletor.fechar()
+
+    asyncio.run(cenario())
+
+
+class ExchangeUnWatchSemResposta(ExchangeDuasEtapas):
+    """Corretora cujo un_watch_order_book nunca recebe a confirmacao (ex.: Bitget sem ack)."""
+
+    async def un_watch_order_book(self, symbol, params=None):
+        self.livros_desassinados.append(symbol)
+        await asyncio.sleep(3600)
+
+
+def test_un_watch_sem_resposta_tem_tempo_limite_avisa_e_segue(caplog):
+    ex = ExchangeUnWatchSemResposta(roteiro={("watch_order_book", "BTC/USDT"): [ob(100.0, 100.1)]})
+    estado = EstadoMercados()
+    coletor = ColetorCcxt("bitget", ex, estado=estado, relogio=relogio_fixo(500.0), timeout_desassinar_s=0.05)
+
+    async def cenario():
+        await coletor.assinar_livros({"BTC/USDT", "ETH/USDT"})
+        await esperar_ate(lambda: estado.obter_livro("bitget", "spot", "BTC", agora=500.0) is not None)
+        await asyncio.wait_for(coletor.assinar_livros({"ETH/USDT"}), timeout=2)  # nao fica preso esperando
+        assert ex.livros_desassinados == ["BTC/USDT"]
+        assert set(coletor._tarefas_livro) == {"ETH/USDT"}
+        assert estado.obter_livro("bitget", "spot", "BTC", agora=500.0) is None  # o livro sai mesmo sem o ack
+        await coletor.fechar()
+
+    with caplog.at_level(logging.WARNING, logger="scanner.coletores"):
+        asyncio.run(cenario())
+    avisos = [m for m in avisos_do_coletor(caplog) if "BTC/USDT" in m]
+    assert len(avisos) == 1 and "0.05" in avisos[0]

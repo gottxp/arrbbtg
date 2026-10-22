@@ -164,3 +164,11 @@ def test_main_imprime_config_ok(tmp_path, capsys):
 def test_main_com_config_invalida_mostra_erro_e_sai_com_1(tmp_path, capsys):
     assert main(["--config", escrever(tmp_path, "ciclo_ms: -1\n")]) == 1
     assert "ciclo_ms" in capsys.readouterr().err
+
+
+def test_timeout_desassinar_padrao_5s_e_precisa_ser_positivo(tmp_path):
+    # Revisao da Task 10: tempo maximo esperando a corretora confirmar o cancelamento de um livro.
+    assert carregar_config(escrever(tmp_path, "corretoras: [bitget]\n")).timeout_desassinar_s == 5
+    assert carregar_config(escrever(tmp_path, "timeout_desassinar_s: 2.5\n")).timeout_desassinar_s == 2.5
+    with pytest.raises(ErroConfig, match="timeout_desassinar_s"):
+        carregar_config(escrever(tmp_path, "timeout_desassinar_s: 0\n"))
