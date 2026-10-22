@@ -53,7 +53,7 @@ As corretoras entram em 3 fases; cada fase só começa depois que a anterior est
 - **Prefixos de multiplicador:** 1000PEPE, 1MBABYDOGE e kPEPE viram o ativo base (o k só vale minúsculo, para não confundir com ativos como KAS ou KAVA), e o preço é ajustado pelo multiplicador.
 - **Tamanho de contrato:** o preço é sempre convertido para o valor de 1 unidade do ativo.
 - **Moeda de cotação:** a base é USDT. Preços em USDC e USDG são convertidos pela cotação real (USDC/USDT, USDG/USDT). Sem cotação disponível, usa 1:1 e marca o sinal com `aviso_cotacao = true`.
-- **Mesmo nome, ativo diferente:** se o spread de abertura passar de um limite (padrão 30%, configurável), o sinal é marcado como **suspeito**.
+- **Mesmo nome, ativo diferente:** se a diferença entre os preços das duas pontas passar de um limite (padrão 30%, configurável), nos dois sentidos (pela razão dos preços, `(maior ÷ menor − 1) × 100`), o sinal é marcado como **suspeito**. (Revisão final: só o A positivo deixava passar o token diferente na direção em que o long é o caro.)
 - **Ações tokenizadas** recebem a etiqueta STOCK.
 
 ## 3. Fórmulas e custos
@@ -245,7 +245,7 @@ A stack é **obrigatória** e o projeto roda com um comando só (`python -m scan
 | `scanner/painel/` | A página web |
 | `tests/` | Testes automáticos |
 
-**Fluxo de dados:** coletores em duas etapas (etapa 1: melhor bid/ask de todos os pares por stream leve de ticker; etapa 2: livro completo só dos pares com spread de abertura acima do mínimo, cancelado depois de 60s abaixo) → estado em memória → a cada ciclo (padrão 500 ms) o motor percorre os pares candidatos → cálculo → métricas → filtros e modo → gerenciador de sinais → painel (ao vivo) + SQLite. Os spreads A e F de cada par candidato são gravados a cada 5s (configurável) para alimentar o gráfico e as métricas; os pares sem livro aberto também alimentam as métricas, pelos tickers (seção 3, "De onde vêm as amostras das métricas").
+**Fluxo de dados:** coletores em duas etapas (etapa 1: melhor bid/ask de todos os pares por stream leve de ticker; etapa 2: livro completo só dos pares com spread de abertura acima do mínimo, cancelado depois de 60s abaixo; no modo Farm, as combinações com ponta numa corretora de farm usam um mínimo próprio, com no máximo `max_livros_farm_por_mercado` livros por mercado de farm, e as moedas de "sempre mostrar" sempre abrem livro) → estado em memória → a cada ciclo (padrão 500 ms) o motor percorre os pares candidatos → cálculo → métricas → filtros e modo → gerenciador de sinais → painel (ao vivo) + SQLite. Os spreads A e F de cada par candidato são gravados a cada 5s (configurável) para alimentar o gráfico e as métricas; os pares sem livro aberto também alimentam as métricas, pelos tickers (seção 3, "De onde vêm as amostras das métricas").
 
 **Ordem de construção:**
 
