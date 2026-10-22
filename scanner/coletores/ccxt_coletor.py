@@ -137,13 +137,16 @@ def criar_exchange_ccxt(nome: str):
 # TIPOS_DE_DESCARTE e DICA_LIMITE moram em scanner/coletores/base.py (comuns a todos os coletores).
 
 
-def _erro_de_conexao(erro: BaseException) -> bool:
-    """True para erro da conexao (rede caiu, tempo esgotado, corretora fora do ar ou bloqueando por excesso).
+# Erros de conexao (rede caiu, tempo esgotado, corretora fora do ar ou bloqueando por excesso): NetworkError e a
+# familia de erros de rede do ccxt (inclui tempo esgotado e limite de requisicoes); OSError cobre os erros de rede
+# do proprio Python. Nesses casos o traceback nao ajuda em nada. Unica definicao: a funcao abaixo e a classe
+# (ColetorComSaude._ERROS_DE_CONEXAO) usam esta.
+ERROS_DE_CONEXAO_CCXT = (NetworkError, OSError)
 
-    NetworkError e a familia de erros de rede do ccxt (inclui tempo esgotado e limite de requisicoes);
-    OSError cobre os erros de rede do proprio Python. Nesses casos o traceback nao ajuda em nada.
-    """
-    return isinstance(erro, (NetworkError, OSError))
+
+def _erro_de_conexao(erro: BaseException) -> bool:
+    """True para erro da conexao (veja ERROS_DE_CONEXAO_CCXT)."""
+    return isinstance(erro, ERROS_DE_CONEXAO_CCXT)
 
 
 def _agrupar_por_mercado(simbolos: list[str]) -> list[list[str]]:
@@ -256,7 +259,7 @@ class ColetorCcxt(ColetorComSaude):
     """
 
     _TEXTO_DA_CONEXAO = "a conexao dos tickers"
-    _ERROS_DE_CONEXAO = (NetworkError, OSError)  # mesma regra de _erro_de_conexao
+    _ERROS_DE_CONEXAO = ERROS_DE_CONEXAO_CCXT
 
     def __init__(
         self,

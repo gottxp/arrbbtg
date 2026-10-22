@@ -24,7 +24,7 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from scanner.coletores.base import Coletor
+from scanner.coletores.base import Coletor, ColetorDoScanner
 from scanner.coletores.ccxt_coletor import ColetorCcxt, mercado_do_simbolo
 from scanner.coletores.fabrica import criar_corretora
 from scanner.coletores.lighter import criar_coletor_lighter, e_lighter
@@ -36,7 +36,7 @@ ATIVOS = ("BTC", "ETH", "SOL")
 INTERVALO_PADRAO_S = 5
 
 
-def simbolos_da_corretora(coletor: ColetorCcxt) -> list[str]:
+def simbolos_da_corretora(coletor: ColetorDoScanner) -> list[str]:
     """Os simbolos de BTC, ETH e SOL (spot e futuro) que o scanner usa nesta corretora, os spot primeiro.
 
     Sao os mesmos que vao para o estado do scanner: a cotacao preferida (USDT, depois USDC...) e so os
@@ -46,7 +46,7 @@ def simbolos_da_corretora(coletor: ColetorCcxt) -> list[str]:
     return [chaves[(mercado, ativo)] for mercado in MERCADOS for ativo in ATIVOS if (mercado, ativo) in chaves]
 
 
-async def preparar(exchanges: dict, cfg: Config) -> tuple[list[ColetorCcxt], dict[str, list[str]], list[str]]:
+async def preparar(exchanges: dict, cfg: Config) -> tuple[list[ColetorDoScanner], dict[str, list[str]], list[str]]:
     """Carrega a lista de mercados de cada corretora e escolhe os pares dela (veja simbolos_da_corretora).
 
     exchanges: {nome: corretora do ccxt}. Devolve (coletores, {nome: simbolos}, erros). A corretora que nao

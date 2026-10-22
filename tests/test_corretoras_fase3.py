@@ -356,6 +356,8 @@ def test_config_yaml_do_projeto_traz_a_fase_3():
     # As taxas publicas padrao de cada uma ficam nos comentarios, para o dono conferir com o nivel dele.
     for nome in ("kraken:", "krakenfutures:", "lighter:", "lighter_rh:"):
         assert f"#   {nome}" in texto, nome
+    # limites_assinatura: na Lighter com a etapa 1 pelos livros, o limite vale para todos os livros.
+    assert "vale para todos os livros" in texto
     chaves = yaml.safe_load(texto) or {}
     for campo in ("url_rest_lighter", "url_ws_lighter", "url_rest_lighter_rh", "url_ws_lighter_rh",
                   "intervalo_ping_lighter_s"):
@@ -463,7 +465,8 @@ def test_campos_novos_da_lighter_na_config(tmp_path):
             lida.mudancas_sem_livro_completo_lighter, lida.tempo_max_livro_completo_lighter_s) == (50, 5, 3, 4, 20)
     chaves = yaml.safe_load((RAIZ / "config.yaml").read_text(encoding="utf-8")) or {}
     for campo in ("niveis_livro_lighter", "tempo_max_rede_lighter_s", "pings_sem_resposta_lighter",
-                  "mudancas_sem_livro_completo_lighter", "tempo_max_livro_completo_lighter_s"):
+                  "mudancas_sem_livro_completo_lighter", "tempo_max_livro_completo_lighter_s",
+                  "tempo_min_modo_etapa1_lighter_s"):
         assert chaves.get(campo) == getattr(c, campo), campo
 
 
@@ -475,6 +478,7 @@ def test_campos_novos_da_lighter_na_config(tmp_path):
     ("mudancas_sem_livro_completo_lighter: -1\n", "mudancas_sem_livro_completo_lighter"),
     ("tempo_max_rede_lighter_s: 0\n", "tempo_max_rede_lighter_s"),
     ("tempo_max_livro_completo_lighter_s: -3\n", "tempo_max_livro_completo_lighter_s"),
+    ("tempo_min_modo_etapa1_lighter_s: 0\n", "tempo_min_modo_etapa1_lighter_s"),
 ])
 def test_campos_novos_da_lighter_com_valor_errado(tmp_path, texto, campo):
     with pytest.raises(ErroConfig, match=campo):

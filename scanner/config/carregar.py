@@ -111,6 +111,8 @@ class Config:
     tempo_max_livro_completo_lighter_s: float = 10
     # Mudancas de livro seguidas sem o livro completo antes delas para o log avisar (uma vez por par).
     mudancas_sem_livro_completo_lighter: int = 10
+    # Tempo minimo em cada modo da etapa 1 da Lighter (market_stats ou livros) antes de trocar de novo, em segundos.
+    tempo_min_modo_etapa1_lighter_s: float = 300
 
     # Painel web.
     painel: dict = field(default_factory=_painel_padrao)
@@ -144,6 +146,7 @@ CAMPOS_POSITIVOS = (
     "faixa_cotacao_pct",
     "tempo_max_rede_lighter_s",
     "tempo_max_livro_completo_lighter_s",
+    "tempo_min_modo_etapa1_lighter_s",
 )
 
 # Campos numericos que aceitam qualquer valor (inclusive zero ou negativo).

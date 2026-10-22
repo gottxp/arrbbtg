@@ -158,8 +158,9 @@ intervalo_funding_h:
 espera_max_reconexao_s: 60
 # Maximo de assinaturas por corretora (livros abertos; e tickers, se a corretora so assina um par
 # por vez, como a bingx e a hyperliquid com watch_ticker). Ficam os pares de maior volume 24h.
-# Vazio = sem limite; se o log disser que a mensagem "parece de limite de assinaturas", preencha (a Lighter
-# nao documenta o limite dela; vale so para os livros, porque os tickers dela vem numa assinatura so). Exemplo:
+# Vazio = sem limite; se o log disser que a mensagem "parece de limite de assinaturas", preencha. Na Lighter
+# (que nao documenta o limite) o limite vale para os livros; com a etapa 1 pelos livros (quando o market_stats
+# nao traz bid/ask), ele vale para todos os livros, os da etapa 1 e os da etapa 2. Exemplo:
 #   limites_assinatura:
 #     bingx: 200
 limites_assinatura: {}
@@ -198,6 +199,11 @@ tempo_max_livro_completo_lighter_s: 10
 # Mudancas de livro seguidas sem o livro completo antes delas para o log avisar (uma vez por par): sinal de que o
 # formato da Lighter mudou.
 mudancas_sem_livro_completo_lighter: 10
+# Se o market_stats da Lighter nao trouxer bid/ask (mensagens_sem_bid_ask mensagens seguidas, de pares
+# diferentes), a etapa 1 dela passa a vir dos livros; volta quando ele trouxer bid/ask do mesmo jeito. Depois de
+# cada troca, fica pelo menos este tempo no modo novo antes de trocar de novo, em segundos (evita trocar e
+# destrocar). A troca e tudo ou nada: com alguns pares sempre com bid/ask e outros sempre sem, nao troca.
+tempo_min_modo_etapa1_lighter_s: 300
 
 # Painel web. Na VPS, preencha usuario e senha.
 painel:

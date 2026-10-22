@@ -1184,13 +1184,20 @@ def test_bid_ask_que_volta_no_market_stats_devolve_a_etapa_1_ao_modo_normal(capl
     ws = WsLighterFalso(respostas={"market_stats/all": [estatisticas], "order_book/0": [[completo()]],
                                    "order_book/1": [[completo(market_id=1, bids=[(64000.0, 1.0)],
                                                               asks=[(64001.0, 1.0)])]]})
-    coletor, _ = coletor_com(ws, estado=estado, mensagens_sem_bid_ask=3)
+    # tempo_min_modo_s=0: aqui so a histerese conta (o tempo minimo em cada modo tem teste proprio).
+    coletor, _ = coletor_com(ws, estado=estado, mensagens_sem_bid_ask=3, tempo_min_modo_s=0)
 
     async def cenario():
         tarefa = asyncio.create_task(coletor.manter_tickers([ETH, BTC]))
         await esperar_ate(lambda: livro_no_estado(estado) is not None and livro_no_estado(estado, "BTC") is not None)
         await coletor.assinar_livros({BTC})                  # a etapa 2 quer o livro do BTC
-        ws.entregar(msg_stats(stats(0, bid="2070.0", ask="2070.5"), stats(1, bid="64100", ask="64101")))
+        com_bid_ask = msg_stats(stats(0, bid="2070.0", ask="2070.5"), stats(1, bid="64100", ask="64101"))
+        ws.entregar(com_bid_ask, com_bid_ask)
+        await esperar_ate(ws.vazia)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert ws.canais("unsubscribe") == []                # 2 mensagens com bid/ask ainda nao bastam (N = 3)
+        ws.entregar(com_bid_ask)
         await esperar_ate(lambda: ws.canais("unsubscribe") == ["order_book/0"])
         # O livro do ETH (so etapa 1) saiu; o do BTC (etapa 2) ficou; os tickers voltaram a vir do market_stats.
         assert livro_no_estado(estado) is None and livro_no_estado(estado, "BTC") is not None
@@ -1244,3 +1251,233 @@ def test_etapa_1_pelos_livros_segue_a_lista_nova_de_tickers():
 
     asyncio.run(cenario())
     assert ws2.canais()[0] == "market_stats/all" and sorted(ws2.canais()[1:]) == ["order_book/0", "order_book/1"]
+
+
+
+# ---------------------------------------------------------------------------
+# Correcao pos-revisao 2 (Task 16)
+# ---------------------------------------------------------------------------
+
+
+def intermitente(vezes=5, btc_tambem=False):
+    """A sequencia do revisor: 3 market_stats sem bid/ask e 1 com (so o ETH, ou os dois pares), repetido."""
+    btc = stats(1, bid="64000", ask="64001") if btc_tambem else stats_sem_bid_ask(1)
+    seq = []
+    for _ in range(vezes):
+        seq += [msg_stats(stats_sem_bid_ask(0), stats_sem_bid_ask(1))] * 3
+        seq += [msg_stats(stats(0, bid="2064.5", ask="2064.6"), btc)]
+    return seq
+
+
+@pytest.mark.parametrize("btc_tambem", [False, True], ids=["com_so_o_eth", "com_os_dois_pares"])
+def test_bid_ask_intermitente_troca_no_maximo_uma_vez_sem_tempestade_de_assinaturas(caplog, btc_tambem):
+    # O relogio anda 100 s por mensagem: o tempo minimo em cada modo passa, e so a histerese segura a volta.
+    agora = [AGORA]
+
+    def relogio_andando():
+        agora[0] += 100
+        return agora[0]
+
+    respostas = {"market_stats/all": [intermitente(btc_tambem=btc_tambem)], "order_book/0": [[completo()]],
+                 "order_book/1": [[completo(market_id=1, bids=[(64000.0, 1.0)], asks=[(64001.0, 1.0)])]]}
+    ws = WsLighterFalso(respostas)
+    # (O livro completo chega depois das 20 mensagens da fila; com o relogio correndo, o tempo maximo do livro
+    # completo fica fora do caminho deste teste.)
+    coletor, _ = coletor_com(ws, estado=EstadoMercados(), relogio=relogio_andando, mensagens_sem_bid_ask=3,
+                             tempo_max_livro_completo_s=1e12)
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers([ETH, BTC]))
+        await esperar_ate(lambda: "market_stats/all" in ws.canais() and ws.vazia())
+        for _ in range(20):
+            await asyncio.sleep(0)
+        await parar(tarefa)
+        await coletor.fechar()
+
+    with caplog.at_level(logging.INFO, logger="scanner"):
+        asyncio.run(cenario())
+    livros = [c for c in ws.canais() if c.startswith("order_book")]
+    assert sorted(livros) == ["order_book/0", "order_book/1"]   # uma troca so: um subscribe por par
+    assert ws.canais("unsubscribe") == []
+    mensagens = avisos(caplog, logging.INFO)
+    assert len([m for m in mensagens if "passa a vir dos livros" in m]) == 1
+    assert not any("voltou a trazer bid/ask" in m for m in mensagens)
+
+
+def test_tempo_minimo_em_cada_modo_antes_de_voltar_ao_market_stats():
+    agora = [AGORA]
+    estado = EstadoMercados()
+    sem = [msg_stats(stats_sem_bid_ask(0), stats_sem_bid_ask(1)) for _ in range(3)]
+    ws = WsLighterFalso(respostas={"market_stats/all": [sem], "order_book/0": [[completo()]],
+                                   "order_book/1": [[completo(market_id=1, bids=[(64000.0, 1.0)],
+                                                              asks=[(64001.0, 1.0)])]]})
+    coletor, _ = coletor_com(ws, estado=estado, relogio=lambda: agora[0], mensagens_sem_bid_ask=3,
+                             tempo_min_modo_s=300)
+    com_bid_ask = msg_stats(stats(0, bid="2070.0", ask="2070.5"), stats(1, bid="64100", ask="64101"))
+
+    async def entregar_e_esperar(*mensagens):
+        ws.entregar(*mensagens)
+        await esperar_ate(ws.vazia)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers([ETH, BTC]))
+        await esperar_ate(lambda: len(ws.canais()) == 3)          # trocou para os livros em AGORA
+        agora[0] = AGORA + 200
+        await entregar_e_esperar(com_bid_ask, com_bid_ask, com_bid_ask, com_bid_ask)
+        assert ws.canais("unsubscribe") == []                     # 200 s: ainda dentro do tempo minimo
+        agora[0] = AGORA + 301
+        await entregar_e_esperar(com_bid_ask, com_bid_ask, com_bid_ask)
+        assert sorted(ws.canais("unsubscribe")) == ["order_book/0", "order_book/1"]
+        await parar(tarefa)
+        await coletor.fechar()
+
+    asyncio.run(cenario())
+
+
+def test_corrida_entre_cancelar_e_assinar_o_mesmo_livro_termina_assinado():
+    # Dois ajustes de livros ao mesmo tempo (o laco de leitura e o assinar_livros do __main__): o cancelamento
+    # do primeiro demora; o segundo assina o mesmo livro de novo. Com a trava, o ultimo pedido e o subscribe.
+    class WsLento(WsLighterFalso):
+        def __init__(self, respostas):
+            super().__init__(respostas)
+            self.portao = asyncio.Event()
+
+        async def enviar(self, dados):
+            if dados.get("type") == "unsubscribe":
+                await self.portao.wait()
+            await super().enviar(dados)
+
+    estado = EstadoMercados()
+    ws = WsLento({"order_book/0": [[completo()], [completo(nonce=200)]]})
+    coletor, _ = coletor_com(ws, estado=estado)
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers([ETH]))
+        await esperar_ate(lambda: "market_stats/all" in ws.canais())
+        await coletor.assinar_livros({ETH})
+        await esperar_ate(lambda: livro_no_estado(estado) is not None)
+        cancelar = asyncio.create_task(coletor.assinar_livros(set()))
+        await asyncio.sleep(0)
+        assinar = asyncio.create_task(coletor.assinar_livros({ETH}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        ws.portao.set()
+        await asyncio.gather(cancelar, assinar)
+        await esperar_ate(lambda: livro_no_estado(estado) is not None)
+        await parar(tarefa)
+        await coletor.fechar()
+
+    asyncio.run(cenario())
+    tipos = [d["type"] for d in ws.enviadas if d.get("channel") == "order_book/0"]
+    assert tipos == ["subscribe", "unsubscribe", "subscribe"]
+
+
+def test_nao_assinado_em_resposta_ao_nosso_cancelamento_nao_avisa_nem_assina_de_novo(caplog):
+    # Pedido de novo pelo tempo maximo: o coletor cancela e assina. Se a Lighter responder 30002 ao NOSSO
+    # cancelamento (o livro nao estava assinado), isso e esperado: nem aviso, nem subscribe a mais.
+    agora = [AGORA]
+    estado = EstadoMercados()
+    ws = WsLighterFalso(respostas={"order_book/0": [[], []]})   # o livro completo o teste entrega na hora certa
+    coletor, _ = coletor_com(ws, estado=estado, relogio=lambda: agora[0], esperar=EsperaFalsa(),
+                             tempo_max_livro_completo_s=10)
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers([ETH]))
+        await esperar_ate(lambda: "market_stats/all" in ws.canais())
+        await coletor.assinar_livros({ETH})
+        agora[0] += 11
+        ws.entregar({"type": "pong"})                                    # pede de novo (cancela e assina)
+        await esperar_ate(lambda: ws.canais().count("order_book/0") == 2)
+        # A Lighter responde ao cancelamento (30002: nao estava assinado) e depois manda o livro completo.
+        ws.entregar({"error": {"code": 30002, "message": "Not Subscribed to : order_book:0"}}, completo(),
+                    {"type": "pong"})
+        await esperar_ate(lambda: livro_no_estado(estado, ) is not None
+                          and estado.obter_livro("lighter", "futuro", "ETH", agora[0]) is not None and ws.vazia())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await parar(tarefa)
+        await coletor.fechar()
+
+    with caplog.at_level(logging.WARNING, logger="scanner"):
+        asyncio.run(cenario())
+    tipos = [d["type"] for d in ws.enviadas if d.get("channel") == "order_book/0"]
+    assert tipos == ["subscribe", "unsubscribe", "subscribe"]
+    assert not any("nao estava assinado" in m for m in avisos(caplog))
+
+
+def test_livros_atrasados_conferidos_no_maximo_uma_vez_por_segundo():
+    agora = [AGORA]
+    ws = WsLighterFalso()
+    coletor, _ = coletor_com(ws, estado=EstadoMercados(), relogio=lambda: agora[0])
+    conferencias = []
+    coletor._conferir_livros_atrasados = conferencias.append
+
+    async def entregar(*mensagens):
+        ws.entregar(*mensagens)
+        await esperar_ate(ws.vazia)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers([ETH]))
+        await esperar_ate(lambda: "market_stats/all" in ws.canais())
+        await entregar(*[{"type": "pong"}] * 20)
+        assert conferencias == [AGORA]                     # 20 mensagens no mesmo segundo: uma conferencia
+        agora[0] += 0.5
+        await entregar({"type": "pong"})
+        assert conferencias == [AGORA]
+        agora[0] += 0.5
+        await entregar({"type": "pong"})
+        assert conferencias == [AGORA, AGORA + 1]
+        await parar(tarefa)
+        await coletor.fechar()
+
+    asyncio.run(cenario())
+
+
+def test_tempo_minimo_do_modo_da_etapa_1_vem_da_config():
+    c = Config()
+    assert c.tempo_min_modo_etapa1_lighter_s == 300
+    cfg = cfg_com(corretoras=["lighter"], tempo_min_modo_etapa1_lighter_s=120)
+    coletor = criar_coletor_lighter("lighter", ClienteLighterFalso(MARKETS), cfg, EstadoMercados(), None, relogio)
+    assert coletor._tempo_min_modo_s == 120
+
+
+def test_anotacoes_do_imprimir_precos_usam_o_protocol():
+    import typing
+
+    from scanner.coletores.base import ColetorDoScanner
+    from scanner.ferramentas import imprimir_precos
+
+    assert typing.get_type_hints(imprimir_precos.simbolos_da_corretora)["coletor"] is ColetorDoScanner
+    assert typing.get_type_hints(imprimir_precos.preparar)["return"] == tuple[
+        list[ColetorDoScanner], dict[str, list[str]], list[str]]
+
+
+def test_regra_do_erro_de_conexao_do_ccxt_num_lugar_so():
+    from scanner.coletores import ccxt_coletor
+
+    assert ccxt_coletor.ColetorCcxt._ERROS_DE_CONEXAO is ccxt_coletor.ERROS_DE_CONEXAO_CCXT
+    assert ccxt_coletor._erro_de_conexao(OSError()) and not ccxt_coletor._erro_de_conexao(ValueError())
+
+
+def test_market_stats_parcial_nos_livros_nao_volta_com_um_par_so():
+    # Tudo ou nada tambem na volta: com so o ETH trazendo bid/ask (o BTC nunca), a etapa 1 fica nos livros
+    # (senao o BTC ficaria sem ticker).
+    sem = [msg_stats(stats_sem_bid_ask(0), stats_sem_bid_ask(1)) for _ in range(3)]
+    so_eth = [msg_stats(stats(0, bid="2070.0", ask="2070.5"), stats_sem_bid_ask(1)) for _ in range(6)]
+    ws = WsLighterFalso(respostas={"market_stats/all": [sem + so_eth]})
+    coletor, _ = coletor_com(ws, estado=EstadoMercados(), mensagens_sem_bid_ask=3, tempo_min_modo_s=0)
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers([ETH, BTC]))
+        await esperar_ate(lambda: len(ws.canais()) == 3 and ws.vazia())
+        for _ in range(10):
+            await asyncio.sleep(0)
+        await parar(tarefa)
+        await coletor.fechar()
+
+    asyncio.run(cenario())
+    assert ws.canais("unsubscribe") == []
