@@ -1,4 +1,5 @@
-"""Testes do motor (Task 10): combinacoes, candidatos spot x futuro, etapa 2, metricas, ciclo e __main__.
+"""Testes do motor (Tasks 10 e 13): combinacoes, candidatos spot x futuro e futuro x futuro,
+etapa 2, metricas, ciclo e __main__.
 
 Nenhum teste acessa a internet: o estado e preenchido a mao (tests.fabricas) e, nos testes do
 __main__, as corretoras do ccxt sao trocadas por objetos falsos.
@@ -15,7 +16,15 @@ from scanner.armazenamento import Banco
 from scanner.coletores.ccxt_coletor import ColetorCcxt
 from scanner.estado import EstadoMercados
 from scanner.filtros import Filtros
-from scanner.motor import Motor, Sessao, chave_de, pares_spot_futuro, simbolos_para_tickers
+from scanner.motor import (
+    Motor,
+    Sessao,
+    chave_de,
+    combinacoes,
+    pares_futuro_futuro,
+    pares_spot_futuro,
+    simbolos_para_tickers,
+)
 from tests.fabricas import DadosLentosFalso, cfg, cfg_com, colocar_ponta, livro, market_ccxt, motor_falso
 
 # Combinacao e chave do caso mais usado: spot da Gate (long) x futuro da Bitget (short).
@@ -47,6 +56,27 @@ def test_ponta_velha_nao_gera():
 def test_suspeito_acima_de_30():
     m = motor_falso(spot=("gate", "X", 1.0), futuro=("bitget", "X", 1.5))
     assert m.candidatos(agora=10)[0].suspeito is True
+
+
+# ---------------------------------------------------------------------------
+# Brief (Task 13, Passo 1) - verbatim
+# ---------------------------------------------------------------------------
+
+def test_nunca_mesma_corretora():
+    for _, x, _, y, _ in pares_futuro_futuro({"gate": {("futuro", "BTC")}, "mexc": {("futuro", "BTC")}}):
+        assert x != y
+
+def test_duas_direcoes():
+    p = pares_futuro_futuro({"gate": {("futuro", "BTC")}, "mexc": {("futuro", "BTC")}})
+    assert ("BTC", "gate", "futuro", "mexc", "futuro") in p and ("BTC", "mexc", "futuro", "gate", "futuro") in p
+
+def test_akam_ponta_a_ponta():
+    m = motor_falso(long_futuro=("bitget", "AKAM", 89.14), short_futuro=("gate", "AKAM", 100.32),
+                    f_medio=-11.91, taxas=0.06, funding_short=(0.01, 8), funding_long=(0.0, 8))
+    c = m.candidatos(agora=10)[0]
+    assert c.tipo == "futuro_futuro"
+    assert round(c.rp_bruto_pct, 2) == 0.63 and round(c.rp_liquido_pct, 2) == 0.40
+    assert round(c.fr_yield_8h_pct, 2) == 0.01
 
 
 # ---------------------------------------------------------------------------
@@ -565,9 +595,12 @@ def test_selecao_junta_os_simbolos_de_varias_combinacoes():
     ticker(e, "gate", "spot", "BTC", 99.9, 100.0, 10.0)
     ticker(e, "bitget", "futuro", "BTC", 100.5, 100.6, 10.0)
     ticker(e, "mexc", "futuro", "BTC", 100.8, 100.9, 10.0)
-    ticker(e, "gate", "futuro", "BTC", 100.1, 100.2, 10.0)  # gate x gate: 0,1%, fica de fora
+    ticker(e, "gate", "futuro", "BTC", 100.1, 100.2, 10.0)
+    # Spot x futuro: gate x bitget (0,5%) e gate x mexc (0,8%) entram; gate x gate (0,1%) fica de fora.
+    # Futuro x futuro: o futuro da gate entra pelo gate x mexc (ask 100,2 e bid 100,8: ~0,6%);
+    # gate x bitget (~0,299%) e bitget x mexc (~0,2%) ficam abaixo de 0,3%.
     assert motor_so_tickers(e).selecao_livros(agora=10) == {
-        "gate": {"BTC/USDT"}, "bitget": {"BTC/USDT:USDT"}, "mexc": {"BTC/USDT:USDT"}}
+        "gate": {"BTC/USDT", "BTC/USDT:USDT"}, "bitget": {"BTC/USDT:USDT"}, "mexc": {"BTC/USDT:USDT"}}
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +693,269 @@ def test_status_por_corretora():
         "gate": {"estado": "conectada"},
         "bitget": {"estado": "atrasada"},
     }
+
+
+# ---------------------------------------------------------------------------
+# Futuros x futuros (Task 13)
+# ---------------------------------------------------------------------------
+
+
+def por_chave(candidatos) -> dict:
+    """Os candidatos indexados pela chave do sinal."""
+    return {c.chave: c for c in candidatos}
+
+
+def test_pares_futuro_futuro_todas_as_combinacoes_em_ordem():
+    m = {
+        "mexc": {("futuro", "BTC"), ("futuro", "ETH")},
+        "gate": {("spot", "BTC"), ("futuro", "BTC"), ("spot", "ETH")},
+        "bitget": {("futuro", "BTC"), ("futuro", "ETH"), ("futuro", "XRP")},
+    }
+    assert pares_futuro_futuro(m) == [
+        ("BTC", "bitget", "futuro", "gate", "futuro"),
+        ("BTC", "bitget", "futuro", "mexc", "futuro"),
+        ("BTC", "gate", "futuro", "bitget", "futuro"),
+        ("BTC", "gate", "futuro", "mexc", "futuro"),
+        ("BTC", "mexc", "futuro", "bitget", "futuro"),
+        ("BTC", "mexc", "futuro", "gate", "futuro"),
+        ("ETH", "bitget", "futuro", "mexc", "futuro"),
+        ("ETH", "mexc", "futuro", "bitget", "futuro"),
+    ]
+
+
+def test_pares_futuro_futuro_sem_par_possivel():
+    assert pares_futuro_futuro({"gate": {("spot", "BTC")}, "mexc": {("futuro", "BTC")}}) == []
+    assert pares_futuro_futuro({"bitget": {("spot", "BTC"), ("futuro", "BTC")}}) == []  # uma corretora so
+    assert pares_futuro_futuro({"gate": {("futuro", "BTC")}, "mexc": {("futuro", "ETH")}}) == []
+    assert pares_futuro_futuro({}) == []
+
+
+def test_combinacoes_junta_os_dois_tipos():
+    m = {"gate": {("spot", "BTC"), ("futuro", "BTC")}, "mexc": {("futuro", "BTC")}}
+    assert combinacoes(m) == pares_spot_futuro(m) + pares_futuro_futuro(m) == [
+        ("BTC", "gate", "spot", "gate", "futuro"),
+        ("BTC", "gate", "spot", "mexc", "futuro"),
+        ("BTC", "gate", "futuro", "mexc", "futuro"),
+        ("BTC", "mexc", "futuro", "gate", "futuro"),
+    ]  # nunca spot vendido nem futuro x futuro na mesma corretora
+
+
+def test_simbolos_para_tickers_inclui_futuro_x_futuro_e_corretora_so_de_futuros():
+    # Nenhuma corretora tem o spot do ETH: o ETH so forma par futuro x futuro.
+    vencedores = {
+        "hyperliquid": {("futuro", "ETH"): "ETH/USDC:USDC", ("futuro", "SOL"): "SOL/USDC:USDC"},
+        "gate": {("futuro", "ETH"): "ETH/USDT:USDT", ("spot", "DOGE"): "DOGE/USDT"},
+    }
+    assert simbolos_para_tickers(vencedores) == {"hyperliquid": ["ETH/USDC:USDC"], "gate": ["ETH/USDT:USDT"]}
+
+
+def test_simbolos_para_tickers_junta_os_dois_tipos_sem_repetir():
+    # O futuro de BTC da mexc forma par com o spot e com o futuro da gate: aparece uma vez so.
+    vencedores = {
+        "gate": {("spot", "BTC"): "BTC/USDT", ("futuro", "BTC"): "BTC/USDT:USDT", ("futuro", "ETH"): "ETH/USDT:USDT"},
+        "mexc": {("futuro", "BTC"): "BTC/USDT:USDT", ("futuro", "ETH"): "ETH/USDT:USDT"},
+    }
+    assert simbolos_para_tickers(vencedores) == {
+        "gate": ["BTC/USDT", "BTC/USDT:USDT", "ETH/USDT:USDT"],
+        "mexc": ["BTC/USDT:USDT", "ETH/USDT:USDT"],
+    }
+
+
+def test_candidato_futuro_futuro_preenche_as_duas_pontas_futuras():
+    m = motor_falso(long_futuro=("bitget", "BTC", 100.0), short_futuro=("gate", "BTC", 101.0),
+                    funding_long=(0.02, 8), funding_short=(0.01, 4))
+    c = por_chave(m.candidatos(agora=10))[("BTC/USDT", "futuro_futuro", "bitget", "futuro", "gate", "futuro")]
+    pl, ps = c.ponta_long, c.ponta_short
+    assert (pl.corretora, pl.mercado, pl.simbolo_original) == ("bitget", "futuro", "BTC/USDT:USDT")
+    assert (ps.corretora, ps.mercado, ps.simbolo_original) == ("gate", "futuro", "BTC/USDT:USDT")
+    assert pl.preco == pytest.approx(100.0) and ps.preco == pytest.approx(101.0)
+    assert c.spread_abertura_pct == pytest.approx(1.0)
+    assert (pl.funding_pct, pl.funding_intervalo_h) == (0.02, 8)  # as duas pontas futuras tem funding
+    assert (ps.funding_pct, ps.funding_intervalo_h) == (0.01, 4)
+    assert pl.taxa_taker_pct == 0.06 and ps.taxa_taker_pct == 0.06 and c.custo_taxas_pct == pytest.approx(0.24)
+
+
+def test_funding_das_duas_pontas_com_intervalos_diferentes():
+    # Operacao de 6h: o long (bitget) cobra de 1 em 1h (6 cobrancas) e o short (gate) de 4 em 4h (1 cobranca).
+    m = motor_falso(long_futuro=("bitget", "BTC", 100.0), short_futuro=("gate", "BTC", 101.0), f_medio=-0.5,
+                    funding_long=(0.01, 1), funding_short=(0.03, 4), config=cfg_com(tempo_operacao_h=6))
+    c = por_chave(m.candidatos(agora=10))[("BTC/USDT", "futuro_futuro", "bitget", "futuro", "gate", "futuro")]
+    assert c.funding_esperado_pct == pytest.approx(0.03 * 1 - 0.01 * 6)  # recebe no short, paga no long
+    assert c.fr_yield_8h_pct == pytest.approx(0.03 * 8 / 4 - 0.01 * 8 / 1)  # normalizado para 8h
+    assert c.rp_bruto_pct == pytest.approx(1.0 - 0.5)
+    assert c.rp_liquido_pct == pytest.approx(0.5 - 0.24 + (0.03 - 0.06))
+
+    # Na direcao contraria as pontas trocam de papel: o funding troca de sinal.
+    inverso = por_chave(m.candidatos(agora=10))[("BTC/USDT", "futuro_futuro", "gate", "futuro", "bitget", "futuro")]
+    assert inverso.funding_esperado_pct == pytest.approx(0.01 * 6 - 0.03 * 1)
+    assert inverso.fr_yield_8h_pct == pytest.approx(0.01 * 8 / 1 - 0.03 * 8 / 4)
+
+
+def test_duas_direcoes_geram_dois_candidatos_distintos(tmp_path):
+    banco = Banco(str(tmp_path / "s.db"))
+    m = motor_falso(long_futuro=("bitget", "BTC", 100.0), short_futuro=("gate", "BTC", 101.0), banco=banco)
+    candidatos = m.candidatos(agora=10)
+    assert [c.chave for c in candidatos] == [
+        ("BTC/USDT", "futuro_futuro", "bitget", "futuro", "gate", "futuro"),
+        ("BTC/USDT", "futuro_futuro", "gate", "futuro", "bitget", "futuro"),
+    ]
+    ida, volta = candidatos
+    assert ida.spread_abertura_pct == pytest.approx(1.0)  # compra a 100 na bitget, vende a 101 na gate
+    # Volta: compra no ask da gate (101 + 0,1%) e vende no bid da bitget (100 - 0,1%).
+    assert (volta.ponta_long.preco, volta.ponta_short.preco) == (pytest.approx(101.101), pytest.approx(99.9))
+    assert volta.spread_abertura_pct == pytest.approx((99.9 - 101.101) / 101.101 * 100)
+    # Cada direcao tem o seu periodo (amostras gravadas com a sua chave).
+    m.ciclo(agora=10.5)
+    assert len(banco.amostras("BTC/USDT|futuro_futuro|bitget|futuro|gate|futuro", desde=0)) == 1
+    assert len(banco.amostras("BTC/USDT|futuro_futuro|gate|futuro|bitget|futuro", desde=0)) == 1
+    banco.fechar()
+
+
+def test_futuro_futuro_na_mesma_corretora_nao_gera():
+    e = EstadoMercados()
+    colocar_ponta(e, "gate", "futuro", "BTC", 100.0, "long", 10.0)
+    m = Motor(cfg, e, DadosLentosFalso(taxas={("gate", "futuro"): 0.06}))
+    assert m.candidatos(agora=10) == []
+
+
+def test_candidato_futuro_futuro_com_corretora_so_de_futuros_em_usdc():
+    e = EstadoMercados()
+    colocar_ponta(e, "hyperliquid", "futuro", "BTC", 100.0, "long", 10.0, cotacao="USDC")
+    colocar_ponta(e, "gate", "futuro", "BTC", 101.0, "short", 10.0)
+    dados = DadosLentosFalso(taxas={("hyperliquid", "futuro"): 0.045, ("gate", "futuro"): 0.05})
+    m = Motor(cfg, e, dados, cotacoes=lambda: {"USDC": 0.99})
+    c = por_chave(m.candidatos(agora=10))[("BTC/USDT", "futuro_futuro", "hyperliquid", "futuro", "gate", "futuro")]
+    assert c.ponta_long.simbolo_original == "BTC/USDC:USDC" and c.aviso_cotacao is False
+    assert c.ponta_long.preco == pytest.approx(99.0)  # 100 USDC x 0,99
+    assert c.spread_abertura_pct == pytest.approx((101 - 99) / 99 * 100)
+    assert c.custo_taxas_pct == pytest.approx(2 * (0.045 + 0.05))
+
+
+def test_sinal_futuro_futuro_tipo_chave_e_id():
+    m = motor_falso(long_futuro=("bitget", "AKAM", 89.14), short_futuro=("gate", "AKAM", 100.32),
+                    f_medio=-11.91, funding_short=(0.01, 8), funding_long=(0.0, 8))
+    eventos = m.ciclo(agora=10)
+    assert [e.tipo for e in eventos] == ["novo"]  # a direcao contraria (gate x bitget) tem RP negativo
+    s = eventos[0].sinal
+    assert s["id"] == "AKAM-futuro_futuro-bitget-gate-19700101T000010Z"
+    assert (s["par"], s["tipo"], s["modo"]) == ("AKAM/USDT", "futuro_futuro", "lucro")
+    assert (s["ponta_long"]["corretora"], s["ponta_long"]["mercado"]) == ("bitget", "futuro")
+    assert (s["ponta_short"]["corretora"], s["ponta_short"]["mercado"]) == ("gate", "futuro")
+    assert (s["ponta_long"]["funding_pct"], s["ponta_long"]["funding_intervalo_h"]) == (0.0, 8)
+    assert (s["ponta_short"]["funding_pct"], s["ponta_short"]["funding_intervalo_h"]) == (0.01, 8)
+    assert s["funding_esperado_pct"] == pytest.approx(0.01)
+    c = m.candidatos(agora=10)[0]
+    assert c.chave == chave_de(("AKAM", "bitget", "futuro", "gate", "futuro")) == (
+        "AKAM/USDT", "futuro_futuro", "bitget", "futuro", "gate", "futuro")
+
+
+def motor_dois_tipos(**kwargs) -> Motor:
+    """Compram: spot da Gate (ask 100) e futuro da MEXC (ask 100). Vende: futuro da Bitget (bid 101).
+
+    Gera 2 spot x futuro (gate/spot x bitget e gate/spot x mexc) e 2 futuro x futuro (mexc x bitget e bitget x mexc).
+    """
+    return motor_falso(spot=("gate", "BTC", 100.0), futuro=("bitget", "BTC", 101.0),
+                       long_futuro=("mexc", "BTC", 100.0), **kwargs)
+
+
+def test_motor_gera_os_dois_tipos():
+    tipos = [c.tipo for c in motor_dois_tipos().candidatos(agora=10)]
+    assert sorted(tipos) == ["futuro_futuro", "futuro_futuro", "spot_futuro", "spot_futuro"]
+
+
+def test_filtro_tipos_escolhe_o_tipo_no_ciclo_e_o_motor_segue_amostrando_os_dois():
+    m = motor_dois_tipos(config=cfg_com(rp_min_lucro_pct=-10.0))  # todos os candidatos passam no modo Lucro
+    chave_ff = chave_de(("BTC", "mexc", "futuro", "bitget", "futuro"))
+
+    m.sessao.filtros = Filtros(tipos=["spot_futuro"])
+    eventos = m.ciclo(agora=10)
+    assert [(e.tipo, e.sinal["tipo"]) for e in eventos] == [("novo", "spot_futuro")] * 2
+    assert m._historicos[chave_ff].ultima_amostra == 10.0  # o futuro x futuro segue amostrado (metricas aquecidas)
+
+    m.sessao.filtros = Filtros(tipos=["futuro_futuro"])
+    eventos = m.ciclo(agora=10.5)
+    assert sorted((e.tipo, e.sinal["tipo"]) for e in eventos) == [
+        ("encerrado", "spot_futuro"), ("encerrado", "spot_futuro"),
+        ("novo", "futuro_futuro"), ("novo", "futuro_futuro"),
+    ]
+    assert m._historicos[chave_ff].ultima_amostra == 10.0  # usou as amostras de antes, sem recomecar
+
+    m.sessao.filtros = Filtros()  # sem filtro de tipo: os dois
+    m.ciclo(agora=11)
+    assert sorted(s["tipo"] for s in m.sinais_ativos()) == ["futuro_futuro"] * 2 + ["spot_futuro"] * 2
+
+
+def test_selecao_inclui_futuro_x_futuro_e_corretora_so_de_futuros():
+    e = EstadoMercados()
+    ticker(e, "hyperliquid", "futuro", "BTC", 99.9, 100.0, 10.0, cotacao="USDC")  # so futuros, em USDC
+    ticker(e, "gate", "futuro", "BTC", 100.5, 100.6, 10.0)  # A = 0,5% com o long na Hyperliquid
+    esperado = {"hyperliquid": {"BTC/USDC:USDC"}, "gate": {"BTC/USDT:USDT"}}
+    m = motor_so_tickers(e, {"USDC": 1.0})
+    assert m.selecao_livros(agora=10) == esperado
+    m.sessao.filtros = Filtros(tipos=["spot_futuro"])  # o filtro de tipo nao muda quais livros abrem
+    assert m.selecao_livros(agora=10.5) == esperado
+
+
+def test_selecao_futuro_x_futuro_abaixo_do_minimo_fica_vazia():
+    e = EstadoMercados()
+    ticker(e, "gate", "futuro", "BTC", 99.9, 100.0, 10.0)
+    ticker(e, "mexc", "futuro", "BTC", 100.2, 100.3, 10.0)  # gate x mexc: 0,2%; mexc x gate: negativo
+    assert motor_so_tickers(e).selecao_livros(agora=10) == {}
+
+
+@pytest.mark.parametrize("minimo, esperado", [
+    (0.0, {"gate": {"BTC/USDT"}, "bitget": {"BTC/USDT:USDT"}}),  # spread exatamente 0 chega ao minimo 0
+    (-0.5, {"gate": {"BTC/USDT", "BTC/USDT:USDT"}, "bitget": {"BTC/USDT:USDT"}}),  # negativos tambem entram
+])
+def test_selecao_com_minimo_zero_ou_negativo(minimo, esperado):
+    e = EstadoMercados()
+    ticker(e, "gate", "spot", "BTC", 99.9, 100.0, 10.0)
+    ticker(e, "bitget", "futuro", "BTC", 100.0, 100.1, 10.0)  # gate/spot x bitget: A = 0%
+    ticker(e, "gate", "futuro", "BTC", 99.8, 100.2, 10.0)  # gate/futuro x bitget: A ~ -0,2%; gate x gate: ~ -0,2%
+    m = Motor(cfg_com(spread_min_livro_pct=minimo), e, DadosLentosFalso())
+    assert m.selecao_livros(agora=10) == esperado
+
+
+def test_selecao_acompanha_mercados_que_aparecem_e_somem():
+    e = EstadoMercados()
+    m = motor_so_tickers(e)
+    ticker(e, "gate", "spot", "BTC", 99.9, 100.0, 10.0)
+    ticker(e, "bitget", "futuro", "BTC", 100.1, 100.2, 10.0)  # 0,1%: abaixo do minimo
+    assert m.selecao_livros(agora=10) == {}
+    ticker(e, "mexc", "futuro", "BTC", 100.35, 100.45, 10.0)  # mercado novo: gate x mexc 0,35%; bitget x mexc ~0,15%
+    assert m.selecao_livros(agora=10) == {"gate": {"BTC/USDT"}, "mexc": {"BTC/USDT:USDT"}}
+    e.marcar_desconectada("mexc")
+    ticker(e, "bitget", "futuro", "BTC", 100.5, 100.6, 100.0)  # mais de 60s depois: so gate x bitget (0,5%)
+    ticker(e, "gate", "spot", "BTC", 99.9, 100.0, 100.0)
+    assert m.selecao_livros(agora=100) == {"gate": {"BTC/USDT"}, "bitget": {"BTC/USDT:USDT"}}
+
+
+def test_selecao_so_guarda_os_simbolos_das_combinacoes_escolhidas():
+    e = EstadoMercados()
+    for i in range(20):  # 20 ativos com spread abaixo do minimo
+        ticker(e, "gate", "spot", f"X{i}", 99.9, 100.0, 10.0)
+        ticker(e, "bitget", "futuro", f"X{i}", 100.1, 100.2, 10.0)
+    ticker(e, "gate", "spot", "BTC", 99.9, 100.0, 10.0)
+    ticker(e, "bitget", "futuro", "BTC", 100.5, 100.6, 10.0)
+    m = motor_so_tickers(e)
+    m.selecao_livros(agora=10)
+    assert list(m._simbolos_livro) == [("BTC", "gate", "spot", "bitget", "futuro")]
+
+
+def test_candidatos_acompanham_livros_que_aparecem_e_somem():
+    m = motor_falso(spot=("gate", "BTC", 100.0), futuro=("bitget", "BTC", 101.0))
+    assert len(m.candidatos(agora=10)) == 1
+    colocar_ponta(m.estado, "mexc", "futuro", "BTC", 101.5, "short", 10.0)
+    m.dados_lentos.taxas[("mexc", "futuro")] = 0.06
+    chaves = {c.chave for c in m.candidatos(agora=10)}
+    assert chaves == {
+        ("BTC/USDT", "spot_futuro", "gate", "spot", "bitget", "futuro"),
+        ("BTC/USDT", "spot_futuro", "gate", "spot", "mexc", "futuro"),
+        ("BTC/USDT", "futuro_futuro", "bitget", "futuro", "mexc", "futuro"),
+        ("BTC/USDT", "futuro_futuro", "mexc", "futuro", "bitget", "futuro"),
+    }
+    m.estado.marcar_desconectada("mexc")
+    assert [c.chave for c in m.candidatos(agora=10)] == [CHAVE]
 
 
 # ---------------------------------------------------------------------------
@@ -787,6 +1083,34 @@ def test_rodar_dois_ciclos_com_corretoras_falsas(tmp_path, caplog):
     assert registros[0]["sinal"]["ponta_long"]["corretora"] == "gate"
     assert registros[0]["sinal"]["ponta_short"]["taxa_taker_pct"] == 0.06  # taxa da API (dados lentos)
     assert len(banco.amostras(chave_texto(CHAVE), desde=0)) == 1
+    banco.fechar()
+
+
+def test_rodar_futuro_x_futuro_com_corretoras_so_de_futuros(tmp_path):
+    # Nenhuma das duas tem spot: sem o futuro x futuro elas ficariam sem tickers e sem livros.
+    def so_futuro(bid, ask):
+        return ExchangeFalsa(
+            {"BTC/USDT:USDT": market_ccxt("BTC/USDT:USDT", "BTC")},
+            tickers={"BTC/USDT:USDT": {"bid": bid, "ask": ask, "quoteVolume": 5e6, "percentage": 1.0}},
+            livros={"BTC/USDT:USDT": {"bids": [[bid, 10.0]], "asks": [[ask, 10.0]], "timestamp": None}},
+        )
+
+    exchanges = {"gate": so_futuro(99.9, 100.0), "bitget": so_futuro(101.0, 101.1)}  # gate x bitget: A = 1%
+    config = config_servico(tmp_path)
+    asyncio.run(asyncio.wait_for(
+        principal.rodar(config, criar_exchange=exchanges.__getitem__, relogio=lambda: 1000.0, ciclos=2),
+        timeout=5))
+
+    assert set(exchanges["gate"].tickers_pedidos) == {"BTC/USDT:USDT"}
+    assert set(exchanges["bitget"].tickers_pedidos) == {"BTC/USDT:USDT"}
+    assert set(exchanges["gate"].livros_pedidos) == {"BTC/USDT:USDT"}
+    assert set(exchanges["bitget"].livros_pedidos) == {"BTC/USDT:USDT"}
+    banco = Banco(config.banco)
+    registros = banco.sinais_do_dia("1970-01-01")
+    # As duas direcoes viram sinal (RP minimo de -5% no config_servico).
+    assert sorted((r["sinal"]["ponta_long"]["corretora"], r["sinal"]["ponta_short"]["corretora"])
+                  for r in registros) == [("bitget", "gate"), ("gate", "bitget")]
+    assert {r["sinal"]["tipo"] for r in registros} == {"futuro_futuro"}
     banco.fechar()
 
 

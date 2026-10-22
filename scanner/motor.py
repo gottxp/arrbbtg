@@ -1,16 +1,27 @@
 """Motor: transforma o estado dos mercados em candidatos e sinais (especificacao, secoes 3 a 5).
 
 A cada ciclo (ciclo_ms da config, padrao 500 ms) o __main__ chama:
-  1. `ciclo(agora)`: monta os candidatos spot x futuro, aplica os filtros e o modo da sessao,
-     passa ao gerenciador de sinais e grava eventos e amostras no banco;
+  1. `ciclo(agora)`: monta os candidatos spot x futuro e futuro x futuro, aplica os filtros e o
+     modo da sessao, passa ao gerenciador de sinais e grava eventos e amostras no banco;
   2. `selecao_livros(agora)`: etapa 2 da coleta, diz de quais pares abrir o livro completo.
+
+O motor sempre calcula os dois tipos; quem escolhe qual aparece e o filtro "tipos de oportunidade"
+(em `passa`). Assim as metricas do periodo dos dois tipos continuam aquecidas quando o dono liga
+ou desliga um tipo no painel.
 
 Precos: o estado guarda os livros com preco por 1 unidade do ativo, mas ainda na moeda de
 cotacao do par (USDT, USDC, USDG). A troca para USDT acontece aqui, com as cotacoes do momento;
 sem cotacao valida, usa 1:1 e marca o candidato com aviso_cotacao.
 
 Combinacao ("combo"): (ativo, corretora long, mercado long, corretora short, mercado short),
-ex.: ("BTC", "gate", "spot", "bitget", "futuro"). No spot x futuro o spot e sempre o long.
+ex.: ("BTC", "gate", "spot", "bitget", "futuro") ou ("BTC", "gate", "futuro", "mexc", "futuro").
+No spot x futuro o spot e sempre o long; o futuro x futuro e sempre entre corretoras diferentes
+e vale nas duas direcoes.
+
+Desempenho: com 9 corretoras e centenas de ativos sao dezenas de milhares de combinacoes. Por
+isso cada mercado e lido uma vez so por ciclo (e nao uma vez por combinacao), as combinacoes sao
+montadas so com os mercados que tem dado valido, e a lista montada fica guardada enquanto esses
+mercados nao mudam.
 
 Nada aqui acessa a rede: tudo vem do estado (coletores) e dos dados lentos (funding e taxas).
 Regra geral: dado em que nao se pode confiar (velho, sem liquidez, sem taxa, numero invalido)
@@ -85,6 +96,39 @@ def pares_spot_futuro(mercados: dict[str, set[tuple[str, str]]]) -> list[tuple]:
     return combinacoes
 
 
+def pares_futuro_futuro(mercados: dict[str, set[tuple[str, str]]]) -> list[tuple]:
+    """Todas as combinacoes futuro x futuro do mesmo ativo, sempre entre corretoras diferentes.
+
+    mercados: {corretora: {(mercado, ativo), ...}}, como em pares_spot_futuro.
+    Devolve (ativo, corretora do long, "futuro", corretora do short, "futuro") nas duas direcoes
+    (gate x mexc e mexc x gate), em ordem alfabetica. Futuro pode ser vendido em qualquer
+    corretora, entao as duas direcoes valem.
+    """
+    futuros: dict[str, list[str]] = {}  # ativo -> corretoras que tem o futuro dele
+    for corretora, pares in mercados.items():
+        for mercado, ativo in pares:
+            if mercado == "futuro":
+                futuros.setdefault(ativo, []).append(corretora)
+
+    combinacoes = []
+    for ativo in sorted(futuros):
+        corretoras = sorted(futuros[ativo])
+        for corretora_long in corretoras:
+            for corretora_short in corretoras:
+                if corretora_long != corretora_short:
+                    combinacoes.append((ativo, corretora_long, "futuro", corretora_short, "futuro"))
+    return combinacoes
+
+
+def combinacoes(mercados: dict[str, set[tuple[str, str]]]) -> list[tuple]:
+    """Todas as combinacoes que o scanner acompanha: primeiro as spot x futuro, depois as futuro x futuro.
+
+    E a unica funcao que monta a lista completa: o motor (candidatos e etapa 2) e a escolha dos
+    tickers usam esta, para os dois tipos andarem sempre juntos.
+    """
+    return pares_spot_futuro(mercados) + pares_futuro_futuro(mercados)
+
+
 def chave_de(combo: tuple) -> tuple:
     """A chave do sinal de uma combinacao: igual a `Candidato.chave` do candidato que ela gera."""
     ativo, corretora_long, mercado_long, corretora_short, mercado_short = combo
@@ -101,12 +145,13 @@ def simbolos_para_tickers(vencedores: dict[str, dict[tuple[str, str], str]]) -> 
     """Quais simbolos cada corretora deve acompanhar na etapa 1 (tickers).
 
     vencedores: {corretora: {(mercado, ativo): simbolo do ccxt}} (ColetorCcxt.simbolos_por_chave).
-    So entram os simbolos que formam pelo menos uma combinacao spot x futuro com alguma corretora;
-    o resto nunca viraria sinal. Corretora sem nenhum simbolo util fica fora do resultado.
+    So entram os simbolos que formam pelo menos uma combinacao (spot x futuro ou futuro x futuro)
+    com alguma corretora; o resto nunca viraria sinal. Uma corretora so de futuros (ex.: Hyperliquid)
+    entra pelos pares futuro x futuro. Corretora sem nenhum simbolo util fica fora do resultado.
     """
     mercados = {corretora: set(chaves) for corretora, chaves in vencedores.items()}
     usados: dict[str, set[str]] = {}
-    for ativo, corretora_long, mercado_long, corretora_short, mercado_short in pares_spot_futuro(mercados):
+    for ativo, corretora_long, mercado_long, corretora_short, mercado_short in combinacoes(mercados):
         usados.setdefault(corretora_long, set()).add(vencedores[corretora_long][(mercado_long, ativo)])
         usados.setdefault(corretora_short, set()).add(vencedores[corretora_short][(mercado_short, ativo)])
     return {corretora: sorted(simbolos) for corretora, simbolos in usados.items()}
@@ -119,7 +164,17 @@ def simbolos_para_tickers(vencedores: dict[str, dict[tuple[str, str], str]]) -> 
 
 def _numero_valido(valor) -> bool:
     """True para numero real (int/float, nao bool, nao NaN nem infinito)."""
+    if type(valor) is float:  # o caso comum (milhares de vezes por ciclo): uma checagem so
+        return math.isfinite(valor)
     return isinstance(valor, (int, float)) and not isinstance(valor, bool) and math.isfinite(valor)
+
+
+def _todos_validos(*valores) -> bool:
+    """True se todos os valores sao numero real (veja _numero_valido)."""
+    for valor in valores:
+        if not _numero_valido(valor):
+            return False
+    return True
 
 
 def _nome_combo(combo: tuple) -> str:
@@ -155,6 +210,38 @@ def _executar(niveis: list[tuple[float, float]], tamanho_usd: float) -> float | 
     if preco is None or not _numero_valido(preco) or preco <= 0:
         return None
     return preco
+
+
+def _agrupar(chaves) -> dict[str, set[tuple[str, str]]]:
+    """Chaves (corretora, mercado, ativo) no formato que `combinacoes` recebe: {corretora: {(mercado, ativo)}}."""
+    mercados: dict[str, set[tuple[str, str]]] = {}
+    for corretora, mercado, ativo in chaves:
+        mercados.setdefault(corretora, set()).add((mercado, ativo))
+    return mercados
+
+
+class _CombinacoesGuardadas:
+    """`combinacoes(mercados)` com a ultima lista guardada: so monta de novo quando os mercados mudam.
+
+    De um ciclo para o outro os mercados com dado valido quase nunca mudam, e montar a lista
+    (dezenas de milhares de combinacoes) custa bem mais que comparar os mercados.
+    Cada item e (combo, chave do long, chave do short), com chave = (corretora, mercado, ativo),
+    para quem percorre nao precisar montar as chaves a cada ciclo.
+    Quem recebe a lista so a percorre (nunca altera).
+    """
+
+    def __init__(self):
+        self._mercados: dict | None = None  # os mercados da ultima lista montada
+        self._lista: list[tuple[tuple, tuple, tuple]] = []
+
+    def obter(self, mercados: dict[str, set[tuple[str, str]]]) -> list[tuple[tuple, tuple, tuple]]:
+        if mercados != self._mercados:
+            self._mercados = mercados
+            self._lista = [
+                (combo, (combo[1], combo[2], combo[0]), (combo[3], combo[4], combo[0]))
+                for combo in combinacoes(mercados)
+            ]
+        return self._lista
 
 
 @dataclass
@@ -197,7 +284,7 @@ class _Historico:
 
     def adicionar(self, ts: float, a: float, f: float, lote_long: float, lote_short: float) -> None:
         """Guarda uma amostra. Recusa NaN e infinito (ValueError): eles estragariam as medias."""
-        if not all(_numero_valido(v) for v in (ts, a, f, lote_long, lote_short)):
+        if not _todos_validos(ts, a, f, lote_long, lote_short):
             raise ValueError(f"amostra com numero invalido: ts={ts} a={a} f={f} lotes={lote_long}/{lote_short}")
         self.janela.adicionar(ts, a, f)
         self._lotes.append((ts, lote_long, lote_short))
@@ -265,25 +352,36 @@ class Motor:
         self._historicos: dict[tuple, _Historico] = {}  # chave do sinal -> amostras do periodo
         self._amostras_pendentes: list[tuple] = []  # amostras novas que `ciclo` ainda vai gravar no banco
         self._ultima_vez_acima: dict[tuple, float] = {}  # etapa 2: combo -> ultima vez acima do spread minimo
-        self._simbolos_livro: dict[tuple, tuple[tuple[str, str], tuple[str, str]]] = {}  # etapa 2: combo -> simbolos
+        # Etapa 2: combo com livro (as de _ultima_vez_acima) -> ((corretora, simbolo) do long, do short).
+        self._simbolos_livro: dict[tuple, tuple[tuple[str, str], tuple[str, str]]] = {}
         self._avisados: set = set()  # avisos de log ja dados (cada um aparece uma vez so)
+        # Listas de combinacoes guardadas: uma para os candidatos (mercados com livro valido) e uma
+        # para a etapa 2 (mercados com ticker valido). Separadas, para uma nao desfazer a outra.
+        self._combos_candidatos = _CombinacoesGuardadas()
+        self._combos_selecao = _CombinacoesGuardadas()
 
     # --- API -----------------------------------------------------------------
 
     def candidatos(self, agora: float) -> list[Candidato]:
-        """Os candidatos spot x futuro de agora, ANTES dos filtros. Cada chamada cria objetos novos.
+        """Os candidatos de agora (spot x futuro e futuro x futuro), ANTES dos filtros.
 
-        Combinacao sem livro valido nas duas pontas, sem liquidez para o tamanho de referencia
-        ou sem taxa taker conhecida nao gera candidato. Tambem acrescenta as amostras do periodo
-        (a primeira quando a combinacao aparece; depois a cada `amostra_s`).
+        Gera sempre os dois tipos: o filtro "tipos de oportunidade" e aplicado depois, em `passa`.
+        Cada chamada cria objetos novos. Combinacao sem livro valido nas duas pontas, sem liquidez
+        para o tamanho de referencia ou sem taxa taker conhecida nao gera candidato. Tambem
+        acrescenta as amostras do periodo (a primeira quando a combinacao aparece; depois a cada
+        `amostra_s`).
         """
         modo = self._modo_da_sessao()
         duracao_invertida_s, metrica = self._ajustar_sessao()
         cotacoes = self._cotacoes_validas()
+        # Cada mercado e lido uma vez so; ficam os que tem livro valido agora.
+        lados = self._lados_com_livro(agora, cotacoes)
         resultado = []
         vistas = set()
-        for combo in pares_spot_futuro(self.estado.mercados()):
-            candidato = self._candidato(combo, agora, cotacoes, modo, duracao_invertida_s, metrica)
+        # So as combinacoes com livro valido nas duas pontas: as outras nao gerariam candidato.
+        for combo, chave_long, chave_short in self._combos_candidatos.obter(_agrupar(lados)):
+            candidato = self._candidato(combo, lados[chave_long], lados[chave_short], agora, modo,
+                                        duracao_invertida_s, metrica)
             if candidato is not None:
                 resultado.append(candidato)
                 vistas.add(candidato.chave)
@@ -309,31 +407,35 @@ class Motor:
     def selecao_livros(self, agora: float) -> dict[str, set[str]]:
         """Etapa 2: os simbolos que devem ter livro completo, por corretora.
 
-        Para cada combinacao calcula o spread de abertura com os TICKERS (ask do long e bid do
-        short, em USDT). Quem passa de `spread_min_livro_pct` ganha o livro das duas pontas e o
-        mantem por `manter_livro_s` depois de cair abaixo (mesmo se o ticker sumir nesse tempo).
+        Para cada combinacao (spot x futuro e futuro x futuro) calcula o spread de abertura com os
+        TICKERS (ask do long e bid do short, em USDT). Quem passa de `spread_min_livro_pct` ganha o
+        livro das duas pontas e o mantem por `manter_livro_s` depois de cair abaixo (mesmo se o
+        ticker sumir nesse tempo). O filtro "tipos de oportunidade" nao muda quais livros abrem.
         """
         cotacoes = self._cotacoes_validas()
-        spreads: dict[tuple, float] = {}
-        for combo in pares_spot_futuro(self.estado.mercados()):
-            ativo, corretora_long, mercado_long, corretora_short, mercado_short = combo
-            ticker_long = self.estado.obter_ticker(corretora_long, mercado_long, ativo, agora)
-            ticker_short = self.estado.obter_ticker(corretora_short, mercado_short, ativo, agora)
-            if ticker_long is None or ticker_short is None:
+        minimo = self.cfg.spread_min_livro_pct
+        precos = self._precos_dos_tickers(agora, cotacoes)  # cada mercado lido uma vez so
+        acima: dict[tuple, float] = {}  # combo -> spread, so as que chegam ao minimo agora
+        for combo, chave_long, chave_short in self._combos_selecao.obter(_agrupar(precos)):
+            ask_long, bid_short = precos[chave_long][0], precos[chave_short][1]
+            if ask_long is None or bid_short is None:
                 continue
-            simbolo_long, simbolo_short = ticker_long.get("simbolo_original"), ticker_short.get("simbolo_original")
-            if simbolo_long is None or simbolo_short is None:
-                continue
-            fator_long, _ = _fator_usdt(ativo, ticker_long.get("cotacao"), cotacoes)
-            fator_short, _ = _fator_usdt(ativo, ticker_short.get("cotacao"), cotacoes)
-            ask_long, bid_short = ticker_long["ask"] * fator_long, ticker_short["bid"] * fator_short
-            if not (_numero_valido(ask_long) and _numero_valido(bid_short) and ask_long > 0 and bid_short > 0):
-                continue
-            spreads[combo] = spread_abertura(ask_long, bid_short)
-            self._simbolos_livro[combo] = ((corretora_long, simbolo_long), (corretora_short, simbolo_short))
+            if minimo > 0 and bid_short <= ask_long:
+                continue  # spread zero ou negativo nunca chega a um minimo positivo: pula a conta (a maioria)
+            spread = spread_abertura(ask_long, bid_short)
+            # Abaixo do minimo nao muda nada em pares_para_livro: nem entra no dicionario.
+            if spread >= minimo:
+                acima[combo] = spread
 
-        escolhidos = pares_para_livro(spreads, self.cfg.spread_min_livro_pct, self._ultima_vez_acima,
-                                      agora, self.cfg.manter_livro_s)
+        escolhidos = pares_para_livro(acima, minimo, self._ultima_vez_acima, agora, self.cfg.manter_livro_s)
+        # Simbolos das escolhidas: os do ticker de agora (mesma condicao do spread acima); se o
+        # ticker sumiu, ficam os da ultima vez.
+        for combo in escolhidos:
+            ativo, corretora_long, mercado_long, corretora_short, mercado_short = combo
+            long = precos.get((corretora_long, mercado_long, ativo))
+            short = precos.get((corretora_short, mercado_short, ativo))
+            if long is not None and short is not None and long[0] is not None and short[1] is not None:
+                self._simbolos_livro[combo] = ((corretora_long, long[2]), (corretora_short, short[2]))
         # Esquece os simbolos de quem saiu de vez (pares_para_livro ja tirou do _ultima_vez_acima).
         for combo in [c for c in self._simbolos_livro if c not in self._ultima_vez_acima]:
             del self._simbolos_livro[combo]
@@ -411,15 +513,53 @@ class Motor:
             if _numero_valido(valor) and valor > 0
         }
 
+    # --- Leitura do estado (cada mercado uma vez por ciclo) ------------------
+
+    def _lados_com_livro(self, agora: float, cotacoes: dict[str, float]) -> dict[tuple[str, str, str], _Lado]:
+        """{(corretora, mercado, ativo): lado} dos mercados com livro valido agora, ja em USDT.
+
+        Mercado sem livro valido (velho, conexao silenciosa ou nunca chegou) fica de fora.
+        """
+        lados = {}
+        for corretora, pares in self.estado.mercados().items():
+            for mercado, ativo in pares:
+                lado = self._ler_lado(corretora, mercado, ativo, agora, cotacoes)
+                if lado is not None:
+                    lados[(corretora, mercado, ativo)] = lado
+        return lados
+
+    def _precos_dos_tickers(self, agora: float, cotacoes: dict[str, float]) -> dict[tuple[str, str, str], tuple]:
+        """{(corretora, mercado, ativo): (ask, bid, simbolo)} dos tickers validos agora, com ask e bid em USDT.
+
+        Fica de fora o mercado sem ticker valido (velho ou conexao silenciosa) ou sem simbolo.
+        ask ou bid que nao e numero real maior que zero vira None: o mercado nao serve de long
+        (sem ask) ou de short (sem bid).
+        """
+        precos = {}
+        fatores: dict[str | None, float] = {}  # moeda de cotacao -> fator: a conta so depende da moeda
+        for corretora, pares in self.estado.mercados().items():
+            for mercado, ativo in pares:
+                ticker = self.estado.obter_ticker(corretora, mercado, ativo, agora)
+                if ticker is None or ticker.get("simbolo_original") is None:
+                    continue
+                cotacao = ticker.get("cotacao")
+                if cotacao not in fatores:
+                    fatores[cotacao], _ = _fator_usdt(ativo, cotacao, cotacoes)
+                fator = fatores[cotacao]
+                ask, bid = ticker["ask"] * fator, ticker["bid"] * fator
+                precos[(corretora, mercado, ativo)] = (
+                    ask if _numero_valido(ask) and ask > 0 else None,
+                    bid if _numero_valido(bid) and bid > 0 else None,
+                    ticker["simbolo_original"],
+                )
+        return precos
+
     # --- Um candidato --------------------------------------------------------
 
-    def _candidato(self, combo: tuple, agora: float, cotacoes: dict[str, float], modo: str,
+    def _candidato(self, combo: tuple, long: _Lado, short: _Lado, agora: float, modo: str,
                    duracao_invertida_s: float, metrica: str) -> Candidato | None:
+        """O candidato da combinacao, com o livro das duas pontas ja lido (long e short), ou None."""
         ativo, corretora_long, mercado_long, corretora_short, mercado_short = combo
-        long = self._ler_lado(corretora_long, mercado_long, ativo, agora, cotacoes)
-        short = self._ler_lado(corretora_short, mercado_short, ativo, agora, cotacoes)
-        if long is None or short is None:
-            return None  # sem livro valido (velho, conexao silenciosa ou nunca chegou)
 
         # Abrir: o long compra no ask e o short vende no bid. Fechar: o long vende no bid e o short recompra no ask.
         tamanho = self.cfg.tamanho_referencia_usd
@@ -432,7 +572,7 @@ class Motor:
         # Lote: quanto vale (em $) o melhor nivel do lado executado ao abrir.
         lote_long = long.asks[0][0] * long.asks[0][1]
         lote_short = short.bids[0][0] * short.bids[0][1]
-        if not all(_numero_valido(v) for v in (a, f, lote_long, lote_short)):
+        if not _todos_validos(a, f, lote_long, lote_short):
             return None
 
         taxa_long = self._taxa(corretora_long, mercado_long, combo)
@@ -453,7 +593,7 @@ class Motor:
         bruto = rp_bruto(a, f_metrica)
         liquido = rp_liquido(bruto, custo, self.cfg.margem_slippage_pct, funding)
         rendimento_8h = fr_yield_8h(fr_short, intervalo_short, fr_long, intervalo_long)
-        if not all(_numero_valido(v) for v in (bruto, liquido, rendimento_8h)):
+        if not _todos_validos(bruto, liquido, rendimento_8h):
             return None
 
         return Candidato(
@@ -486,8 +626,10 @@ class Motor:
         e a variacao 24h. O preco vem sempre do livro, que o estado so entrega se estiver valido.
         """
         livro = self.estado.obter_livro(corretora, mercado, ativo, agora)
+        if livro is None:
+            return None  # o caso mais comum (so os pares interessantes tem livro): nem le o ticker
         ticker = self.estado.ticker_guardado(corretora, mercado, ativo)
-        if livro is None or ticker is None:
+        if ticker is None:
             return None
         fator, aviso = _fator_usdt(ativo, ticker.get("cotacao"), cotacoes)
         volume = ticker.get("volume_24h_usd")
