@@ -8,3 +8,8 @@ requires-python = ">=3.12"
 # Os testes ficam em tests/ e enxergam o pacote "scanner" a partir da raiz do projeto.
 testpaths = ["tests"]
 pythonpath = ["."]
+# O TestClient do FastAPI prefere o pacote httpx2 (nao instalado aqui) e avisa; com o httpx funciona igual.
+# Como os testes rodam com -W error, esse aviso especifico (e so ele) fica de fora.
+filterwarnings = [
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]

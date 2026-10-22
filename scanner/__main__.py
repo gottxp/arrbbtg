@@ -2,8 +2,9 @@
 
 Sobe o scanner: le o config.yaml, conecta nas corretoras (so dados publicos), acompanha os
 tickers de todos os pares, abre o livro dos pares interessantes e, a cada `ciclo_ms`, roda o
-motor (candidatos -> filtros -> sinais -> banco). A cada minuto o log mostra quantos sinais
-estao ativos. Ctrl+C encerra fechando as conexoes e o banco.
+motor (candidatos -> filtros -> sinais -> banco). Junto sobe a API do painel (rotas /api e o
+WebSocket /ws/sinais, que recebe cada evento do motor). A cada minuto o log mostra quantos
+sinais estao ativos. Ctrl+C encerra fechando as conexoes, o painel e o banco.
 
 Com --validar, so confere o config.yaml e sai (nao conecta em nada).
 """
@@ -15,12 +16,14 @@ import sys
 import time
 from collections.abc import Callable
 
+from scanner.api import conferir_painel, criar_app, servir_api
 from scanner.armazenamento import Banco
 from scanner.coletores.ccxt_coletor import ColetorCcxt, criar_exchange_ccxt
 from scanner.coletores.dados_lentos import DadosLentos
 from scanner.config.carregar import Config, ErroConfig, carregar_config
 from scanner.estado import EstadoMercados
 from scanner.motor import Motor, simbolos_para_tickers
+from scanner.sinais import Evento
 
 # Nome fixo (e nao __name__, que vira "__main__" com python -m): fica debaixo do logger "scanner".
 registro = logging.getLogger("scanner.principal")
@@ -77,13 +80,33 @@ async def _ajustar_livros(coletores: dict[str, ColetorCcxt], selecao: dict[str, 
                            nome, type(resultado).__name__, resultado)
 
 
+def _transmitir(publicar: Callable[[list[Evento]], None] | None, eventos: list[Evento]) -> None:
+    """Entrega os eventos do ciclo aos paineis conectados. Nunca levanta erro: o motor nao pode parar por causa do painel."""
+    if publicar is None:
+        return
+    try:
+        publicar(eventos)
+    except Exception:
+        registro.exception("erro ao transmitir os eventos ao painel; o motor segue")
+
+
+async def _servir_painel(app, cfg: Config) -> None:
+    """Sobe a API do painel. Se ela nao subir (ex.: porta em uso), registra e deixa o scanner seguindo sem painel."""
+    try:
+        await servir_api(app, cfg)
+    except Exception as erro:  # cancelamento (Ctrl+C) nao entra aqui
+        registro.error("o painel parou (%s: %s); o scanner segue sem painel ate reiniciar", type(erro).__name__, erro)
+
+
 async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorCcxt], cfg: Config,
-                         relogio: Callable[[], float], ciclos: int | None) -> None:
-    """A cada `ciclo_ms`: roda o ciclo do motor e ajusta os livros abertos (etapa 2).
+                         relogio: Callable[[], float], ciclos: int | None,
+                         publicar: Callable[[list[Evento]], None] | None = None) -> None:
+    """A cada `ciclo_ms`: roda o ciclo do motor, transmite os eventos ao painel e ajusta os livros abertos (etapa 2).
 
     O ajuste dos livros roda numa tarefa propria, fora do ritmo do motor: se a corretora demorar
     para responder, o motor continua rodando e o proximo ajuste so comeca quando o anterior acabar.
     ciclos: quantos ciclos rodar (os testes usam 2); None = ate ser cancelado (Ctrl+C).
+    publicar: recebe os eventos de cada ciclo (o `Transmissor` da API); o motor nunca espera por ele.
     Um erro num ciclo vai para o log e o proximo ciclo tenta de novo.
     """
     intervalo_s = cfg.ciclo_ms / 1000
@@ -99,7 +122,7 @@ async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorCcxt], cfg: C
             proximo = max(proximo + intervalo_s, relogio_do_laco())
             agora = relogio()
             try:
-                motor.ciclo(agora)
+                _transmitir(publicar, motor.ciclo(agora))
                 selecao = motor.selecao_livros(agora)
             except Exception:
                 registro.exception("erro no ciclo do motor; tentando de novo no proximo ciclo")
@@ -144,7 +167,8 @@ async def rodar(
 
     criar_exchange: monta a corretora do ccxt pelo nome (os testes passam corretoras falsas).
     relogio: hora atual em segundos (os testes passam um relogio fixo).
-    Levanta RuntimeError se nenhuma corretora carregar a lista de mercados.
+    Levanta ErroConfig se o bloco `painel` for inseguro (antes de conectar em qualquer corretora) e
+    RuntimeError se nenhuma corretora carregar a lista de mercados.
     """
     estado = EstadoMercados(cfg.max_silencio_conexao_s, cfg.max_idade_livro_s)
     dados_lentos = DadosLentos(cfg.taxas)
@@ -156,6 +180,8 @@ async def rodar(
         for nome in dict.fromkeys(cfg.corretoras):  # sem nomes repetidos, na ordem da config
             exchanges[nome] = criar_exchange(nome)
         banco = Banco(cfg.banco)
+        motor = Motor(cfg, estado, dados_lentos, banco=banco)
+        app = criar_app(motor, banco, cfg, relogio=relogio)  # antes de conectar: painel mal configurado para tudo
 
         carregadas = await _carregar_mercados(exchanges)
         if not carregadas:
@@ -179,8 +205,8 @@ async def rodar(
             dados_lentos.rodar({nome: exchanges[nome] for nome in carregadas}, cfg.intervalo_dados_lentos_s),
             name="dados lentos",
         ))
-        motor = Motor(cfg, estado, dados_lentos, banco=banco)
-        await _laco_do_motor(motor, coletores, cfg, relogio, ciclos)
+        tarefas.append(asyncio.create_task(_servir_painel(app, cfg), name="painel"))
+        await _laco_do_motor(motor, coletores, cfg, relogio, ciclos, publicar=app.state.transmissor.publicar)
     finally:
         await _encerrar(tarefas, coletores, exchanges, banco)
 
@@ -194,6 +220,7 @@ def main(argv=None) -> int:
 
     try:
         cfg = carregar_config(args.config)
+        conferir_painel(cfg)  # usuario sem senha (ou o contrario) para aqui, antes de conectar em qualquer coisa
     except ErroConfig as erro:
         print(f"Erro na configuracao: {erro}", file=sys.stderr)
         return 1
