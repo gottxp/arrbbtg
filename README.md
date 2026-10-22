@@ -326,7 +326,7 @@ Faça os marcos nesta ordem. Os comandos são do Windows (PowerShell, na pasta `
    | `lighter: N perpetuos ativos; M inativos ficam de fora` | ao ligar |
    | `painel em http://127.0.0.1:8000` | ao ligar |
    | `sinais ativos: N` | a cada minuto, sem buracos |
-   | `recursos: memoria ... MB (atual), CPU ...%, ..., ciclo medio N ms (maior M ms), banco N MB, fila do banco N` e `descartes nos ultimos 300s: ...` | a cada 5 minutos. O `maior` do ciclo tem que ficar abaixo de 500 (a cada 5 minutos um ciclo leva ~0,2 s a mais: é a limpeza da memória do Python) e a `fila do banco` perto de 0 |
+   | `recursos: memoria ... MB (atual), CPU ...%, ..., ciclo medio N ms (maior M ms), banco N MB, fila do banco N` e `descartes nos ultimos 300s: ...` | a cada 5 minutos. O `maior` do ciclo tem que ficar abaixo de 500 (a limpeza da memória do Python, a cada 5 minutos, roda entre dois ciclos e não entra nesse número) e a `fila do banco` perto de 0 |
    | `mexc: limite de 30 assinaturas no spot (limites_assinatura_mercado), 10 delas para os livros: N de M pares ficaram fora dos tickers` | ao ligar (é o esperado; veja o [aviso A](#aviso-a-mexc-futuros-um-par-por-assinatura)) |
    | `kraken: N pares cotados em outras moedas ficam de fora (EUR ..., GBP ...)` | ao ligar (é o esperado: o scanner só compara preços em USDT, USDC, USDG e USD) |
    | `janelas do periodo (4h) recarregadas do banco: N combinacoes, M amostras, em X s` | ao ligar, depois de alguns segundos (na primeira vez, 0 combinações) |

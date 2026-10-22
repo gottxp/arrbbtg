@@ -11,11 +11,12 @@ import asyncio
 import gc
 import logging
 import math
-import weakref
 import os
 import subprocess
 import sys
 import threading
+import time
+import weakref
 from pathlib import Path
 
 import pytest
@@ -694,26 +695,93 @@ def test_recolher_e_congelar_lixo_apaga_o_lixo_em_ciclo_e_congela_o_resto():
         gc.unfreeze()
 
 
-def laco_com_gc(monkeypatch, config, ciclos=4):
-    chamadas = []
-    monkeypatch.setattr(principal, "INTERVALO_CONGELAR_GC_S", 0)
-    monkeypatch.setattr(principal, "_recolher_e_congelar_lixo", lambda: chamadas.append(1))
+class RelogioDoLaco:
+    """Relogio falso do laco do motor: so anda quando o laco espera (esperar) ou quando o ciclo "demora"."""
+
+    def __init__(self):
+        self.agora = 0.0
+
+    def __call__(self) -> float:
+        return self.agora
+
+    async def esperar(self, segundos: float) -> None:
+        self.agora += segundos
+        await asyncio.sleep(0)
+
+
+def laco_com_gc(monkeypatch, config, duracao_do_ciclo_s, ciclos, intervalo_s=2.0, prazo_s=1.0):
+    """Roda o laco do motor com o relogio falso: cada ciclo "demora" `duracao_do_ciclo_s` (de ciclo_ms).
+
+    Devolve (eventos em ordem: ("ciclo", t), ("tempo", ms) e ("gc", t, folga), tempos registrados em ms).
+    """
+    relogio = RelogioDoLaco()
+    eventos = []
+    monkeypatch.setattr(principal, "INTERVALO_CONGELAR_GC_S", intervalo_s)
+    monkeypatch.setattr(principal, "PRAZO_FORCAR_GC_S", prazo_s)
+
+    def congelar():
+        eventos.append(("gc", relogio.agora))
+        time.sleep(0.05)  # um congelamento "demorado" de verdade: nao pode entrar no tempo do ciclo
+
+    monkeypatch.setattr(principal, "_recolher_e_congelar_lixo", congelar)
+    original = Motor.ciclo
+
+    def ciclo_que_demora(self, agora):
+        eventos.append(("ciclo", relogio.agora))
+        relogio.agora += duracao_do_ciclo_s
+        return original(self, agora)
+
+    monkeypatch.setattr(Motor, "ciclo", ciclo_que_demora)
+    tempos = principal.TemposDoCiclo()
+    registrar = tempos.registrar
+    tempos.registrar = lambda ms: (eventos.append(("tempo", ms)), registrar(ms))
     m, _ = novo_motor(config)
-    asyncio.run(principal._laco_do_motor(m, {}, config, lambda: 10.0, ciclos=ciclos))
-    return chamadas
+    asyncio.run(principal._laco_do_motor(m, {}, config, lambda: 10.0, ciclos=ciclos, tempos=tempos,
+                                         relogio_do_laco=relogio, esperar=relogio.esperar))
+    return eventos
 
 
-def test_laco_do_motor_recolhe_e_congela_o_lixo_de_tempos_em_tempos(monkeypatch):
-    # O primeiro ciclo so marca o horario; depois, a cada INTERVALO_CONGELAR_GC_S (aqui 0: todo ciclo).
-    assert len(laco_com_gc(monkeypatch, cfg_com(ciclo_ms=10))) == 3
+def test_laco_congela_o_lixo_fora_do_tempo_do_ciclo_quando_sobra_folga(monkeypatch):
+    # Ciclo de 0,5 s que leva 0,1 s: sobram 0,4 s (>= FOLGA_CONGELAR_GC_S) ate o proximo. O primeiro congelamento e
+    # depois de INTERVALO_CONGELAR_GC_S (2 s aqui), sempre depois de registrar o tempo do ciclo.
+    eventos = laco_com_gc(monkeypatch, cfg_com(ciclo_ms=500), duracao_do_ciclo_s=0.1, ciclos=12)
+    congelamentos = [e[1] for e in eventos if e[0] == "gc"]
+    assert len(congelamentos) == 2  # 12 ciclos de 0,5 s (ate ~6 s): no fim dos ciclos de ~2,6 s e ~4,6 s
+    assert all(2.0 <= depois - antes <= 3.0 for antes, depois in zip([0.5] + congelamentos, congelamentos))
+    for i, evento in enumerate(eventos):
+        if evento[0] == "gc":
+            assert eventos[i - 1][0] == "tempo"  # o tempo do ciclo ja foi registrado
+    assert max(e[1] for e in eventos if e[0] == "tempo") < 40  # o congelamento (50 ms) ficou fora
+
+
+def test_laco_sem_folga_adia_o_congelamento_e_forca_depois_do_prazo(monkeypatch):
+    # Ciclo que leva 0,45 s de 0,5 s: so 0,05 s de folga. Nao congela no intervalo (2 s); congela forcado quando
+    # passa o prazo (mais 1 s aqui), mesmo sem folga.
+    eventos = laco_com_gc(monkeypatch, cfg_com(ciclo_ms=500), duracao_do_ciclo_s=0.45, ciclos=12)
+    congelamentos = [e[1] for e in eventos if e[0] == "gc"]
+    inicio = next(e[1] for e in eventos if e[0] == "ciclo") + 0.45  # o primeiro ciclo marca o horario
+    assert congelamentos and all(depois - antes >= 3.0 - 1e-6 for antes, depois in zip([inicio] + congelamentos,
+                                                                                         congelamentos))
+
+
+def test_hora_de_congelar_pede_intervalo_e_folga_ou_o_prazo():
+    intervalo, folga = principal.INTERVALO_CONGELAR_GC_S, principal.FOLGA_CONGELAR_GC_S
+    prazo = principal.PRAZO_FORCAR_GC_S
+    assert not principal._hora_de_congelar(intervalo - 1, folga)
+    assert principal._hora_de_congelar(intervalo, folga)
+    assert not principal._hora_de_congelar(intervalo, folga - 0.01)
+    assert principal._hora_de_congelar(intervalo + prazo, 0.0)
 
 
 def test_laco_do_motor_sem_historico_pelos_tickers_nao_mexe_no_gc(monkeypatch):
-    assert laco_com_gc(monkeypatch, cfg_com(ciclo_ms=10, historico_tickers=False)) == []
+    eventos = laco_com_gc(monkeypatch, cfg_com(ciclo_ms=500, historico_tickers=False), duracao_do_ciclo_s=0.1,
+                          ciclos=12)
+    assert not [e for e in eventos if e[0] == "gc"]
 
 
 def test_laco_do_motor_descongela_ao_terminar(monkeypatch):
     monkeypatch.setattr(principal, "INTERVALO_CONGELAR_GC_S", 0)
+    monkeypatch.setattr(principal, "FOLGA_CONGELAR_GC_S", 0)
     config = cfg_com(ciclo_ms=10)
     m, _ = novo_motor(config)
     try:

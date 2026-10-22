@@ -70,8 +70,12 @@ INTERVALO_LOG_SINAIS_S = 60
 # Quanto o resumo do dia espera o escritor gravar a ultima leitura das corretoras antes de ler o banco (segundos).
 ESPERA_ESCRITOR_RESUMO_S = 10
 # Coletor de lixo do Python (gc), com o historico pelos tickers ligado: de quanto em quanto tempo o laco do motor
-# recolhe o lixo de uma vez e congela o que sobrou (veja _recolher_e_congelar_lixo). Detalhe tecnico, em segundos.
+# recolhe o lixo de uma vez e congela o que sobrou (veja _recolher_e_congelar_lixo). Ele leva ~200 ms, entao so roda
+# quando sobra pelo menos FOLGA_CONGELAR_GC_S ate o proximo ciclo; sem folga, tenta no ciclo seguinte e, passados
+# PRAZO_FORCAR_GC_S alem do intervalo, roda mesmo assim. Detalhes tecnicos, em segundos.
 INTERVALO_CONGELAR_GC_S = 300
+FOLGA_CONGELAR_GC_S = 0.3
+PRAZO_FORCAR_GC_S = 60
 
 
 def configurar_log(cfg: Config) -> None:
@@ -410,10 +414,20 @@ def _recolher_e_congelar_lixo() -> None:
     gc.freeze()
 
 
+def _hora_de_congelar(desde_o_ultimo_s: float, folga_s: float) -> bool:
+    """True se e hora de recolher e congelar o lixo: passou o intervalo e sobra folga ate o proximo ciclo, ou passou
+    tambem o prazo (entao congela mesmo sem folga, para nao ficar adiando para sempre)."""
+    if desde_o_ultimo_s < INTERVALO_CONGELAR_GC_S:
+        return False
+    return folga_s >= FOLGA_CONGELAR_GC_S or desde_o_ultimo_s >= INTERVALO_CONGELAR_GC_S + PRAZO_FORCAR_GC_S
+
+
 async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorDoScanner], cfg: Config,
                          relogio: Callable[[], float], ciclos: int | None,
                          publicar: Callable[[list[Evento]], None] | None = None,
-                         tempos: TemposDoCiclo | None = None) -> None:
+                         tempos: TemposDoCiclo | None = None,
+                         relogio_do_laco: Callable[[], float] | None = None,
+                         esperar: Callable[[float], Awaitable] = asyncio.sleep) -> None:
     """A cada `ciclo_ms`: roda o ciclo do motor, transmite os eventos ao painel e ajusta os livros abertos (etapa 2).
 
     O ajuste dos livros roda em tarefas proprias (uma por corretora), fora do ritmo do motor: se uma
@@ -425,10 +439,13 @@ async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorDoScanner], c
     Erro no ciclo (sinais) e erro na etapa 2 (escolha dos livros) sao separados: um nao impede o
     outro; vai para o log e o proximo ciclo tenta de novo.
     Com o historico pelos tickers ligado, a cada INTERVALO_CONGELAR_GC_S o laco tambem recolhe e congela o lixo
-    do Python (_recolher_e_congelar_lixo); esse tempo entra no tempo do ciclo. Ao sair, descongela.
+    do Python (_recolher_e_congelar_lixo), depois de registrar o tempo do ciclo e so com folga ate o proximo (veja
+    _hora_de_congelar): esse tempo nao entra no "maior" da linha recursos:. Ao sair, descongela.
+    relogio_do_laco e esperar: o relogio que marca o ritmo e a espera entre os ciclos (os testes passam falsos).
     """
     intervalo_s = cfg.ciclo_ms / 1000
-    relogio_do_laco = asyncio.get_running_loop().time  # relogio que nao pula (so para marcar o ritmo)
+    if relogio_do_laco is None:
+        relogio_do_laco = asyncio.get_running_loop().time  # relogio que nao pula (so para marcar o ritmo)
     proximo = relogio_do_laco() + intervalo_s  # espera um ciclo antes do primeiro: da tempo dos tickers chegarem
     ultimo_log: float | None = None
     ajustes: dict[str, asyncio.Task] = {}  # corretora -> ajuste de livros em andamento
@@ -438,7 +455,7 @@ async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorDoScanner], c
     ultimo_gc: float | None = None  # quando o laco recolheu e congelou o lixo pela ultima vez (relogio do laco)
     try:
         while ciclos is None or feitos < ciclos:
-            await asyncio.sleep(max(0.0, proximo - relogio_do_laco()))
+            await esperar(max(0.0, proximo - relogio_do_laco()))
             # Ritmo fixo de ciclo_ms, descontando o tempo gasto no ciclo; se atrasar, segue sem "recuperar" ciclos.
             proximo = max(proximo + intervalo_s, relogio_do_laco())
             agora = relogio()
@@ -455,17 +472,18 @@ async def _laco_do_motor(motor: Motor, coletores: dict[str, ColetorDoScanner], c
                 registro.exception("erro na etapa 2 (escolha dos livros); tentando de novo no proximo ciclo")
             else:
                 _iniciar_ajustes(coletores, selecao, ajustes, com_traceback)
-            if congelar_gc:
+            if tempos is not None:
+                tempos.registrar((time.perf_counter() - inicio_do_ciclo) * 1000)
+            if congelar_gc:  # depois de registrar o tempo do ciclo: o congelamento nao conta como ciclo lento
+                fim_do_ciclo = relogio_do_laco()
                 if ultimo_gc is None:
-                    ultimo_gc = relogio_do_laco()  # o primeiro so depois de um intervalo: as janelas ja existem
-                elif relogio_do_laco() - ultimo_gc >= INTERVALO_CONGELAR_GC_S:
-                    ultimo_gc = relogio_do_laco()
+                    ultimo_gc = fim_do_ciclo  # o primeiro so depois de um intervalo: as janelas ja existem
+                elif _hora_de_congelar(fim_do_ciclo - ultimo_gc, proximo - fim_do_ciclo):
+                    ultimo_gc = fim_do_ciclo
                     try:
                         _recolher_e_congelar_lixo()
                     except Exception:
                         registro.exception("erro ao recolher o lixo do Python; o motor segue")
-            if tempos is not None:
-                tempos.registrar((time.perf_counter() - inicio_do_ciclo) * 1000)
             feitos += 1
             if ultimo_log is None or agora - ultimo_log >= INTERVALO_LOG_SINAIS_S:
                 ultimo_log = agora
