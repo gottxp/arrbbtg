@@ -37,6 +37,7 @@ from tests.fabricas import (
     candidato,
     cfg,
     cfg_com,
+    colocar_ponta,
     iso_utc,
     market_ccxt,
     motor_falso,
@@ -661,7 +662,7 @@ def test_modo_farm_abre_livro_da_combinacao_de_farm_com_o_minimo_de_farm():
 def test_minimo_de_farm_vale_tambem_com_a_ponta_de_farm_no_short():
     m, e = _motor_farm()
     ticker(e, "gate", "futuro", "BTC", 99.99, 100.0, 10.0)
-    ticker(e, "lighter", "futuro", "BTC", 99.9, 99.91, 10.0)  # long gate / short lighter: A = -0,1% (>= -0,3%)
+    ticker(e, "lighter", "futuro", "BTC", 99.95, 99.96, 10.0)  # long gate / short lighter: A = -0,05% (>= -0,1%)
     assert m.selecao_livros(agora=10) == {"lighter": {"BTC/USDT:USDT"}, "gate": {"BTC/USDT:USDT"}}
 
 
@@ -695,7 +696,7 @@ def test_sempre_mostrar_sempre_abre_o_livro_da_moeda():
     assert m.selecao_livros(agora=10) == {"mexc": {"BTC/USDT:USDT"}, "gate": {"BTC/USDT:USDT"}}
 
 
-def _cenario_etapa2_esconde(sessao: Sessao) -> list[dict]:
+def _cenario_etapa2_esconde(sessao: Sessao, **campos) -> list[dict]:
     """O cenario do revisor (etapa2_esconde.py): lighter x gate com A ~0,1%, livros abertos so pela etapa 2."""
     from scanner.modelos import Livro
 
@@ -706,7 +707,7 @@ def _cenario_etapa2_esconde(sessao: Sessao) -> list[dict]:
         def taxa_taker(self, corretora, mercado):
             return 0.0 if corretora == "lighter" else 0.02
 
-    config = Config(corretoras=["gate", "lighter"], corretoras_farm=["lighter"])
+    config = Config(corretoras=["gate", "lighter"], corretoras_farm=["lighter"], **campos)
     estado = EstadoMercados()
     motor = Motor(config, estado, Dados())
     motor.sessao = sessao
@@ -727,6 +728,8 @@ def _cenario_etapa2_esconde(sessao: Sessao) -> list[dict]:
 
 
 def test_cenario_do_revisor_farm_aparece_pela_etapa_2():
+    # Com o minimo de farm padrao (-0,1%) a direcao long lighter / short gate (A +0,12%) abre os dois livros; com
+    # eles abertos, a outra direcao (A -0,16%) tambem e calculada e passa na regra do Farm.
     sinais = _cenario_etapa2_esconde(Sessao(modo="farm"))
     assert len(sinais) == 2 and all(s["rp_liquido_pct"] >= -0.1 for s in sinais)
 
@@ -771,13 +774,16 @@ def _sinal_aberto(detectado: float, atualizado: float | None = None) -> dict:
     }
 
 
-def test_fechar_abertos_usa_a_ultima_amostra_conhecida_do_par(banco):
+def test_fechar_abertos_usa_a_ultima_vez_que_o_sinal_foi_visto(banco):
+    # Re-revisao (N4): o fim e a ultima vez em que o SINAL foi visto, e nao a ultima amostra da combinacao (que
+    # continua sendo amostrada enquanto tem livro, mesmo sem sinal).
     t0 = INICIO_20_OUT + 10 * 3600
     banco.gravar_evento(Evento("novo", _sinal_aberto(t0), registrar_historico=True))
-    banco.gravar_amostras([amostra(t0 + ts) for ts in (0.0, 5.0, 30.0)])
+    banco.marcar_vistos([(_sinal_aberto(t0)["id"], iso_utc(t0 + 20))])
+    banco.gravar_amostras([amostra(t0 + ts) for ts in (0.0, 5.0, 30.0, 3600.0)])
     assert banco.fechar_abertos() == 1
     [s] = banco.sinais_do_dia("2026-10-20")
-    assert s["encerrado_em"] == iso_utc(t0 + 30) == s["sinal"]["encerrado_em"]
+    assert s["encerrado_em"] == iso_utc(t0 + 20) == s["sinal"]["encerrado_em"]
     assert banco.fechar_abertos() == 0  # nada mais aberto
 
 
@@ -902,7 +908,8 @@ def test_main_validar_com_config_fora_de_utf8_mostra_erro_e_nao_traceback(tmp_pa
 
 def test_campos_novos_da_config_com_os_padroes(tmp_path):
     c = carregar_config(_escrever(tmp_path, "corretoras: [bitget]\n"))
-    assert c.spread_min_livro_farm_pct == -0.3
+    assert c.spread_min_livro_farm_pct == -0.1
+    assert c.max_livros_farm_por_mercado == 50
     assert c.validade_funding_s == 900
 
 
@@ -1111,3 +1118,338 @@ def test_resumo_da_virada_espera_o_escritor_gravar_a_leitura_que_fecha_o_dia(tmp
     finally:
         escritor.parar()
         b.fechar()
+
+
+# ===========================================================================
+# Rodada 2 (re-revisao): N1 a N6
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# N1. O Farm nao abre livro de quase tudo
+# ---------------------------------------------------------------------------
+
+
+def _farm_varios_ativos(n: int, k: int, a_base: float = 0.10, passo: float = 0.01, **campos):
+    """lighter (farm) e gate, so futuros, `n` ativos; long lighter / short gate com A = a_base + i x passo (%).
+
+    A outra direcao (long gate / short lighter) fica com A abaixo de -0,1% (fora do minimo de farm).
+    Devolve (motor, estado, publicar): publicar(agora, a={ativo: A novo}, sem=[ativos]) manda os tickers de novo.
+    """
+    m, e = _motor_farm(max_livros_farm_por_mercado=k, **campos)
+    spreads = {f"A{i:02d}": a_base + i * passo for i in range(n)}
+
+    def publicar(agora, a=None, sem=()):
+        spreads.update(a or {})
+        for ativo, spread in spreads.items():
+            ticker(e, "lighter", "futuro", ativo, 99.99, 100.0, agora)
+            if ativo in sem:
+                e.remover_ticker("gate", "futuro", ativo)
+                continue
+            bid = 100.0 * (1 + spread / 100)
+            ticker(e, "gate", "futuro", ativo, bid, bid * 1.0001, agora)
+
+    publicar(10.0)
+    return m, e, publicar
+
+
+def _simbolos(*indices) -> set[str]:
+    return {f"A{i:02d}/USDT:USDT" for i in indices}
+
+
+def test_farm_abre_so_os_k_melhores_de_cada_mercado_de_farm():
+    m, _, _ = _farm_varios_ativos(10, k=3)
+    assert m.selecao_livros(agora=10) == {"lighter": _simbolos(7, 8, 9), "gate": _simbolos(7, 8, 9)}
+
+
+def test_farm_mantem_os_abertos_enquanto_estao_entre_os_2k_melhores():
+    m, _, publicar = _farm_varios_ativos(10, k=3)
+    m.selecao_livros(agora=10)
+    publicar(11.0, a={"A06": 0.25})  # A06 passa a ser o melhor
+    assert m.selecao_livros(agora=11)["lighter"] == _simbolos(7, 8, 9)  # os abertos seguem entre os 6 melhores
+    publicar(12.0, a={"A07": 0.0})  # A07 cai para fora das 6 melhores: segura manter_livro_s (60 s), como a regra
+    assert m.selecao_livros(agora=12)["lighter"] == _simbolos(7, 8, 9)  # normal; depois a vaga vai para a melhor
+    publicar(73.0)
+    assert m.selecao_livros(agora=73)["lighter"] == _simbolos(6, 8, 9)
+
+
+def test_farm_mantem_o_livro_por_manter_livro_s_se_o_ticker_sumir():
+    m, _, publicar = _farm_varios_ativos(10, k=3)
+    m.selecao_livros(agora=10)
+    publicar(20.0, sem=["A07"])  # o ticker da gate de A07 sumiu (ou ficou velho)
+    assert m.selecao_livros(agora=20)["lighter"] == _simbolos(7, 8, 9)  # como na regra normal: segura 60 s
+    publicar(71.0, sem=["A07"])
+    assert m.selecao_livros(agora=71)["lighter"] == _simbolos(6, 8, 9)
+
+
+def test_farm_combinacao_acima_do_minimo_normal_nao_conta_no_limite():
+    m, _, _ = _farm_varios_ativos(5, k=1, a_base=0.5)  # todas com A >= 0,3%: abrem como no Lucro
+    assert m.selecao_livros(agora=10)["lighter"] == _simbolos(0, 1, 2, 3, 4)
+
+
+def test_limite_de_livros_de_farm_vem_da_config():
+    m, _, _ = _farm_varios_ativos(10, k=5)
+    assert m.selecao_livros(agora=10)["lighter"] == _simbolos(5, 6, 7, 8, 9)
+
+
+def test_no_farm_o_motor_so_calcula_combinacoes_com_ponta_de_farm_e_as_do_sempre_mostrar():
+    config = cfg_com(corretoras=["gate", "bitget", "lighter"], corretoras_farm=["lighter"])
+    m = motor_falso(spot=("gate", "BTC", 100.0), futuro=("bitget", "BTC", 101.0), long_futuro=("lighter", "BTC", 100.0),
+                    config=config)
+
+    def direcoes():
+        return {(c.ponta_long.corretora, c.ponta_short.corretora) for c in m.candidatos(agora=10)}
+
+    lucro = direcoes()
+    assert ("gate", "bitget") in lucro and any("lighter" in d for d in lucro)
+    m.sessao = Sessao(modo="farm")
+    assert direcoes() == {d for d in lucro if "lighter" in d}
+    m.sessao = Sessao(modo="farm", filtros=Filtros(sempre_mostrar=["btc"]))
+    assert direcoes() == lucro
+
+
+def test_max_livros_farm_por_mercado_precisa_ser_inteiro_positivo(tmp_path):
+    for valor in ("0", "-1", "2.5", "true"):
+        with pytest.raises(ErroConfig, match="max_livros_farm_por_mercado"):
+            carregar_config(_escrever(tmp_path, f"max_livros_farm_por_mercado: {valor}\n"))
+    assert carregar_config(_escrever(tmp_path, "max_livros_farm_por_mercado: 7\n")).max_livros_farm_por_mercado == 7
+
+
+def _cenario_de_escala(modo: str, farm=("c7", "c8"), ativos_farm=400, ciclos=8) -> dict:
+    """O cenario do revisor (farm_escala.py): 9 corretoras x 500 ativos, spot e futuro; as de farm com `ativos_farm`."""
+    import random
+    import statistics
+
+    from scanner.modelos import Livro
+
+    class Dados:
+        def funding(self, corretora, ativo):
+            return (0.01, 8)
+
+        def taxa_taker(self, corretora, mercado):
+            return 0.06
+
+    rnd = random.Random(42)
+    config = Config(corretoras_farm=list(farm))
+    estado = EstadoMercados()
+    motor = Motor(config, estado, Dados())
+    motor.sessao = Sessao(modo=modo)
+    corretoras = [f"c{i}" for i in range(9)]
+    agora, meio_spread, meio = 100_000.0, 0.0005, {}
+    for n, ativo in enumerate(f"A{i:03d}" for i in range(500)):
+        base = rnd.uniform(0.01, 1000)
+        for corretora in corretoras:
+            if corretora in farm and n >= ativos_farm:
+                continue
+            for mercado in ("spot", "futuro"):
+                p = base * (1 + rnd.gauss(0, 0.00128))
+                meio[(corretora, mercado, ativo)] = p
+                simbolo = f"{ativo}/USDT" if mercado == "spot" else f"{ativo}/USDT:USDT"
+                estado.atualizar_ticker(corretora, mercado, ativo, p * (1 - meio_spread), p * (1 + meio_spread), agora,
+                                        5e6, 1.0, simbolo_original=simbolo, cotacao="USDT")
+    for corretora in corretoras:
+        estado.registrar_mensagem(corretora, agora)
+    com_livro = set()
+    for corretora, simbolos in motor.selecao_livros(agora).items():
+        for simbolo in simbolos:
+            ativo, mercado = simbolo.split("/")[0], ("futuro" if ":" in simbolo else "spot")
+            com_livro.add((corretora, mercado, ativo))
+            p = meio[(corretora, mercado, ativo)]
+            estado.atualizar_livro(Livro(corretora, mercado, simbolo,
+                                         [(p * (1 - meio_spread - 0.0001 * i), 1000 / p) for i in range(20)],
+                                         [(p * (1 + meio_spread + 0.0001 * i), 1000 / p) for i in range(20)], agora,
+                                         None), ativo=ativo)
+    tempos = []
+    for _ in range(ciclos):
+        agora += 0.5
+        for corretora in corretoras:
+            estado.registrar_mensagem(corretora, agora)
+        for dado in estado._tickers.values():
+            dado["recebido_em"] = agora
+        for livro in estado._livros.values():
+            livro.recebido_em = agora
+        inicio = time.perf_counter()
+        motor.ciclo(agora)
+        motor.selecao_livros(agora)
+        tempos.append((time.perf_counter() - inicio) * 1000)
+    return {"livros": len(com_livro), "calculadas": motor.quantidade_historicos(),
+            "mediana_ms": statistics.median(tempos)}
+
+
+def test_escala_farm_com_duas_corretoras_de_farm_de_400_ativos_cabe_no_ciclo():
+    # Re-revisao (N1): antes, 7.254 mercados com livro, 60.585 combinacoes calculadas e ~1,7 s por ciclo.
+    lucro = _cenario_de_escala("lucro")
+    farm = _cenario_de_escala("farm")
+    mercados_de_farm = 4  # c7 e c8, spot e futuro
+    k = Config().max_livros_farm_por_mercado
+    assert farm["livros"] <= lucro["livros"] + mercados_de_farm * k * 2
+    assert farm["calculadas"] <= lucro["calculadas"] + mercados_de_farm * k
+    assert farm["mediana_ms"] < Config().ciclo_ms
+
+
+# ---------------------------------------------------------------------------
+# N2. Terminal travado nao para o arquivo de log
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_travado_nao_para_o_arquivo_de_log(tmp_path, logs_limpos, monkeypatch):
+    terminal = TerminalTravado()
+    monkeypatch.setattr(sys, "stderr", terminal)
+    logs.configurar_logs("normal", str(tmp_path), dias=3)
+    for i in range(3):
+        logging.getLogger("scanner.teste").info("linha %d com o terminal travado", i)
+    arquivo = next(tmp_path.glob("scanner-*.log"))
+    assert _esperar(lambda: "linha 2 com o terminal travado" in arquivo.read_text(encoding="utf-8"))
+    assert terminal.getvalue() == ""  # o terminal continua parado
+    terminal.solta.set()
+    logs.desligar_logs()
+    assert "linha 2" in terminal.getvalue()
+
+
+def test_fila_do_terminal_travado_tem_limite(tmp_path, logs_limpos, monkeypatch):
+    monkeypatch.setattr(logs, "MAX_LINHAS_ESPERANDO_O_TERMINAL", 5)
+    terminal = TerminalTravado()
+    monkeypatch.setattr(sys, "stderr", terminal)
+    logs.configurar_logs("normal", str(tmp_path), dias=3)
+    for i in range(50):
+        logging.getLogger("scanner.teste").info("linha %d", i)
+    arquivo = next(tmp_path.glob("scanner-*.log"))
+    assert _esperar(lambda: "linha 49" in arquivo.read_text(encoding="utf-8"))  # o arquivo recebe todas
+    terminal.solta.set()
+    logs.desligar_logs()
+    assert terminal.getvalue().count("linha") <= 6  # o terminal so as que cabiam na fila (+ a que travou)
+
+
+def test_readme_diz_que_o_arquivo_de_log_continua_com_o_terminal_parado():
+    texto = (RAIZ / "README.md").read_text(encoding="utf-8")
+    assert "o arquivo de log continua sendo gravado" in texto
+
+
+# ---------------------------------------------------------------------------
+# N3. Erro do SQLite no escritor nao perde nem duplica evento
+# ---------------------------------------------------------------------------
+
+
+def test_banco_travado_por_outro_programa_nao_perde_nem_desordena_eventos(tmp_path, caplog):
+    caminho = str(tmp_path / "trava.db")
+    b = Banco(caminho)
+    b._conn.execute("PRAGMA busy_timeout=50")  # o padrao do sqlite3 e esperar 5 s pela trava
+    escritor = EscritorBanco(b, espera_erro_s=0.05, intervalo_lote_amostras_s=0)
+    escritor.iniciar()
+    outro = sqlite3.connect(caminho, isolation_level=None)
+    outro.execute("BEGIN IMMEDIATE")  # outro programa (ex.: DB Browser) segurando a trava de escrita
+    try:
+        with caplog.at_level(logging.WARNING, logger="scanner"):
+            escritor.gravar_eventos([Evento("novo", _sinal("s1"), registrar_historico=True)])
+            escritor.gravar_amostras([amostra(1.0)])
+            assert _esperar(lambda: any("database is locked" in r.getMessage() for r in caplog.records))
+            fechado = _sinal("s1", encerrado_em="2026-10-20T15:01:00.000Z")
+            escritor.gravar_eventos([Evento("encerrado", fechado, registrar_historico=True)])  # chega durante a trava
+            time.sleep(0.3)  # varias tentativas com o banco travado
+    finally:
+        outro.execute("COMMIT")
+        outro.close()
+    assert escritor.descarregar(timeout=5)
+    escritor.parar()
+    [s] = b.sinais_do_dia("2026-10-20")  # um registro so, e fechado: o "novo" foi gravado antes do "encerrado"
+    assert s["encerrado_em"] == "2026-10-20T15:01:00.000Z"
+    assert any("amostras" in r.getMessage() and "descartadas" in r.getMessage() for r in caplog.records)
+    b.fechar()
+
+
+def test_espera_entre_tentativas_cresce_ate_o_maximo():
+    from scanner.armazenamento import escritor as modulo_escritor
+
+    esperas = [modulo_escritor.espera_depois_de_erros(n, 1.0) for n in range(1, 8)]
+    assert esperas == [1.0, 2.0, 4.0, 8.0, 16.0, modulo_escritor.ESPERA_MAX_ERRO_S, modulo_escritor.ESPERA_MAX_ERRO_S]
+
+
+# ---------------------------------------------------------------------------
+# N4. Fechar o registro aberto na ultima vez em que o sinal foi visto
+# ---------------------------------------------------------------------------
+
+
+def test_motor_grava_de_tempos_em_tempos_quando_cada_sinal_foi_visto(banco):
+    m = motor_falso(spot=("gate", "BTC", 100.0), futuro=("bitget", "BTC", 101.0), f_medio=-0.5, banco=banco,
+                    config=cfg_com(rp_min_lucro_pct=-5.0))
+    for agora in (10.0, 12.0, 16.0):
+        colocar_ponta(m.estado, "gate", "spot", "BTC", 100.0, "long", agora)
+        colocar_ponta(m.estado, "bitget", "futuro", "BTC", 101.0, "short", agora)
+        m.ciclo(agora)
+    banco.gravar_amostras([amostra(3600.0)])  # a combinacao segue com livro (amostras) depois do sinal
+    # O scanner "caiu" aqui (sem encerrar): ao religar, o registro fecha na ultima vez em que o sinal foi visto.
+    assert banco.fechar_abertos() == 1
+    assert banco.sinais_do_dia("1970-01-01")[0]["encerrado_em"] == "1970-01-01T00:00:16.000Z"
+
+
+def test_escritor_grava_os_vistos_com_o_lote_de_amostras(banco):
+    escritor = EscritorBanco(banco, intervalo_lote_amostras_s=60)
+    escritor.iniciar()
+    banco.gravar_evento(Evento("novo", _sinal("s1"), registrar_historico=True))
+    escritor.marcar_vistos([("s1", "2026-10-20T15:00:05.000Z")])
+    escritor.marcar_vistos([("s1", "2026-10-20T15:00:10.000Z")])  # o mais novo vale
+    assert escritor.descarregar(timeout=5)
+    escritor.parar()
+    assert banco.fechar_abertos() == 1
+    assert banco.sinais_do_dia("2026-10-20")[0]["encerrado_em"] == "2026-10-20T15:00:10.000Z"
+
+
+def test_banco_da_rodada_1_ganha_a_coluna_visto_em(tmp_path):
+    caminho = str(tmp_path / "r1.db")
+    con = sqlite3.connect(caminho)
+    con.executescript(ESQUEMA_ANTIGO)
+    con.execute("ALTER TABLE sinais ADD COLUMN comparacao INTEGER NOT NULL DEFAULT 0")
+    con.commit()
+    con.close()
+    b = Banco(caminho)
+    colunas = {linha[1] for linha in b._conn.execute("PRAGMA table_info(sinais)")}
+    assert {"comparacao", "visto_em"} <= colunas
+    b.fechar()
+
+
+# ---------------------------------------------------------------------------
+# N5. Limite do periodo passado explicito (sem variavel global)
+# ---------------------------------------------------------------------------
+
+
+def test_criar_um_motor_nao_muda_o_que_os_filtros_aceitam():
+    motor_falso(config=cfg_com(retencao_dias=1))
+    assert Filtros.de_dict({"periodo_metricas_h": 30}).periodo_metricas_h == 30  # sem limite: quem limita e quem chama
+    with pytest.raises(ValueError, match="periodo_metricas_h"):
+        Filtros.de_dict({"periodo_metricas_h": 30}, periodo_max_h=24)
+
+
+def test_filtros_nao_tem_mais_o_limite_global():
+    import scanner.filtros.filtros as modulo_filtros
+
+    assert not hasattr(modulo_filtros, "limitar_periodo_metricas")
+    assert not hasattr(modulo_filtros, "_periodo_max_h")
+
+
+# ---------------------------------------------------------------------------
+# N6. Custo do "sempre mostrar" no README
+# ---------------------------------------------------------------------------
+
+
+def test_readme_avisa_o_custo_do_sempre_mostrar():
+    assert "~150 combinações" in (RAIZ / "README.md").read_text(encoding="utf-8")
+
+
+def test_parar_com_o_banco_travado_desiste_e_avisa_quantos_eventos_ficaram(tmp_path, caplog):
+    caminho = str(tmp_path / "trava2.db")
+    b = Banco(caminho)
+    b._conn.execute("PRAGMA busy_timeout=20")
+    escritor = EscritorBanco(b, espera_erro_s=0.02)
+    escritor.iniciar()
+    outro = sqlite3.connect(caminho, isolation_level=None)
+    outro.execute("BEGIN IMMEDIATE")
+    try:
+        with caplog.at_level(logging.ERROR, logger="scanner"):
+            escritor.gravar_eventos([Evento("novo", _sinal("s1"), True), Evento("novo", _sinal("s2"), True)])
+            inicio = time.perf_counter()
+            escritor.parar(timeout=10)
+            assert time.perf_counter() - inicio < 5  # nao fica tentando para sempre
+    finally:
+        outro.execute("COMMIT")
+        outro.close()
+    assert any("2 eventos de sinal ficaram sem gravar" in r.getMessage() for r in caplog.records)
+    b.fechar()

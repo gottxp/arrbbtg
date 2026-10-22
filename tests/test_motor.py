@@ -246,7 +246,9 @@ def test_cada_chamada_cria_candidato_novo():
 
 
 def test_modo_farm_preenche_custo_por_1000():
-    m = motor_falso(spot=("gate", "BTC", 100.0), futuro=("bitget", "BTC", 101.0), f_medio=-0.9)
+    # A bitget como corretora de farm: no modo Farm o motor so calcula combinacoes com ponta de farm.
+    m = motor_falso(spot=("gate", "BTC", 100.0), futuro=("bitget", "BTC", 101.0), f_medio=-0.9,
+                    config=cfg_com(corretoras_farm=["bitget"]))
     m.sessao = Sessao(modo="farm")
     c = m.candidatos(agora=10)[0]
     assert c.modo == "farm"

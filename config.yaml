@@ -111,11 +111,17 @@ margem_slippage_pct: 0.0
 #   Padrao: medio. Quando mexer: raramente.
 metrica_spread: medio
 # Modo Farm: combinacao com ponta numa corretora de corretoras_farm abre o livro completo (etapa 2) a partir deste
-#   spread de abertura pelos tickers, em vez de spread_min_livro_pct (vale o menor dos dois). As operacoes de farm
-#   baratas tem spread perto de zero ou negativo: sem isto o livro delas nunca abria e elas nunca apareciam.
-#   Unidade: %. Padrao: -0.3. Quando mexer: suba (ex.: 0) se uma corretora de farm limitar assinaturas; abaixe para
-#   ver farm mais caro.
-spread_min_livro_farm_pct: -0.3
+#   spread de abertura pelos tickers, em vez de spread_min_livro_pct (vale o menor dos dois), ate o teto de
+#   max_livros_farm_por_mercado. As operacoes de farm baratas tem spread perto de zero: sem isto o livro delas
+#   nunca abria e elas nunca apareciam. Unidade: %. Padrao: -0.1. Quando mexer: suba (ex.: 0) se uma corretora de
+#   farm limitar assinaturas; abaixe para ver farm mais caro.
+spread_min_livro_farm_pct: -0.1
+# Modo Farm: no maximo tantas combinacoes abaixo de spread_min_livro_pct abrem livro em cada mercado de farm
+#   (corretora de farm + spot ou futuro, ex.: os futuros da Lighter): as de maior spread pelos tickers. Sem teto,
+#   quase toda combinacao com ponta de farm abriria livro (milhares de assinaturas e o ciclo passando de 500 ms).
+#   As acima de spread_min_livro_pct abrem como no modo Lucro, fora do teto. Unidade: combinacoes (inteiro).
+#   Padrao: 50. Quando mexer: abaixe se uma corretora de farm limitar assinaturas; suba para ver mais farm.
+max_livros_farm_por_mercado: 50
 
 # Taxas taker da sua conta (nivel VIP, descontos), por corretora e mercado (spot e/ou futuro). Unidade: % por
 #   ordem. Padrao: {} (vazio = vale a taxa que vem da corretora). Quando mexer: sempre que a sua taxa real for

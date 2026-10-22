@@ -20,18 +20,6 @@ from scanner.modelos import Candidato, Ponta
 # operacoes de $500. Como o RP e em %, o custo em $ e RP/100 x 500 = RP x 5.
 FATOR_CUSTO_POR_1000 = 5
 
-# Maior "Periodo das metricas" aceito num grupo de filtros ou na sessao, em horas. O banco so guarda
-# `retencao_dias` de amostras, e uma janela maior nunca descartaria amostra (a memoria cresceria sem fim). O motor
-# acerta este valor ao ser criado (retencao_dias x 24 da Config dele, veja limitar_periodo_metricas); antes disso
-# vale o padrao da Config (7 dias = 168 h). Um scanner tem um motor so.
-_periodo_max_h: float = Config.retencao_dias * 24
-
-
-def limitar_periodo_metricas(horas: float) -> None:
-    """Define o maior periodo das metricas que `Filtros.de_dict` aceita sem `periodo_max_h` (o motor chama)."""
-    global _periodo_max_h
-    _periodo_max_h = horas
-
 
 def custo_por_1000(rp_liquido_pct: float) -> float:
     """Custo em $ para gerar $1.000 de volume na corretora de farm. Negativo = a operacao da lucro."""
@@ -102,8 +90,9 @@ class Filtros:
         """Cria os filtros a partir de um dicionario salvo. Campo que falta fica desligado.
 
         Levanta ValueError com o nome do campo se houver chave desconhecida, valor com tipo errado ou
-        periodo_metricas_h acima de `periodo_max_h` (padrao: o do motor, retencao_dias x 24; veja
-        limitar_periodo_metricas). A API devolve essa mensagem com o erro 400.
+        periodo_metricas_h acima de `periodo_max_h`. Quem chama passa retencao_dias x 24 da Config (a API e o
+        motor): o banco so guarda essas horas de amostras, e uma janela maior nunca descartaria amostra. None =
+        sem limite. A API devolve a mensagem com o erro 400.
         """
         if not isinstance(dados, dict):
             raise ValueError("filtros: precisa ser um dicionario campo -> valor")
@@ -111,7 +100,8 @@ class Filtros:
         desconhecidos = [str(chave) for chave in dados if chave not in conhecidos]
         if desconhecidos:
             raise ValueError("filtros: campo(s) desconhecido(s): " + ", ".join(desconhecidos))
-        _conferir_periodo(dados.get("periodo_metricas_h"), _periodo_max_h if periodo_max_h is None else periodo_max_h)
+        if periodo_max_h is not None:
+            _conferir_periodo(dados.get("periodo_metricas_h"), periodo_max_h)
         return cls(**{campo: _validar_valor(campo, valor) for campo, valor in dados.items()})
 
 

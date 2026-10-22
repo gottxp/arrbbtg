@@ -284,9 +284,12 @@ class CorpoSessao(BaseModel):
     comparacao: StrictBool
 
 
-def _filtros_validos(dados: Any) -> Filtros:
-    """Filtros.de_dict + recusa de NaN e infinito (nao existem em JSON e estragariam as comparacoes). ValueError se invalido."""
-    filtros = Filtros.de_dict(dados)
+def _filtros_validos(dados: Any, periodo_max_h: float) -> Filtros:
+    """Filtros.de_dict + recusa de NaN e infinito (nao existem em JSON e estragariam as comparacoes). ValueError se invalido.
+
+    periodo_max_h: o maior periodo das metricas aceito (retencao_dias x 24: o banco so guarda isso de amostras).
+    """
+    filtros = Filtros.de_dict(dados, periodo_max_h=periodo_max_h)
     try:
         json.dumps(filtros.para_dict(), allow_nan=False)
     except ValueError:
@@ -402,7 +405,7 @@ def criar_app(
         if not nome.strip():
             raise HTTPException(400, "o nome do grupo nao pode ser vazio")
         try:
-            filtros = _filtros_validos(corpo).para_dict()
+            filtros = _filtros_validos(corpo, cfg.retencao_dias * 24).para_dict()
         except ValueError as erro:
             raise HTTPException(400, str(erro)) from None
         banco.salvar_grupo(nome, filtros)
@@ -426,7 +429,7 @@ def criar_app(
         if corpo.modo not in MODOS:
             raise HTTPException(400, f"modo precisa ser {' ou '.join(repr(m) for m in MODOS)} (recebi {corpo.modo!r})")
         try:
-            filtros = _filtros_validos(corpo.filtros)
+            filtros = _filtros_validos(corpo.filtros, cfg.retencao_dias * 24)
         except ValueError as erro:
             raise HTTPException(400, str(erro)) from None
         # Um objeto novo de uma vez so (nunca campo a campo): o motor le a sessao sem nunca ver metade da troca.

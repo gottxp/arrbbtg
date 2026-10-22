@@ -186,6 +186,10 @@ class GerenciadorSinais:
         """Os sinais ativos agora, no formato JSON da spec, na ordem em que foram detectados."""
         return [self._sinal(ativo) for ativo in self._ativos.values()]
 
+    def vistos(self) -> list[tuple[str, str]]:
+        """(id, atualizado_em ISO) de cada sinal ativo: a ultima vez em que foi visto (sem montar o JSON inteiro)."""
+        return [(ativo.id, _iso_utc(ativo.atualizado_em)) for ativo in self._ativos.values()]
+
     # --- Internos ------------------------------------------------------------
 
     def _esquecer_encerrados_antigos(self, agora: float) -> None:

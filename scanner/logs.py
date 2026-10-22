@@ -1,10 +1,12 @@
 """Log do scanner (especificacao, secao 8): terminal + um arquivo por dia, e a medida de memoria e CPU.
 
-Fila: quem chama o log (o laco do asyncio: motor, coletores, painel) nunca espera o terminal nem o disco. Na
-raiz do logging fica so um QueueHandler, que poe a linha numa fila e volta na hora; uma thread propria
-(QueueListener, da biblioteca padrao) tira da fila e escreve no terminal e no arquivo. Sem isso, no Windows,
-selecionar texto na janela do PowerShell ("Edicao Rapida") faz a escrita no terminal esperar o Enter, e o
-scanner inteiro parava junto. Agora so a thread do log espera (o terminal congela, o scanner nao).
+Filas: quem chama o log (o laco do asyncio: motor, coletores, painel) nunca espera o terminal nem o disco. Na
+raiz do logging fica so um QueueHandler, que poe a linha em duas filas e volta na hora; uma thread propria para
+cada destino (QueueListener, da biblioteca padrao) tira da sua fila e escreve: uma no terminal, outra no arquivo.
+Sem isso, no Windows, selecionar texto na janela do PowerShell ("Edicao Rapida") faz a escrita no terminal esperar
+o Enter, e o scanner inteiro parava junto. Agora so a thread do terminal espera: o scanner segue e o arquivo do
+dia continua recebendo tudo. A fila do terminal tem limite (MAX_LINHAS_ESPERANDO_O_TERMINAL): com o terminal
+parado por muito tempo, as linhas a mais nao aparecem na janela (o arquivo tem todas).
 
 Arquivo: `<pasta_logs>/scanner-AAAA-MM-DD.log`, com a data LOCAL da maquina. O scanner grava direto no
 arquivo do dia e, a meia-noite (horario local), passa a gravar no arquivo do dia novo. Nenhum arquivo
@@ -147,15 +149,24 @@ class ArquivoDoDia(logging.FileHandler):
                                  "tento de novo na proxima virada do dia\n")
 
 
-class _FilaDoLog(logging.handlers.QueueHandler):
-    """O handler da raiz: monta a linha (com o traceback, se houver) e poe na fila. Nunca espera disco nem terminal.
+# Quantas linhas podem esperar o terminal (ex.: com texto selecionado no console do Windows). Passou disso, as
+# novas nao aparecem na janela; o arquivo do dia recebe todas. Detalhe tecnico, nao um ajuste do dono.
+MAX_LINHAS_ESPERANDO_O_TERMINAL = 10_000
+# Quanto o desligar_logs espera cada thread do log terminar: um terminal travado nao segura a saida do scanner.
+ESPERA_MAX_PARAR_LOG_S = 5
 
-    Marca em cada linha a hora do `relogio` (momento_do_log): o arquivo do dia usa essa hora, mesmo que a thread
-    do log so grave a linha um pouco depois (ex.: virada da meia-noite).
+
+class _FilaDoLog(logging.handlers.QueueHandler):
+    """O handler da raiz: monta a linha (com o traceback, se houver) e poe nas filas. Nunca espera disco nem terminal.
+
+    Uma fila por destino (terminal e arquivo). Fila cheia (o terminal parado ha muito tempo): a linha nao vai para
+    aquele destino. Marca em cada linha a hora do `relogio` (momento_do_log): o arquivo do dia usa essa hora,
+    mesmo que a thread do log so grave a linha um pouco depois (ex.: virada da meia-noite).
     """
 
-    def __init__(self, fila: queue.SimpleQueue, relogio: Callable[[], float]):
-        super().__init__(fila)
+    def __init__(self, filas: list[queue.Queue], relogio: Callable[[], float]):
+        super().__init__(filas[0])
+        self._filas = filas
         self._relogio = relogio
 
     def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
@@ -163,9 +174,16 @@ class _FilaDoLog(logging.handlers.QueueHandler):
         preparado.momento_do_log = self._relogio()
         return preparado
 
+    def enqueue(self, record: logging.LogRecord) -> None:
+        for fila in self._filas:
+            try:
+                fila.put_nowait(record)
+            except queue.Full:  # o terminal travado ficou para tras: esta linha nao aparece na janela
+                pass
+
 
 class _Ouvinte(logging.handlers.QueueListener):
-    """A thread do log: tira as linhas da fila e entrega ao terminal e ao arquivo. Tambem atende `descarregar_logs`."""
+    """Uma thread do log: tira as linhas da fila dela e entrega ao seu handler. Tambem atende `descarregar_logs`."""
 
     def handle(self, record) -> None:
         if isinstance(record, threading.Event):  # pedido de descarregar_logs: tudo antes dele ja foi escrito
@@ -174,6 +192,17 @@ class _Ouvinte(logging.handlers.QueueListener):
             record.set()
             return
         super().handle(record)
+
+    def parar(self, timeout: float) -> bool:
+        """Escreve o que ja estava na fila e termina a thread, esperando no maximo `timeout`. False se nao deu tempo."""
+        try:
+            self.queue.put(self._sentinel, timeout=timeout)
+        except queue.Full:
+            return False
+        self._thread.join(timeout)
+        terminou = not self._thread.is_alive()
+        self._thread = None
+        return terminou
 
 
 def _fora_do_terminal(record: logging.LogRecord) -> bool:
@@ -184,41 +213,46 @@ def _fora_do_terminal(record: logging.LogRecord) -> bool:
     return not getattr(record, "so_no_arquivo", False)
 
 
-# A fila e a thread do log ligadas agora (None = o log do scanner nao esta configurado).
-_ouvinte: _Ouvinte | None = None
-_fila_do_log: queue.SimpleQueue | None = None
+# As threads do log ligadas agora, uma por destino (vazio = o log do scanner nao esta configurado).
+_ouvintes: list[_Ouvinte] = []
 
 
 def handlers_do_scanner() -> list[logging.Handler]:
-    """Os handlers que escrevem de verdade (terminal e arquivo do dia), atras da fila. Vazio se o log esta desligado."""
-    return list(_ouvinte.handlers) if _ouvinte is not None else []
+    """Os handlers que escrevem de verdade (terminal e arquivo do dia), atras das filas. Vazio = log desligado."""
+    return [handler for ouvinte in _ouvintes for handler in ouvinte.handlers]
 
 
 def descarregar_logs(timeout: float = 5) -> bool:
-    """Espera a thread do log escrever tudo o que ja estava na fila (e da flush). True se deu tempo.
+    """Espera as threads do log escreverem tudo o que ja estava nas filas (e darem flush). True se deu tempo.
 
-    Para os testes e para quem vai ler o arquivo de log logo em seguida.
+    Para os testes e para quem vai ler o arquivo de log logo em seguida. Com o terminal travado, volta False.
     """
-    if _ouvinte is None or _fila_do_log is None:
-        return True
-    pronto = threading.Event()
-    _fila_do_log.put(pronto)
-    return pronto.wait(timeout)
+    limite = time.monotonic() + timeout
+    pedidos = []
+    for ouvinte in _ouvintes:
+        pronto = threading.Event()
+        try:
+            ouvinte.queue.put_nowait(pronto)
+        except queue.Full:
+            return False
+        pedidos.append(pronto)
+    return all(pronto.wait(max(0.0, limite - time.monotonic())) for pronto in pedidos)
 
 
 def desligar_logs() -> None:
-    """Para a thread do log (escrevendo antes tudo o que estava na fila), tira a fila da raiz e fecha os handlers.
+    """Para as threads do log (escrevendo antes o que estava nas filas), tira a fila da raiz e fecha os handlers.
 
-    Usado ao reconfigurar, ao sair do scanner (o main chama) e nos testes.
+    Usado ao reconfigurar, ao sair do scanner (o main chama) e nos testes. Espera cada thread no maximo
+    ESPERA_MAX_PARAR_LOG_S (um terminal travado nao segura a saida).
     """
-    global _ouvinte, _fila_do_log
+    global _ouvintes
     raiz = logging.getLogger()
     for handler in [h for h in raiz.handlers if getattr(h, "do_scanner", False)]:
         raiz.removeHandler(handler)
         handler.close()
-    ouvinte, _ouvinte, _fila_do_log = _ouvinte, None, None
-    if ouvinte is not None:
-        ouvinte.stop()  # escreve o que ja estava na fila e termina a thread
+    ouvintes, _ouvintes = _ouvintes, []
+    for ouvinte in ouvintes:
+        ouvinte.parar(ESPERA_MAX_PARAR_LOG_S)
         for handler in ouvinte.handlers:
             handler.close()
 
@@ -231,9 +265,9 @@ def configurar_logs(nivel: str, pasta: str, dias: int, relogio: Callable[[], flo
     dias: quantos arquivos de dias anteriores guardar, alem do de hoje (dias_logs da Config).
     Pode ser chamada de novo: troca os handlers antigos pelos novos, sem abrir o arquivo duas vezes.
     Se a pasta nao puder ser criada ou o arquivo nao abrir, segue so com o terminal e avisa.
-    Na raiz fica so a fila (veja o topo do arquivo); terminal e arquivo ficam na thread do log.
+    Na raiz fica so a fila (veja o topo do arquivo); terminal e arquivo ficam cada um na sua thread.
     """
-    global _ouvinte, _fila_do_log
+    global _ouvintes
     desligar_logs()
     raiz = logging.getLogger()
     raiz.setLevel(logging.WARNING)
@@ -255,12 +289,17 @@ def configurar_logs(nivel: str, pasta: str, dias: int, relogio: Callable[[], flo
         arquivo.do_scanner = True
         handlers.append(arquivo)
 
-    _fila_do_log = queue.SimpleQueue()
-    fila = _FilaDoLog(_fila_do_log, relogio)
-    fila.do_scanner = True
-    _ouvinte = _Ouvinte(_fila_do_log, *handlers, respect_handler_level=True)
-    _ouvinte.start()
-    raiz.addHandler(fila)
+    # Uma fila e uma thread por destino: o terminal travado nao para o arquivo. A do terminal tem limite.
+    filas: list[queue.Queue] = []
+    for handler in handlers:
+        fila = queue.Queue(maxsize=MAX_LINHAS_ESPERANDO_O_TERMINAL if handler is terminal else 0)
+        ouvinte = _Ouvinte(fila, handler, respect_handler_level=True)
+        ouvinte.start()
+        filas.append(fila)
+        _ouvintes.append(ouvinte)
+    entrada = _FilaDoLog(filas, relogio)
+    entrada.do_scanner = True
+    raiz.addHandler(entrada)
     if aviso is not None:
         registro.warning("sem arquivo de log: nao consegui usar a pasta '%s' (%s); o log fica so no terminal", *aviso)
 

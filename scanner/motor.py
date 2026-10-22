@@ -35,6 +35,7 @@ periodo sao recarregadas das amostras do banco ao ligar e quando o periodo muda 
 thread propria, e juntadas as amostras novas da memoria quando a recarga termina.
 """
 
+import heapq
 import logging
 import math
 import threading
@@ -57,7 +58,7 @@ from scanner.calculo import (
 from scanner.coletores.dados_lentos import TaxaDesconhecida
 from scanner.config.carregar import Config
 from scanner.estado import EstadoMercados, pares_para_livro
-from scanner.filtros import Filtros, custo_por_1000, limitar_periodo_metricas, passa
+from scanner.filtros import Filtros, custo_por_1000, passa
 from scanner.metricas import JanelaMetricas
 from scanner.modelos import Candidato, Ponta
 from scanner.normalizador import ParNormalizado, preco_unitario_usdt
@@ -206,6 +207,14 @@ def _preco_valido(preco, fator: float) -> float | None:
         return None  # ex.: None ou texto
     convertido = preco * fator
     return convertido if _numero_valido(convertido) and convertido > 0 else None
+
+
+def _guardar_entre_os_melhores(lista: list, tamanho: int, spread: float, combo: tuple) -> None:
+    """Guarda (spread, combo) na `lista` (um heap: o menor spread em lista[0]), que fica com as `tamanho` maiores."""
+    if len(lista) < tamanho:
+        heapq.heappush(lista, (spread, combo))
+    elif spread > lista[0][0]:
+        heapq.heapreplace(lista, (spread, combo))
 
 
 def _nome_normal(texto: str) -> str:
@@ -458,13 +467,16 @@ class Motor:
         self.escritor = escritor
         self._cotacoes = cotacoes
         self.sessao = Sessao()
-        limitar_periodo_metricas(self._periodo_max_h())  # o painel nao aceita periodo maior que a retencao
         self._recarga: _Recarga | None = None  # recarga das janelas pelo banco em andamento
         self._periodo_h = cfg.periodo_metricas_h  # periodo em uso (a sessao pode trocar)
         self.gerenciador = GerenciadorSinais(cfg.anti_repeticao_s, self._periodo_h)
         self._historicos: dict[tuple, _Historico] = {}  # chave do sinal -> amostras do periodo
         self._amostras_pendentes: list[tuple] = []  # amostras novas que `ciclo` ainda vai gravar no banco
+        self._ultimo_visto: float | None = None  # quando o motor anotou no banco pela ultima vez os sinais vistos
         self._ultima_vez_acima: dict[tuple, float] = {}  # etapa 2: combo -> ultima vez acima do spread minimo
+        # Etapa 2 no modo Farm: mercado de farm (corretora, mercado) -> {combinacao abaixo do minimo normal com livro
+        # aberto agora: ultima vez entre as melhores} (no maximo max_livros_farm_por_mercado; veja _escolher_farm).
+        self._livros_farm: dict[tuple[str, str], dict[tuple, float]] = {}
         # Etapa 2: combo com livro (as de _ultima_vez_acima) -> ((corretora, simbolo) do long, do short).
         self._simbolos_livro: dict[tuple, tuple[tuple[str, str], tuple[str, str]]] = {}
         self._avisados: set = set()  # avisos de log ja dados (cada um aparece uma vez so)
@@ -484,6 +496,11 @@ class Motor:
         para o tamanho de referencia ou sem taxa taker conhecida nao gera candidato. Tambem
         acrescenta as amostras do periodo (a primeira quando a combinacao aparece; depois a cada
         `amostra_s`) e junta as janelas recarregadas do banco, se a recarga terminou.
+
+        No modo Farm so as combinacoes com ponta numa corretora de farm e as moedas do "sempre mostrar" sao
+        calculadas: as outras nunca viram sinal no Farm (a regra do modo exige uma ponta de farm), e calcular
+        todas nao caberia no ciclo. Enquanto o Farm durar, as metricas do periodo dessas outras param de receber
+        amostras (o historico pelos tickers de todos os pares, da Task 18, resolve isso).
         """
         modo = self._modo_da_sessao()
         duracao_invertida_s, metrica = self._ajustar_sessao(agora)
@@ -491,10 +508,13 @@ class Motor:
         cotacoes = self._cotacoes_validas()
         # Cada mercado e lido uma vez so; ficam os que tem livro valido agora.
         lados = self._lados_com_livro(agora, cotacoes)
+        so_do_farm = self._filtro_do_farm(modo, {corretora for corretora, _, _ in lados})
         resultado = []
         vistas = set()
         # So as combinacoes com livro valido nas duas pontas: as outras nao gerariam candidato.
         for combo, chave_long, chave_short in self._combos_candidatos.obter(_agrupar(lados)):
+            if so_do_farm is not None and not so_do_farm(combo):
+                continue  # modo Farm: sem ponta de farm, nunca vira sinal
             try:
                 candidato = self._candidato(combo, lados[chave_long], lados[chave_short], agora, modo,
                                             duracao_invertida_s, metrica)
@@ -528,7 +548,18 @@ class Motor:
         destino = self._destino()
         if destino is not None:
             self._gravar(destino, eventos, amostras)
+            self._marcar_vistos(destino, agora)
         return eventos
+
+    def _marcar_vistos(self, destino, agora: float) -> None:
+        """A cada `amostra_s`, anota no banco quando cada sinal ativo foi visto (fechar certo apos uma queda)."""
+        if self._ultimo_visto is not None and agora - self._ultimo_visto < self.cfg.amostra_s:
+            return
+        self._ultimo_visto = agora
+        try:
+            destino.marcar_vistos(self.gerenciador.vistos())
+        except Exception:
+            registro.exception("nao consegui anotar no banco quando os sinais ativos foram vistos")
 
     def sinais_ativos(self) -> list[dict]:
         """Os sinais ativos agora, no formato JSON da spec (secao 5)."""
@@ -605,14 +636,18 @@ class Motor:
         """Etapa 2: os simbolos que devem ter livro completo, por corretora.
 
         Para as combinacoes (spot x futuro e futuro x futuro) calcula o spread de abertura com os
-        TICKERS (ask do long e bid do short, em USDT). Quem passa do minimo ganha o livro das duas
-        pontas e o mantem por `manter_livro_s` depois de cair abaixo (mesmo se o ticker sumir nesse
-        tempo). O minimo e `spread_min_livro_pct`, com duas excecoes (sem livro nao ha sinal, entao a
-        etapa 2 nao pode esconder o que o dono pediu para ver):
-        - modo Farm: combinacao com ponta numa corretora de farm usa o menor entre esse e
-          `spread_min_livro_farm_pct` (as operacoes de farm baratas tem A perto de zero);
-        - moeda do "sempre mostrar" da sessao: todas as combinacoes dela abrem livro (o limite de
-          assinaturas de cada corretora continua valendo no coletor).
+        TICKERS (ask do long e bid do short, em USDT). Quem passa de `spread_min_livro_pct` ganha o
+        livro das duas pontas e o mantem por `manter_livro_s` depois de cair abaixo (mesmo se o
+        ticker sumir nesse tempo). Duas excecoes (sem livro nao ha sinal, entao a etapa 2 nao pode
+        esconder o que o dono pediu para ver):
+        - modo Farm: as combinacoes com ponta numa corretora de farm abrem livro tambem abaixo desse
+          minimo, ate `spread_min_livro_farm_pct` (as operacoes de farm baratas tem A perto de zero), mas
+          so as `max_livros_farm_por_mercado` melhores de cada mercado de farm (ex.: os futuros da Lighter),
+          pelo A dos tickers. Sem esse teto, quase toda combinacao com ponta de farm passaria e o ciclo nao
+          caberia em 500 ms. As que passam do minimo normal abrem como no modo Lucro, fora do teto;
+        - moeda do "sempre mostrar" da sessao: todas as combinacoes dela abrem livro (~150 por moeda com 9
+          corretoras).
+        O limite de assinaturas de cada corretora continua valendo por cima de tudo, no coletor.
         O filtro "tipos de oportunidade" nao muda quais livros abrem.
         Combinacao que nao chega ao minimo nem precisa ter o spread calculado: para cada long, os
         shorts sao olhados do maior bid para o menor, e o spread so cai quando o bid cai.
@@ -620,6 +655,7 @@ class Motor:
         cotacoes = self._cotacoes_validas()
         minimo = self.cfg.spread_min_livro_pct
         minimo_farm = min(minimo, self.cfg.spread_min_livro_farm_pct)
+        banda = 2 * self.cfg.max_livros_farm_por_mercado  # quantas das melhores de farm cada mercado guarda
         # As combinacoes saem de TODOS os mercados com ticker guardado: ticker que fica velho e volta
         # (comum) nao obriga a arruma-las de novo. Quem nao tem preco valido agora e pulado no laco
         # (precos tem uma entrada para cada mercado).
@@ -629,19 +665,25 @@ class Motor:
         asks, bids = precos.asks, precos.bids
         # So as combinacoes que chegam ao minimo agora: as outras nao mudam nada em pares_para_livro.
         acima: dict[tuple, float] = {}  # combo -> spread
+        ranking: dict[tuple[str, str], list] = {}  # Farm: mercado de farm -> as melhores abaixo do minimo normal
         for ativo, (longs, shorts) in self._combos_selecao.obter(mercados).items():  # um ativo por vez
             try:
                 if sempre and _nome_normal(ativo) in sempre:
                     self._todas_do_ativo(longs, asks, bids, acima)
-                else:
-                    self._acima_do_minimo(longs, shorts, asks, bids, minimo, acima, farm, minimo_farm)
+                    continue
+                # Os shorts do ativo com bid valido, do maior bid para o menor.
+                vendas = sorted(((bids[chave], chave) for chave in shorts if bids[chave] is not None), reverse=True)
+                self._acima_do_minimo(longs, vendas, asks, minimo, acima)
+                if farm:
+                    self._farm_do_ativo(longs, vendas, asks, minimo, minimo_farm, farm, ranking, banda)
             except Exception:  # defeito inesperado neste ativo: so ele fica fora da etapa 2 neste ciclo
                 self._avisar_uma_vez(("erro_selecao", ativo),
                                      "%s: erro na etapa 2 (escolha dos livros); este ativo fica de fora "
                                      "(aviso uma vez so)", ativo, exc_info=True)
 
-        # Em `acima` so estao as combinacoes que passaram do minimo de cada uma: todas contam como "acima agora".
+        # Em `acima` so estao as combinacoes que passaram do minimo: todas contam como "acima agora".
         escolhidos = pares_para_livro(acima, -math.inf, self._ultima_vez_acima, agora, self.cfg.manter_livro_s)
+        escolhidos |= self._escolher_farm(ranking, agora, bool(farm))
         # Simbolos das escolhidas: os do ticker de agora (mesma condicao do spread acima); se o
         # ticker sumiu, ficam os da ultima vez.
         for combo in escolhidos:
@@ -651,8 +693,8 @@ class Motor:
             if asks.get(chave_long) is not None and bids.get(chave_short) is not None:
                 self._simbolos_livro[combo] = ((corretora_long, precos.simbolos[chave_long]),
                                                (corretora_short, precos.simbolos[chave_short]))
-        # Esquece os simbolos de quem saiu de vez (pares_para_livro ja tirou do _ultima_vez_acima).
-        for combo in [c for c in self._simbolos_livro if c not in self._ultima_vez_acima]:
+        # Esquece os simbolos de quem saiu de vez.
+        for combo in [c for c in self._simbolos_livro if c not in escolhidos]:
             del self._simbolos_livro[combo]
 
         selecao: dict[str, set[str]] = {}
@@ -661,10 +703,24 @@ class Motor:
                 selecao.setdefault(corretora, set()).add(simbolo)
         return selecao
 
-    def _excecoes_da_etapa2(self, mercados: dict) -> tuple[dict[str, bool], set[str]]:
-        """As excecoes do minimo da etapa 2 (veja selecao_livros).
+    def _filtro_do_farm(self, modo: str, corretoras: set[str]) -> Callable[[tuple], bool] | None:
+        """No Farm: funcao que diz se a combinacao entra no calculo (ponta de farm ou "sempre mostrar"). Lucro: None."""
+        if modo != "farm":
+            return None
+        farm, sempre = self._excecoes_da_etapa2(corretoras)
 
-        Devolve ({corretora: e de farm?} de cada corretora de `mercados`, so no modo Farm e vazio no Lucro;
+        def entra(combo: tuple) -> bool:
+            if farm.get(combo[1]) or farm.get(combo[3]):
+                return True
+            return bool(sempre) and _nome_normal(combo[0]) in sempre
+
+        return entra
+
+    def _excecoes_da_etapa2(self, mercados) -> tuple[dict[str, bool], set[str]]:
+        """As excecoes do minimo da etapa 2 (veja selecao_livros) e do calculo no Farm (veja candidatos).
+
+        mercados: as corretoras a classificar (um dict por corretora, ou so os nomes).
+        Devolve ({corretora: e de farm?} de cada uma, so no modo Farm e vazio no Lucro ou se nenhuma e de farm;
         moedas do "sempre mostrar" da sessao), com os nomes ja normalizados para comparar.
         """
         farm: dict[str, bool] = {}
@@ -678,39 +734,104 @@ class Motor:
         return farm, sempre
 
     @staticmethod
-    def _acima_do_minimo(longs: dict, shorts: list, asks: dict, bids: dict, minimo: float,
-                         acima: dict[tuple, float], farm: dict[str, bool] | None = None,
-                         minimo_farm: float | None = None) -> None:
-        """Etapa 2 de um ativo: anota em `acima` as combinacoes com spread de abertura (tickers) >= o minimo delas.
+    def _acima_do_minimo(longs: dict, vendas: list, asks: dict, minimo: float, acima: dict[tuple, float]) -> None:
+        """Etapa 2 de um ativo: anota em `acima` as combinacoes com spread de abertura (tickers) >= minimo.
 
-        farm: {corretora: e de farm?} (so no modo Farm; vazio = nenhuma). Combinacao com uma ponta de farm usa
-        `minimo_farm` (ja o menor dos dois minimos); as outras, `minimo`.
+        vendas: os shorts do ativo com bid valido, (bid, chave), do maior bid para o menor.
         """
-        # Os shorts do ativo com bid valido, do maior bid para o menor.
-        vendas = sorted(((bids[chave], chave) for chave in shorts if bids[chave] is not None), reverse=True)
-        vendas_farm = [venda for venda in vendas if farm.get(venda[1][0])] if farm else []
         for chave_long, combos_do_long in longs.items():
             ask_long = asks[chave_long]
             if ask_long is None:
                 continue  # sem ask valido agora: nao serve de long
-            if farm and farm.get(chave_long[0]):  # long de farm: toda combinacao dele tem ponta de farm
-                Motor._percorrer(vendas, combos_do_long, ask_long, minimo_farm, acima)
-                continue
-            Motor._percorrer(vendas, combos_do_long, ask_long, minimo, acima)
-            if vendas_farm:  # e os shorts de farm, com o minimo de farm
-                Motor._percorrer(vendas_farm, combos_do_long, ask_long, minimo_farm, acima)
+            for bid_short, chave_short in vendas:
+                combo = combos_do_long.get(chave_short)
+                if combo is None:
+                    continue  # nao forma combinacao com este long (ex.: futuro x futuro na mesma corretora)
+                spread = spread_abertura(ask_long, bid_short)
+                if spread < minimo:
+                    break  # os proximos shorts tem bid menor ou igual: spread menor ou igual
+                acima[combo] = spread
 
     @staticmethod
-    def _percorrer(vendas: list, combos_do_long: dict, ask_long: float, minimo: float, acima: dict) -> None:
-        """Anota em `acima` as combinacoes do long com os shorts de `vendas` (maior bid primeiro) ate cair do minimo."""
+    def _farm_do_ativo(longs: dict, vendas: list, asks: dict, minimo: float, minimo_farm: float,
+                       farm: dict[str, bool], ranking: dict[tuple[str, str], list], banda: int) -> None:
+        """Etapa 2 no modo Farm, de um ativo: as combinacoes com ponta de farm e spread entre `minimo_farm` e `minimo`.
+
+        Cada uma entra no `ranking` do mercado de farm dela ((corretora, mercado), ex.: ("lighter", "futuro")):
+        uma lista (heap) com as `banda` de maior spread ate agora. As que passam de `minimo` ja abrem pela regra
+        normal e ficam de fora daqui. A combinacao com as duas pontas de farm conta no mercado do long.
+        Os lacos param cedo: os shorts estao do maior bid para o menor (e os longs, do menor ask para o maior),
+        entao o spread so cai; e com a lista cheia, so entra quem passa do pior que ela guarda.
+        """
+        # 1) Long numa corretora de farm: todos os shorts.
+        for chave_long, combos_do_long in longs.items():
+            ask_long = asks[chave_long]
+            if ask_long is None or not farm.get(chave_long[0]):
+                continue
+            lista = ranking.setdefault((chave_long[0], chave_long[1]), [])
+            for bid_short, chave_short in vendas:
+                combo = combos_do_long.get(chave_short)
+                if combo is None:
+                    continue
+                spread = spread_abertura(ask_long, bid_short)
+                if spread >= minimo:
+                    continue  # abre pela regra normal
+                if spread < minimo_farm or (len(lista) >= banda and spread <= lista[0][0]):
+                    break
+                _guardar_entre_os_melhores(lista, banda, spread, combo)
+        # 2) Short numa corretora de farm, com long de outra corretora: os longs do menor ask para o maior.
+        compras = None
         for bid_short, chave_short in vendas:
-            combo = combos_do_long.get(chave_short)
-            if combo is None:
-                continue  # nao forma combinacao com este long (ex.: futuro x futuro na mesma corretora)
-            spread = spread_abertura(ask_long, bid_short)
-            if spread < minimo:
-                break  # os proximos shorts tem bid menor ou igual: spread menor ou igual
-            acima[combo] = spread
+            if not farm.get(chave_short[0]):
+                continue
+            if compras is None:
+                compras = sorted((asks[chave], chave) for chave in longs
+                                 if asks[chave] is not None and not farm.get(chave[0]))
+            lista = ranking.setdefault((chave_short[0], chave_short[1]), [])
+            for ask_long, chave_long in compras:
+                combo = longs[chave_long].get(chave_short)
+                if combo is None:
+                    continue
+                spread = spread_abertura(ask_long, bid_short)
+                if spread >= minimo:
+                    continue
+                if spread < minimo_farm or (len(lista) >= banda and spread <= lista[0][0]):
+                    break
+                _guardar_entre_os_melhores(lista, banda, spread, combo)
+
+    def _escolher_farm(self, ranking: dict[tuple[str, str], list], agora: float, no_farm: bool) -> set[tuple]:
+        """Modo Farm: as combinacoes de farm (abaixo do minimo normal) que ficam com livro, no maximo k por mercado.
+
+        k = max_livros_farm_por_mercado. Para nao abrir e fechar livro a cada oscilacao, a que ja tem livro tem
+        preferencia: continua enquanto estiver entre as 2k melhores do mercado (o `ranking`) e, como na regra
+        normal, ate `manter_livro_s` depois de sair delas (mesmo se o ticker sumir nesse tempo). As vagas que
+        sobram vao para as melhores de agora. Fora do modo Farm (no_farm False) nenhuma fica.
+        """
+        if not no_farm:
+            self._livros_farm = {}
+            return set()
+        k, manter_s = self.cfg.max_livros_farm_por_mercado, self.cfg.manter_livro_s
+        novos: dict[tuple[str, str], dict[tuple, float]] = {}
+        for mercado in set(ranking) | set(self._livros_farm):
+            ordem = [combo for _, combo in sorted(ranking.get(mercado, ()), reverse=True)]  # melhor primeiro
+            abertos = self._livros_farm.get(mercado, {})  # combo -> ultima vez entre as 2k melhores
+            ficam: dict[tuple, float] = {}
+            for combo in ordem:  # 1) as que ja tem livro e seguem entre as 2k melhores
+                if combo in abertos and len(ficam) < k:
+                    ficam[combo] = agora
+            for combo, visto in sorted(abertos.items(), key=lambda item: -item[1]):  # 2) as que sairam ha pouco
+                if len(ficam) >= k:
+                    break
+                if combo not in ficam and agora - visto <= manter_s:
+                    ficam[combo] = visto
+            for combo in ordem:  # 3) as melhores de agora, nas vagas que sobraram
+                if len(ficam) >= k:
+                    break
+                ficam.setdefault(combo, agora)
+            if ficam:
+                novos[mercado] = ficam
+        self._livros_farm = novos
+        return {combo for ficam in novos.values() for combo in ficam}
 
     @staticmethod
     def _todas_do_ativo(longs: dict, asks: dict, bids: dict, acima: dict[tuple, float]) -> None:

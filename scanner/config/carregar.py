@@ -52,7 +52,10 @@ class Config:
     metrica_spread: str = "medio"
     # Etapa 2 no modo Farm: combinacao com ponta numa corretora de farm abre o livro a partir deste spread de
     # abertura (pelos tickers), em %. Vale o menor entre este e spread_min_livro_pct.
-    spread_min_livro_farm_pct: float = -0.3
+    spread_min_livro_farm_pct: float = -0.1
+    # Etapa 2 no modo Farm: no maximo tantas combinacoes abaixo de spread_min_livro_pct por mercado de farm
+    # (corretora + spot/futuro), as de maior spread pelos tickers.
+    max_livros_farm_por_mercado: int = 50
 
     # Taxas taker sobrescritas por (corretora, mercado). Ex.: {("mexc", "futuro"): 0.02}
     taxas: dict = field(default_factory=dict)
@@ -399,7 +402,8 @@ def _validar_campo(campo: str, valor):
         if not isinstance(valor, str) or not valor:
             raise ErroConfig("pasta_logs: precisa ser o nome de uma pasta, ex.: logs")
         return valor
-    if campo in ("dias_logs", "mensagens_sem_bid_ask", "livros_reservados_limite_mercado", *CAMPOS_INTEIROS_LIGHTER):
+    if campo in ("dias_logs", "mensagens_sem_bid_ask", "livros_reservados_limite_mercado",
+                 "max_livros_farm_por_mercado", *CAMPOS_INTEIROS_LIGHTER):
         if not _inteiro_positivo(valor):
             raise ErroConfig(f"{campo}: precisa ser um numero inteiro maior que zero (valor recebido: {valor!r})")
         return valor

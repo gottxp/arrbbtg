@@ -71,7 +71,7 @@ Regra para todos os comandos: rode sempre **dentro da pasta do projeto** (a que 
 
    Em até 1 minuto aparecem linhas como `INFO scanner.principal: mexc: acompanhando 812 pares` e `INFO scanner.api: painel em http://127.0.0.1:8000`. Deixe essa janela aberta: fechar a janela desliga o scanner.
 
-   Não clique nem selecione texto dentro dessa janela com o scanner ligado. A **Edição Rápida** do console do Windows congela a saída da janela até você apertar `Enter` ou `Esc`. O scanner não para (o log continua indo para o arquivo), mas a janela fica parada. Para desligar a Edição Rápida: clique com o botão direito na barra de título da janela > **Propriedades** > aba **Opções** > desmarque **Modo de Edição Rápida** > **OK**.
+   Não clique nem selecione texto dentro dessa janela com o scanner ligado. A **Edição Rápida** do console do Windows congela a saída da janela até você apertar `Enter` ou `Esc`. O scanner não para e o arquivo de log continua sendo gravado; só a janela fica parada (ao apertar `Enter` ou `Esc`, as linhas que estavam esperando aparecem; se ela ficar parada por muito tempo, as mais novas só ficam no arquivo). Para desligar a Edição Rápida: clique com o botão direito na barra de título da janela > **Propriedades** > aba **Opções** > desmarque **Modo de Edição Rápida** > **OK**.
 2. Abrir o painel: no navegador, abra <http://localhost:8000>.
 3. Parar: clique na janela do PowerShell e aperte `Ctrl+C`. Aparece `Encerrado.`.
 4. Logs: um arquivo por dia em `C:\scanner-arbitragem\logs\scanner-AAAA-MM-DD.log`, no horário do PC. Ficam o de hoje e os 30 dias anteriores. Para acompanhar o log de hoje numa segunda janela do PowerShell:
@@ -88,7 +88,7 @@ Regra para todos os comandos: rode sempre **dentro da pasta do projeto** (a que 
    ```
 
 5. Banco: `C:\scanner-arbitragem\scanner.db` (histórico dos sinais, amostras do gráfico, grupos de filtros, métricas da validação e a última sessão do painel). O scanner apaga sozinho as amostras do gráfico com mais de 7 dias (`retencao_dias`); o histórico dos sinais e as métricas da validação ficam. Para começar do zero: pare o scanner e apague `scanner.db`, `scanner.db-wal` e `scanner.db-shm`.
-6. Ao ligar de novo, o scanner volta na última sessão do painel (modo, filtros e modo comparação), recarrega as amostras do período (4 h) do banco para o F médio e o lote médio não começarem do zero, e fecha os sinais que ficaram abertos se ele tiver caído. Ao parar com `Ctrl+C`, os sinais ativos são encerrados com o horário da parada.
+6. Ao ligar de novo, o scanner volta na última sessão do painel (modo, filtros e modo comparação), recarrega as amostras do período (4 h) do banco para o F médio e o lote médio não começarem do zero, e fecha os sinais que ficaram abertos se ele tiver caído (com a última vez em que cada um foi visto). Ao parar com `Ctrl+C`, os sinais ativos são encerrados com o horário da parada.
 
 ## 3. Instalar e rodar na VPS (Ubuntu)
 
@@ -622,7 +622,7 @@ Tem que aparecer `recursos: memoria NNN.N MB (atual), ...`. Se aparecer `memoria
 | Geral | Métrica de spread | qual F entra no RP bruto: médio, maior ou média dos 10 maiores. Vazio = o do `config.yaml` |
 | Geral | Resultado projetado mín. (Lucro) (%) | RP mínimo do modo Lucro. Vazio = o do `config.yaml` (0,2%) |
 | Geral | Custo máx. (Farm) (%) | menor RP aceito no modo Farm (negativo). Vazio = o do `config.yaml` (-0,1%) |
-| Organização | Sempre mostrar | moedas que aparecem mesmo fora dos filtros, das listas e do modo (nunca com lote abaixo do mínimo nem suspeitas) |
+| Organização | Sempre mostrar | moedas que aparecem mesmo fora dos filtros, das listas e do modo (nunca com lote abaixo do mínimo nem suspeitas). Cada moeda abre o livro de todas as combinações dela (~150 combinações com 9 corretoras, e cada livro é uma assinatura na corretora): use para poucas moedas |
 | Organização | Nunca mostrar / Apenas mostrar | moedas escondidas / só estas moedas |
 | Organização | Ordenar por | Resultado (padrão: RP líquido; Farm: menor custo; comparação: RP bruto), Horário, Spread ou Volume (o menor das duas pontas) |
 | Organização | Mostrar suspeitos | mostra os sinais marcados `SUSPEITO` |
@@ -683,6 +683,7 @@ Verde = positivo; vermelho = negativo. Linha com faixa amarela à esquerda = fix
 - As colunas `MAX` e a etiqueta `STOCK` ficam vazias na v1.
 - `Funding sincronizado` só confere se as pontas têm o mesmo intervalo de cobrança (não o horário da próxima cobrança).
 - O gráfico do histórico mostra as amostras até uns 10 s atrás: o banco grava as amostras em lotes de 10 s (escreve menos no disco). A tabela ao vivo não tem esse atraso.
+- No modo Farm o scanner só calcula as combinações com uma ponta numa corretora de farm (e as moedas do **Sempre mostrar**). Abaixo do spread mínimo normal (0,3%), cada mercado de farm (ex.: os futuros da Lighter) abre no máximo 50 combinações, as de maior spread (`max_livros_farm_por_mercado`).
 
 ---
 
@@ -821,8 +822,9 @@ O padrão vale quando a linha não está no `config.yaml`.
 | `prazo_primeiro_ticker_s` | `60` | s | par pedido sem nenhum ticker neste tempo vai para um aviso no log |
 | `intervalo_montar_livro_lighter_ms` | `100` | ms | intervalo mínimo entre duas montagens do livro de um par da Lighter |
 | `prazo_primeiro_livro_s` | `60` | s | livro pedido sem nada neste tempo vai para um aviso no log |
-| `spread_min_livro_farm_pct` | `-0.3` | % | spread mínimo para abrir o livro das combinações de farm, no modo Farm |
+| `spread_min_livro_farm_pct` | `-0.1` | % | spread mínimo para abrir o livro das combinações de farm, no modo Farm |
 | `validade_funding_s` | `900` | s | funding mais velho que isto fica desconhecido no cálculo |
+| `max_livros_farm_por_mercado` | `50` | combinações | no modo Farm, quantas combinações abaixo de `spread_min_livro_pct` cada mercado de farm abre |
 
 ---
 
@@ -912,3 +914,4 @@ Para qualquer erro fora desta tabela: copie a mensagem inteira (e as linhas em v
 | `N sinais ficaram abertos na execucao anterior (...)` | Normal depois de uma queda (energia, janela fechada sem `Ctrl+C`): os registros foram fechados com a última hora conhecida. Nada a fazer. |
 | `sessao salva no banco ignorada (...)` | A última sessão guardada não vale mais (ex.: o período ficou acima de `retencao_dias` × 24). O scanner começa no padrão do `config.yaml`; abra o painel e escolha o grupo de filtros de novo. |
 | No painel: `periodo_metricas_h: no maximo 168 horas (...)` | O período das métricas passou da retenção do banco. Use até `retencao_dias` × 24 horas (ou aumente `retencao_dias` no `config.yaml`). |
+| `nao consegui gravar no banco (OperationalError: database is locked); N itens (...) voltaram para a fila e o escritor tenta de novo em Ns` | Outro programa está com o `scanner.db` aberto (ex.: DB Browser). Feche esse programa: o scanner grava sozinho o que estava esperando. Com `database or disk is full`, libere espaço no disco. |

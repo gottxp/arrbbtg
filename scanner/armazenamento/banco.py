@@ -66,7 +66,8 @@ CREATE TABLE IF NOT EXISTS sinais (
     encerrado_em   TEXT,            -- vazio enquanto o sinal esta aberto
     rp_liquido_pct REAL,
     sinal_json     TEXT NOT NULL,
-    comparacao     INTEGER NOT NULL DEFAULT 0  -- 1 = nasceu com o modo comparacao ligado (decidido pelo RP bruto)
+    comparacao     INTEGER NOT NULL DEFAULT 0, -- 1 = nasceu com o modo comparacao ligado (decidido pelo RP bruto)
+    visto_em       TEXT             -- ultima vez em que o sinal ativo foi visto (gravada de tempos em tempos)
 );
 CREATE INDEX IF NOT EXISTS idx_sinais_detectado_em ON sinais (detectado_em);
 
@@ -262,6 +263,9 @@ class Banco:
                 self._conn.execute("ALTER TABLE sinais ADD COLUMN comparacao INTEGER NOT NULL DEFAULT 0")
             registro.info("banco: a tabela de sinais ganhou a coluna comparacao (os registros antigos ficam sem a "
                           "marca)")
+        if colunas_sinais and "visto_em" not in colunas_sinais:
+            with self._conn:
+                self._conn.execute("ALTER TABLE sinais ADD COLUMN visto_em TEXT")
 
     def fechar(self) -> None:
         """Fecha a conexao. Depois disso o `Banco` nao pode mais ser usado."""
@@ -410,16 +414,18 @@ class Banco:
         """Fecha os registros que ficaram abertos de uma execucao anterior (o scanner caiu). Devolve quantos.
 
         O __main__ chama ao ligar, antes de o motor comecar. Cada registro aberto recebe como `encerrado_em`
-        (na coluna e no JSON) a ultima hora conhecida do par: a mais nova entre o `atualizado_em` do JSON e a
-        ultima amostra gravada da combinacao (o motor amostra o par enquanto o sinal esta ativo). Sem isso o
-        registro contaria para sempre como aberto no resumo do dia e a limpeza nunca o fecharia.
+        (na coluna e no JSON) a ultima vez em que o SINAL foi visto: a mais nova entre o `atualizado_em` do JSON e
+        o `visto_em` (que o motor grava de tempos em tempos enquanto o sinal esta ativo, veja marcar_vistos). Nao
+        usa as amostras da combinacao: ela continua sendo amostrada enquanto tem livro, mesmo sem sinal. Sem isso
+        o registro contaria para sempre como aberto no resumo do dia.
         """
         with self._trava:
-            linhas = self._conn.execute("SELECT id, sinal_json FROM sinais WHERE encerrado_em IS NULL").fetchall()
+            linhas = self._conn.execute(
+                "SELECT id, sinal_json, visto_em FROM sinais WHERE encerrado_em IS NULL").fetchall()
             fechados = []
             for linha in linhas:
                 sinal = json.loads(linha["sinal_json"])
-                fim = self._ultima_hora_conhecida(sinal)
+                fim = self._ultima_vez_visto(sinal, linha["visto_em"])
                 sinal["encerrado_em"] = fim
                 fechados.append((fim, _json(sinal), linha["id"]))
             if fechados:
@@ -427,23 +433,28 @@ class Banco:
                     self._conn.executemany("UPDATE sinais SET encerrado_em = ?, sinal_json = ? WHERE id = ?", fechados)
         return len(fechados)
 
-    def _ultima_hora_conhecida(self, sinal: dict) -> str:
-        """A ultima hora (ISO) em que o sinal certamente ainda existia (veja fechar_abertos). Chamado com a trava."""
-        candidatas = [sinal.get(campo) for campo in ("detectado_em", "atualizado_em")]
+    def _ultima_vez_visto(self, sinal: dict, visto_em: str | None) -> str:
+        """A ultima hora (ISO) em que o sinal foi visto ativo (veja fechar_abertos)."""
+        candidatas = [sinal.get("detectado_em"), sinal.get("atualizado_em"), visto_em]
         candidatas = [hora for hora in candidatas if isinstance(hora, str) and hora]
-        long, short = sinal.get("ponta_long"), sinal.get("ponta_short")
-        if isinstance(long, dict) and isinstance(short, dict):
-            # A chave da combinacao, como o motor grava as amostras (motor.texto_da_chave).
-            chave = "|".join(str(x) for x in (sinal.get("par"), sinal.get("tipo"), long.get("corretora"),
-                                               long.get("mercado"), short.get("corretora"), short.get("mercado")))
-            ultima = self._conn.execute(
-                "SELECT max(ts) FROM amostras WHERE combo_id = (SELECT id FROM combos WHERE chave = ?)", (chave,)
-            ).fetchone()[0]
-            if ultima is not None:
-                candidatas.append(_iso_utc(ultima))
         if not candidatas:  # registro sem data nenhuma (nao acontece com o motor): fecha agora
             candidatas.append(_iso_utc(self._relogio()))
         return max(candidatas)  # mesmo formato ISO: a ordem alfabetica e a ordem do tempo
+
+    def marcar_vistos(self, vistos: list[tuple[str, str]]) -> None:
+        """Anota, para cada (id, hora ISO), a ultima vez em que o sinal ativo foi visto (coluna visto_em).
+
+        O motor manda de tempos em tempos (a cada amostra_s) pelo escritor. So muda registro ainda aberto e so para
+        uma hora mais nova. Serve ao fechar_abertos depois de uma queda.
+        """
+        if not vistos:
+            return
+        with self._trava, self._conn:
+            self._conn.executemany(
+                "UPDATE sinais SET visto_em = ? WHERE id = ? AND encerrado_em IS NULL "
+                "AND (visto_em IS NULL OR visto_em < ?)",
+                [(hora, id_, hora) for id_, hora in vistos],
+            )
 
     # --- Amostras ---------------------------------------------------------------
 
