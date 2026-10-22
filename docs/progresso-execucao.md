@@ -122,3 +122,28 @@ Ruling: T11 — TAMANHO_FILA_PADRAO e TEMPO_MAX_ENCERRAR_S ficam como constantes
 Task 11: fix round 1/5 (1 addressed, 0 open — CorpoSessao extra=forbid e campos obrigatórios; commits c5ad88f..63ac302)
 Task 11: note → T12: o painel envia sempre modo+filtros+comparacao no PUT; não depender do código 1008 no WS (real = HTTP 403/1006)
 Task 11: complete (commits 61bd11b..63ac302, review clean)
+Ruling: execução (controlador nesta conta) — T12 e T13 rodaram em paralelo (T13 num git worktree, branch t13), com os commits trazidos para a v1 na ordem do plano (rebase). Ambiente novo: .venv recriado com as mesmas versões (ccxt 4.5.89); 647 testes conferidos antes de começar.
+Ruling: T12 — Lightweight Charts 4.2.3 (API v4) pelo unpkg, versão fixa; sem a biblioteca o modal do gráfico avisa e o resto do painel funciona — custo se errado: trocar a URL e as chamadas da API v4
+Ruling: T12 — filtros: toda mudança aplica na hora (PUT /api/sessao com modo+filtros+comparacao) e é salva no grupo selecionado (POST, debounce ~300 ms); lápis = renomear (POST novo + DELETE antigo); duplicar seleciona a cópia; grupo lembrado no navegador (localStorage) é reaplicado ao abrir/reconectar se diferir da sessão (o último navegador aberto define a sessão do motor) — custo se errado: comportamento de grupo diferente do Arbimax
+Ruling: T12 — `fixados` = lista de chaves em texto (`par|tipo|corretora_long|mercado_long|corretora_short|mercado_short`, igual a texto_da_chave); o gráfico abre pelo botão da coluna Histórico — custo se errado: formato de fixados nos grupos já salvos
+Ruling: T12 — números: vírgula ou ponto como decimal; nos campos em dólar "d.ddd" é milhar (50.000 = 50 mil) — custo se errado: um campo interpretado diferente do esperado
+Ruling: T12 — nome de grupo com "/" é recusado no painel (a rota /api/filtros/{nome} não aceita "/") — custo se errado: trocar a rota para {nome:path}
+Task 12: minor (deferred → final): ressincronização do painel que falha (GET depois de reiniciar o scanner) não tenta de novo; o grupo não é reaplicado até a próxima queda
+Task 12: minor (deferred → final): mudança recusada (400/422) seguida de reconexão reenvia o formulário recusado em vez de reaplicar o grupo (nada é apagado)
+Task 12: minor (deferred): montagem em "/" muda respostas de erro da API (GET /api/sinais/ 404 em vez de 307; POST /api/sessao 405 com Allow: GET, HEAD)
+Task 12: minor (deferred): guarda dos campos de Filtros no painel é só textual (não confere data-tipo)
+Task 12: minor (deferred): várias abas com o mesmo grupo: a aba com formulário velho regrava o grupo inteiro ao mudar um filtro (limitação de projeto; avisar o dono)
+Task 12: minor (deferred): opções de corretoras = /api/status × {spot, futuro}; corretoras só de futuros mostram uma opção "spot" que não casa com nada
+Task 12: minor (deferred → T17/README): gráfico mostra as linhas de preço de abertura nas duas intenções (o banco só guarda ask do long e bid do short); nota no modal
+Task 12: fix round 1/5 (2 important + 5 minor addressed, 0 open — sessão/grupos lidos antes de gravar; "d.ddd" = milhar em dólar; travessia, fetch com tempo limite, foco na ressincronização, espera da reconexão, teste dos números; commits b2c6433..f3bb65e)
+Task 12: complete (commits 989e8c2..f3bb65e, review clean)
+Ruling: T13 — Motor.candidatos gera sempre spot x futuro e futuro x futuro (as duas direções); o filtro "tipos" é aplicado só no passa, para as métricas continuarem aquecidas ao trocar o filtro — custo se errado: o dobro de amostras gravadas
+Ruling: T13 — métricas do período incrementais (JanelaMetricas) entraram na rodada de correção da T13: com futuros x futuros e 9 corretoras o recálculo completo a cada amostra não cabia no ciclo de 500 ms — custo se errado: nenhum (resultado idêntico, conferido por teste de equivalência)
+Ruling: T13 — ordem de `combinacoes`: todos os spot x futuro, depois todos os futuro x futuro; as duas direções do futuro x futuro sempre geram candidato (cada uma com histórico próprio); a etapa 2 também ignora o filtro "tipos" — custo se errado: ordem dos eventos e assinaturas de livro a mais
+Ruling: T13 — desempenho aceito no cenário de 9 corretoras × 500 ativos com janelas de 4h cheias: mediana ~137 ms, ciclos com amostra ~236 ms em média (máx. medido 327 ms, abaixo do ciclo de 500 ms); as médias passaram a ser fsum/n (podem diferir de sum()/n só no último bit em grandezas adversárias) — custo se errado: nenhum na prática
+Task 13: minor (deferred → T14): _SomaExata.valor levanta OverflowError acima de ~1,8e308 (antes dava inf e o candidato era descartado); o ciclo inteiro falharia
+Task 13: minor (deferred → T14): JanelaMetricas.adicionar aceita texto e bool (float(...)); antes _Historico recusava
+Task 13: minor (deferred): teste de memória mede antes das linhas mortas da limpeza (em regime 135-161 KB por histórico)
+Task 13: minor (deferred): testes afirmam sobre atributos privados (_historicos, _simbolos_livro, _ultima_vez_acima); tuplas por posição e laço de agrupar futuros repetido
+Task 13: fix round 1/5 (1 important + 3 minor addressed + métricas incrementais, 0 open — cache da etapa 2 por estado.mercados(), ticker inválido não derruba a etapa 2, NamedTuple, comentário do __main__, JanelaMetricas incremental e compacta (747 KB → 122 KB por histórico; ~700 µs → ~11 µs por amostra), poda exata da etapa 2; commits fa2d790..055268a)
+Task 13: complete (commits f3bb65e..055268a depois do rebase na v1, review clean; 728 testes)
