@@ -970,7 +970,7 @@ Para qualquer erro fora desta tabela: copie a mensagem inteira (e as linhas em v
 | Mensagem | O que fazer |
 | --- | --- |
 | `O termo 'python' não é reconhecido...`, uma mensagem falando da Microsoft Store, ou `python --version` mostra outra versão | O Python 3.12 não está no PATH. Crie o `.venv` com `py -3.12 -m venv .venv` no lugar de `python -m venv .venv` e siga a [parte 1](#1-instalar-no-windows) a partir daí. Se `py` também não existir, reinstale o Python marcando **Add python.exe to PATH**. |
-| `o painel parou (RuntimeError: nao consegui abrir o painel em 127.0.0.1:8000 (a porta ja esta em uso?)); o scanner segue sem painel ate reiniciar` | Já tem outro scanner aberto (outra janela do PowerShell ou, na VPS, o serviço). Feche o outro e ligue de novo. Para achar quem usa a porta, veja [Porta em uso](#porta-em-uso), abaixo da tabela. Ou troque `painel.porta` para `8001` e abra `http://localhost:8001`. |
+| `o painel parou (RuntimeError: nao consegui abrir o painel em 127.0.0.1:8000 (a porta ja esta em uso?)); o scanner segue sem painel ate reiniciar` | Já tem outro scanner aberto (outra janela do PowerShell ou, na VPS, o serviço). Feche o outro (`Ctrl+C` na outra janela; na VPS, `sudo systemctl stop scanner`) e ligue de novo. Para achar quem usa a porta, veja [Porta em uso](#porta-em-uso), abaixo da tabela. Ou troque `painel.porta` para `8001` e abra `http://localhost:8001`. |
 | `Erro na configuracao: ...` | A mensagem diz o campo. Exemplos: `rp_min_lucro: campo desconhecido (erro de digitacao?)` (nome errado); `rp_min_lucro_pct: precisa ser um numero`; `o arquivo 'config.yaml' nao e um yaml valido: ... line 2, column 3` (recuo ou `[` `]` errado na linha indicada); `painel.senha: o painel tem usuario mas nao tem senha`; `limites_assinatura: mexcc nao esta em corretoras`. Corrija e faça a [parte 6](#6-mudar-a-configuração), passos 3 e 4. |
 | `Erro na configuracao: o arquivo 'config.yaml' nao esta salvo em UTF-8 ...` | O `config.yaml` foi salvo em outra codificação. No Bloco de Notas: Arquivo > Salvar como > Codificação: **UTF-8** > Salvar. Ou tire os acentos que você escreveu. |
 | `Erro: ValueError: corretora 'mexcc' nao existe no ccxt (nome com erro de digitacao?)` | Nome errado em `corretoras`. Os nomes aceitos: `mexc`, `gate`, `bitget`, `bingx`, `xt`, `hyperliquid`, `kraken`, `krakenfutures`, `lighter`, `lighter_rh`. |
@@ -1008,7 +1008,13 @@ Anote o número da coluna `OwningProcess` e rode (troque `NUMERO` por ele):
 Stop-Process -Id NUMERO
 ```
 
-VPS (terminal): o número vem depois de `pid=`.
+VPS (terminal): se for o scanner do serviço, pare com o comando abaixo (o `kill` não adianta: o systemd liga de novo em 10 s).
+
+```bash
+sudo systemctl stop scanner
+```
+
+Se não for o serviço: o número vem depois de `pid=`.
 
 ```bash
 sudo ss -ltnp 'sport = :8000'

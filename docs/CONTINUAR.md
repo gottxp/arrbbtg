@@ -1,134 +1,139 @@
 # Como continuar o Scanner de Arbitragem
 
-Parada em 22/10/2026, com as **Tasks 1 a 11 de 17 prontas e revisadas** (branch `v1`, 17 commits, **647 testes passando**). Falta o painel web (Task 12), futuros x futuros, robustez, fases 2 e 3 de corretoras, métricas de validação (Tasks 13 a 17) e a revisão final do código inteiro.
+Situação em 22/10/2026: **v1 completa.** Tasks 1 a 18 prontas, e a revisão final do código inteiro foi feita, com as correções já aplicadas. Branch `v1`, **1477 testes passando**. Cada tarefa e cada correção passou por um implementador e por um revisor independente.
+
+Falta só o que precisa do seu PC e da internet: os marcos e os 3 dias de validação (README, parte 4).
 
 ## O que tem nesta pasta
 
 | Arquivo | Para que serve |
 | --- | --- |
-| `docs/especificacao.md` | A especificação aprovada (fonte da verdade). Em conflito com o plano, vale ela. |
-| `docs/plano.md` | O plano com as 17 tarefas, testes e interfaces. |
-| `docs/progresso-execucao.md` | O registro da execução: o que foi feito em cada tarefa, decisões tomadas e pendências menores adiadas. |
+| `README.md` | Passo a passo: instalar, rodar, conferir cada marco, ler o painel, mudar a configuração, erros. **Comece por aqui.** |
+| `config.yaml` | Toda a configuração, com um comentário em cada campo. |
+| `docs/especificacao.md` | A especificação (fonte da verdade), já com as mudanças que você aprovou. |
+| `docs/plano.md` | O plano original das 17 tarefas. |
+| `docs/progresso-execucao.md` | O registro da execução: cada decisão ("Ruling", com o custo se estiver errada), cada tarefa concluída e os itens menores adiados. |
 | `docs/CONTINUAR.md` | Este arquivo. |
-| `.superpowers/sdd/plano/` | Material de trabalho da execução (briefs e relatórios de cada tarefa, instruções do revisor, prints do Arbimax em `referencias/`). Não vai para o Git, mas está no zip. |
+| `.superpowers/sdd/plano/` | Material de trabalho: briefs, relatórios de cada tarefa, revisões e prints do Arbimax. Não vai para o Git, mas está no zip. |
 | `scanner/` e `tests/` | O código e os testes. |
 
-Os documentos "Especificação" e "Plano" que ficaram no Claude Docs da outra conta são uma versão **anterior**. Os arquivos em `docs/` estão atualizados (com as correções da auto-análise) e são os que valem.
+## Testar no seu PC
 
-## O que já está pronto (Tasks 1 a 11)
+Siga o `README.md`, nesta ordem:
 
-| Task | O que faz | Status |
-| --- | --- | --- |
-| 1 | Base do projeto e `config.yaml` com validação | Pronta e revisada |
-| 2 | Coletor de livro de ofertas via ccxt | Pronta e revisada |
-| 3 | Normalizador (1000PEPE, kPEPE, 1M, USDC/USDG) | Pronta e revisada |
-| 4 | Estado em memória, coleta em duas etapas (ticker leve + livro só dos pares promissores), MEXC/Gate/Bitget | Pronta, revisada e corrigida |
-| 5 | Fórmulas (A, F, taxas, funding, RP bruto e líquido) | Pronta e revisada |
-| 6 | Métricas do período e invertidas (com cache) | Pronta, revisada e corrigida |
-| 7 | Filtros e modos Lucro/Farm | Pronta e revisada |
-| 8 | Gerenciador de sinais (formato JSON da spec, anti-repetição) | Pronta e revisada |
-| 9 | Banco SQLite (histórico, amostras, grupos de filtros) | Pronta e revisada |
-| 10 | Motor spot x futuros (junta tudo e roda o ciclo) | Pronta, revisada e corrigida |
-| 11 | API (FastAPI + WebSocket, login opcional) | Pronta, revisada e corrigida |
+1. Parte 1: instalar no Windows (termina com os testes passando).
+2. Parte 2: rodar e abrir o painel em `http://localhost:8000`.
+3. Parte 4: conferir cada marco e os avisos específicos.
 
-Cada tarefa passou por um implementador e por um revisor independente. As correções importantes encontradas na revisão já estão aplicadas.
+Se der erro, veja a parte 8 do README. Se não estiver lá, copie a mensagem inteira e cole na próxima conversa.
 
-## O que falta
+## O que foi feito nesta conta (Tasks 12 a 18 e revisão final)
 
 | Task | O que faz |
 | --- | --- |
-| 12 | Painel web (tabela ao vivo, filtros, gráfico, barra de status) |
-| 13 | Futuros x futuros |
-| 14 | Robustez: reconexão, limites de assinatura, logs diários |
-| 15 | Fase 2 de corretoras: BingX, XT, Hyperliquid (cotação USDC) |
-| 16 | Fase 3: Kraken Pro, Lighter e Lighter Robinhood (USDG) |
-| 17 | Métricas de validação, README completo e `config.yaml` comentado |
-| Final | Revisão do código inteiro por um revisor independente, correções e entrega |
+| 12 | Painel web: tabela ao vivo, filtros com grupos salvos, gráfico, barra de status |
+| 13 | Futuros x futuros, e métricas do período mais rápidas e leves (747 KB → 122 KB por par) |
+| 14 | Reconexão sozinha, limites de assinatura, logs diários, memória e CPU no log |
+| 15 | BingX, XT, Hyperliquid e cotação USDC → USDT |
+| 16 | Kraken (spot e futuros) e Lighter (conector próprio, principal e Robinhood) |
+| 17 | Métricas de validação (`/api/validacao`), limpeza diária, README completo e config comentado |
+| Final | 3 revisores independentes (coleta, núcleo, painel/API) e as correções que eles pediram |
+| 18 | Histórico das métricas pelos tickers de todos os pares (a sua opção 1) |
 
-## Testar no seu PC agora
+## Decisões que tomei no seu lugar (as que mais podem te afetar)
 
-Siga o `README.md` (na pasta do projeto), nesta ordem:
+Todas estão em `docs/progresso-execucao.md`, com o custo caso estejam erradas.
 
-1. Parte 1: instalar no Windows (termina com os testes passando).
-2. Parte 2: rodar no Windows e abrir o painel em `http://localhost:8000`.
-3. Parte 4: conferir cada marco, do marco 1 (preços das corretoras) ao marco 5 (validação de 3 dias), e os avisos específicos A a F.
+1. **Painel:**
+   - mudou um filtro, vale na hora e é salvo no grupo escolhido;
+   - o grupo lembrado no navegador é reaplicado ao abrir: o último navegador aberto manda no motor;
+   - nos campos em dólar, "50.000" é 50 mil.
+2. **Sessão salva:** o modo, os filtros e a comparação ficam no banco e voltam quando você religa o scanner.
+3. **Futuros x futuros:** o motor calcula sempre os dois tipos e as duas direções; o filtro "tipos" só esconde.
+4. **Quedas:**
+   - a corretora volta sozinha (1 s, 2 s, 4 s… até 60 s), inclusive a que não carregou ao ligar;
+   - durante a queda, os dados dela são apagados (nunca sinal com dado velho);
+   - "reconexões" conta só as voltas que deram certo.
+5. **Logs:** um arquivo por dia em `logs/`, com o horário do PC e o fuso (`-0300`); o log nunca trava nem derruba o scanner.
+6. **Memória e CPU** no log a cada 5 min, sem biblioteca nova.
+7. **Suspeito:** os preços das duas pontas diferem mais de 30%, em qualquer sentido (antes só pegava um).
+8. **Cotações:**
+   - USDC vem da Bitget, USD vem da Kraken;
+   - cotação fora de 10% em volta de 1 vale 1:1, com aviso;
+   - pares em EUR, GBP etc. ficam fora (dariam sinal falso).
+9. **Kraken = duas corretoras:** `kraken` (spot) e `krakenfutures` (futuros), cada uma com a sua conexão.
+10. **Lighter:**
+    - conector próprio, sempre só leitura;
+    - taxa e funding lidos em %, funding de 1 h (conferido na documentação oficial);
+    - se o `market_stats` não trouxer bid/ask, ela passa a usar os livros.
+11. **Farm:** abre livro a partir de −0,1% de spread, no máximo 50 por mercado de farm. "Sempre mostrar" sempre abre livro.
+12. **Banco:**
+    - grava numa thread separada, com amostras compactas (209 → 82 bytes);
+    - a limpeza apaga só as amostras antigas, nunca o histórico de sinais;
+    - sinais abertos são fechados ao encerrar.
+13. **Segurança:**
+    - o scanner não liga com o painel aberto para fora (host que não é 127.0.0.1) sem usuário e senha;
+    - outro site não consegue ler nem mudar nada no painel.
+14. **Versões fixas** no `requirements.txt` (as testadas). O código depende de detalhes do ccxt 4.5.89.
+15. **Histórico pelos tickers (Task 18):**
+    - amostra a cada **120 s**, e não 60 s: com 60 s a memória passava de 600 MB, acima dos ~400 MB que você aceitou;
+    - a média é ponderada pelo tempo (sem isso o sinal sumia em ~10 min);
+    - a memória fica em ~380 MB em qualquer período.
+16. **Teste de tempo:** o teste de escala do Farm só confere tempo com `SCANNER_TESTES_DE_TEMPO=1`, para não dar falso alarme num PC lento.
 
-Se algo der erro, veja a parte 8 do README. O que não estiver lá: copie a mensagem inteira e cole na próxima conversa.
+## Decisões que você aprovou nesta conta
 
-## Decisões que tomei no seu lugar
+- **Histórico pelos tickers de todos os pares (opção 1):** spec §3 atualizada, Task 18.
+- **Biblioteca `protobuf==5.29.5`:** sem ela, o spot da MEXC não recebe nada no ccxt 4.5.89.
 
-Durante a execução, decidi alguns pontos que a especificação não fechava. Todos estão em `docs/progresso-execucao.md` com o custo caso estejam errados. Os que mais podem te afetar:
+## O que continua com você
 
-1. **Conversão de preços:** os livros são guardados por unidade do ativo na moeda de cotação; a conversão para USDT acontece no motor. Se errado, é refatorar a conversão para um ponto só.
-2. **Uma cotação por par:** quando a mesma corretora tem BTC/USDT e BTC/USDC, fica o USDT (depois USDC, depois USDG). Contratos inversos e opções são ignorados. Se errado, pares que só existem em USDC numa corretora com USDT somem.
-3. **Taxa desconhecida:** par sem taxa (nem no config, nem na API) não gera sinal. É o lado seguro.
-4. **Filtros:** "Corretoras 1" filtra a ponta long e "Corretoras 2" a short. "Sempre mostrar" passa por cima dos filtros e das listas, mas nunca do lote mínimo nem de sinais suspeitos.
-5. **Funding sincronizado:** aproximado por "as duas pontas cobram no mesmo intervalo", porque não temos o horário da próxima cobrança. Pendente confirmar com o Arbimax.
-6. **Anti-repetição:** se o mesmo sinal volta em menos de 60s, conta como a mesma oportunidade no histórico.
-7. **Colunas MAX e STOCK:** ficam vazias na v1 (limite de ordem e identificação de ação tokenizada ainda não definidos).
-8. **`python -m scanner`** liga o scanner; `python -m scanner --validar` só confere o `config.yaml`.
-9. **API e motor no mesmo processo:** o painel sobe junto com o scanner. Se a porta 8000 estiver ocupada, o scanner segue sem painel e avisa no log.
-10. **Bibliotecas extras:** `websockets` entrou no `requirements.txt` porque o uvicorn precisa dela para o WebSocket do painel. `httpx` só para testes. `psutil` não entrou: o log mede só memória, não CPU.
+1. **XT spot:** no exemplo, a XT está só com futuros (`xt: [futuro]`), porque o ccxt 4.5.89 não traz bid/ask no spot dela. Para tentar o spot, apague essa linha; se não funcionar, o log avisa.
+2. **MEXC spot por REST:** com o limite de 30 assinaturas por conexão, o scanner acompanha só ~20 pares do spot da MEXC. Pegar todos exige a etapa 1 por REST a cada 1–2 s, o que a spec §8 não permite sem você aprovar.
+3. **Funding da Bitget em USDC:** só os perpétuos em USDT da Bitget recebem funding; os que só existem em USDC ficam com funding 0.
+4. **RP mínimo do modo Lucro:** está em **0,2% líquido** (depois das taxas). No Arbimax você usava 0,2% bruto. Para afrouxar, mude `rp_min_lucro_pct`.
+5. **Antes de ativar:**
+   - `krakenfutures`: futuros da Kraken na sua conta;
+   - `lighter_rh`: elegibilidade no Brasil.
+   As duas estão comentadas no `config.yaml` (spec §11).
+6. **Suas taxas reais (nível VIP):** preencha `taxas` no `config.yaml`.
+7. **Pendências da spec §11:** definição de "invertida", o valor entre parênteses do lote e o "limite de ordem" do Arbimax.
+8. **GitHub:** subir para um repositório privado seu. Na próxima conversa, informe o usuário e o nome do repositório.
 
-## Decisões que continuam com você
+## Prompt para continuar em outra conversa
 
-- **RP mínimo do modo Lucro:** está em **0,2% líquido** (depois de taxas). No Arbimax você usava 0,2% bruto, então o filtro ficou mais rígido. Para afrouxar, mude `rp_min_lucro_pct` no `config.yaml` (ex.: 0.05).
-- **GitHub:** o ideal é subir o projeto para um repositório privado seu. Na próxima conta, informe o usuário e o nome do repositório.
-- **Pendências da spec (seção 11):** definição de "invertida", o valor entre parênteses do lote e o "limite de ordem" do Arbimax, as suas taxas reais (nível VIP), elegibilidade da Lighter Robinhood no Brasil e futuros da Kraken na sua conta.
-
-## Itens menores guardados para a revisão final
-
-O registro tem 59 itens menores encontrados pelos revisores e adiados de propósito. Os que a revisão final precisa olhar primeiro:
-
-- **Segurança do painel:** o WebSocket não confere a origem da conexão quando o login está ligado. É importante antes de abrir o painel na VPS.
-- **Consulta de histórico sem limite** pode travar o banco que o motor também usa.
-- **Eventos gravados um a um**, de forma síncrona, no ciclo do motor; devem ser gravados em lote.
-- **Itens marcados "→ T14"** no registro: entram na Task 14 (robustez).
-
-## Prompt para continuar em outra conta Claude
-
-1. Na nova conta, abra uma conversa com acesso a arquivos e execução de código. Pode ser o Claude com o computador ligado, ou o Claude Code.
-2. Anexe o arquivo `scanner-arbitragem-ate-task11.zip`.
-3. Cole o prompt abaixo:
+1. Abra uma conversa com acesso a arquivos e execução de código.
+2. Anexe o zip mais recente do projeto.
+3. Cole:
 
 ```
 <contexto>
-Estou migrando um projeto de outra conta Claude. O zip anexado é o repositório completo
-(com histórico Git) de um scanner de arbitragem cripto spot x futuros e futuros x futuros,
-só leitura, em Python 3.12 + ccxt + FastAPI + SQLite, com painel web.
-Sou iniciante em programação: explique de forma direta e curta.
+Projeto: scanner de arbitragem cripto (spot x futuros e futuros x futuros), só leitura,
+Python 3.12 + ccxt + FastAPI + SQLite, com painel web. O zip anexado é o repositório
+completo com histórico Git. Sou iniciante em programação: explique de forma direta e curta.
 </contexto>
 
 <estado>
-- Tasks 1 a 11 de 17 prontas, revisadas e commitadas na branch v1 (647 testes passando).
-- Falta: Task 12 (painel web) até a Task 17, e depois a revisão final do código inteiro.
+- v1 completa (Tasks 1 a 18 e revisão final), branch v1, todos os testes passando.
+- Agora estou testando no meu PC (README, parte 4). Vou colar aqui o que der errado.
 </estado>
 
 <arquivos_para_ler_primeiro>
-1. docs/CONTINUAR.md: situação, decisões já tomadas e pendências
-2. docs/especificacao.md: fonte da verdade
-3. docs/plano.md: as 17 tarefas (Task N), com testes e interfaces
-4. docs/progresso-execucao.md: registro de execução, decisões ("Ruling") e itens menores adiados
-5. .superpowers/sdd/plano/: briefs, relatórios das tarefas, instruções do revisor e prints do Arbimax em referencias/
+1. docs/CONTINUAR.md
+2. docs/especificacao.md (fonte da verdade)
+3. docs/progresso-execucao.md (decisões "Ruling" e itens adiados)
+4. README.md
 </arquivos_para_ler_primeiro>
 
 <regras>
 - Descompacte o zip, confira com "git log" e rode os testes (python -m pytest -q) antes de mudar qualquer coisa.
-- Continue a partir da Task 12, na ordem do plano, sem refazer tarefas concluídas.
-- Para cada tarefa: um implementador faz com TDD e commit; depois um revisor independente
-  confere contra a especificação; problemas importantes são corrigidos antes de seguir.
-  Se o plugin "superpowers" estiver disponível, use a skill subagent-driven-development.
-- Siga as decisões ("Ruling") já registradas em docs/progresso-execucao.md e registre ali
-  cada nova decisão, conclusão de tarefa e item menor adiado.
-- Itens marcados "→ T14" no registro entram na Task 14.
-- Sem rede para as corretoras no ambiente de nuvem: testes sempre com corretoras falsas;
-  os marcos "no PC do dono" ficam para mim.
+- Toda mudança: TDD, commit, e um revisor independente confere contra a especificação.
+- Mudança de regra: primeiro na especificação, com a minha aprovação.
+- Registre cada decisão nova em docs/progresso-execucao.md.
 - Código, nomes e comentários em português. Nenhuma biblioteca nova sem me perguntar.
-- No fim: revisão final do código inteiro, lista das decisões tomadas no meu lugar e um zip
-  atualizado (ou push para o meu GitHub, se eu informar o repositório).
 </regras>
 
 <pedido>
-Leia os arquivos acima, me diga em poucas linhas se está tudo consistente e comece a Task 12.
+{O que você quer agora: por exemplo, "o marco 1 deu este erro: ..."}
 </pedido>
 ```
