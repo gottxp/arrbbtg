@@ -275,7 +275,7 @@ def rodar_no_node(codigo: str, dados):
         f"const painel = require({json.dumps(str(PASTA_PAINEL / 'app.js'))});\n"
         "const dados = JSON.parse(process.argv[1]);\n" + codigo
     )
-    resultado = subprocess.run(["node", "-e", programa, json.dumps(dados)], capture_output=True, text=True, timeout=60)
+    resultado = subprocess.run(["node", "-e", programa, json.dumps(dados)], capture_output=True, text=True, encoding="utf-8", timeout=60)
     assert resultado.returncode == 0, resultado.stderr
     return json.loads(resultado.stdout)
 
