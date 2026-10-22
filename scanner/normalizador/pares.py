@@ -91,12 +91,13 @@ def _base_original(market: dict) -> str:
 
     O ccxt poe o codigo da moeda em maiuscula: o "kPEPE" da Hyperliquid chega como base "KPEPE", com o
     nome original em `baseName`. Sem o original, o "k" minusculo (multiplicador 1000) se perderia. So vale
-    quando o `baseName` e a mesma palavra em outra caixa: "UBTC" -> "BTC" (token embrulhado) e
-    "xyz:TSLA" -> "XYZ-TSLA" (outro nome) continuam com a base do ccxt.
+    no perpetuo (swap) e quando o `baseName` e a mesma palavra em outra caixa: "UBTC" -> "BTC" (token
+    embrulhado) e "xyz:TSLA" -> "XYZ-TSLA" (outro nome) continuam com a base do ccxt. No spot o nome do token
+    e livre (ex.: "kSTAKE" pode ser um token de staking, e nao 1000 STAKE): fica a base do ccxt.
     """
     base = market["base"]
     original = market.get("baseName")
-    if isinstance(original, str) and isinstance(base, str) and len(original) == len(base) \
+    if market.get("swap") and isinstance(original, str) and isinstance(base, str) and len(original) == len(base) \
             and original != base and original.upper() == base:
         return original
     return base

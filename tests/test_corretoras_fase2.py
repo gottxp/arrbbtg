@@ -15,6 +15,7 @@ import asyncio
 import logging
 
 import pytest
+from ccxt.base.errors import NotSupported
 
 import scanner.__main__ as principal
 from scanner.armazenamento import Banco
@@ -540,12 +541,12 @@ def test_mensagem_com_algum_ticker_bom_zera_a_contagem():
     assert gate.pedidos_de("watch_ticker") == []
 
 
-def test_nenhum_metodo_com_bid_ask_desiste_do_mercado_com_erro_e_o_outro_segue(caplog):
+def test_nenhum_metodo_com_bid_ask_avisa_com_erro_e_o_outro_mercado_segue(caplog):
     # Como o spot da XT no ccxt 4.5.89: nem o 'tickers' nem o 'ticker' trazem bid/ask.
     estado = EstadoMercados()
     xt = CorretoraFalsa([market_ccxt("BTC/USDT", "BTC"), market_ccxt("BTC/USDT:USDT", "BTC")],
                         has={"watchTickers": True, "watchTicker": True})
-    coletor = ColetorCcxt("xt", xt, estado=estado, relogio=relogio, mensagens_sem_bid_ask=2)
+    coletor = ColetorCcxt("xt", xt, estado=estado, relogio=relogio, mensagens_sem_bid_ask=2, esperar=EsperaFalsa())
     xt.entregar(("watch_tickers", "spot"), {"BTC/USDT": so_preco()}, {"BTC/USDT": so_preco()})
     xt.entregar(("watch_ticker", "BTC/USDT"), so_preco(), so_preco())
     xt.entregar(("watch_tickers", "futuro"), {"BTC/USDT:USDT": tk(100.0, 100.1)})
@@ -737,6 +738,9 @@ def test_sinal_hyperliquid_usdc_contra_mexc_usdt_com_cotacao(tmp_path):
                                                             "fetchFundingRates": True},
                                  funding={"BTC/USDC:USDC": {"symbol": "BTC/USDC:USDC", "fundingRate": 0.0000125,
                                                             "interval": "1h"}})
+    # Obs.: a MEXC falsa responde o watch_tickers do futuro COM bid/ask para o teste ser curto. A MEXC de
+    # verdade nao traz (ccxt/pro/mexc.py: sub.tickers sem bid1/ask1): no PC do dono a troca automatica
+    # passa o futuro dela para um par por assinatura (watch_ticker), com aviso no log.
     mexc = CorretoraFalsa([MEXC_BTC])
     bitget = CorretoraFalsa([BITGET_USDC_USDT])
     # A Hyperliquid vende a 100,00 USDC; a MEXC compra a 101,00 USDT; 1 USDC = 0,999 USDT.
@@ -847,3 +851,141 @@ def test_hyperliquid_com_o_ccxt_de_verdade_assina_kpepe_e_guarda_pepe():
     ticker = estado.obter_ticker("hyperliquid", "futuro", "PEPE", AGORA)
     assert (ticker["bid"], ticker["ask"]) == (pytest.approx(0.010105 / 1000), pytest.approx(0.010115 / 1000))
     assert ticker["cotacao"] == "USDC" and ticker["simbolo_original"] == "KPEPE/USDC:USDC"
+
+
+
+# ---------------------------------------------------------------------------
+# Correcao pos-revisao
+# ---------------------------------------------------------------------------
+
+HL_ETH = {**HL_BTC, "id": "1", "symbol": "ETH/USDC:USDC", "base": "ETH", "baseName": "ETH"}
+
+
+def coletor_hyperliquid_um_a_um(espera, **kwargs):
+    hl = CorretoraFalsa([HL_BTC, HL_ETH], has={"watchTickers": True, "watchTicker": True})
+    estado = EstadoMercados()
+    coletor = ColetorCcxt("hyperliquid", hl, estado=estado, relogio=relogio, mercados=("futuro",),
+                          metodo_ticker="watch_ticker", mensagens_sem_bid_ask=2, esperar=espera, **kwargs)
+    return hl, estado, coletor
+
+
+async def esvaziar(corretora_falsa, *chaves):
+    """Espera as filas `chaves` esvaziarem e da a vez ao coletor tratar a ultima mensagem."""
+    await esperar_ate(lambda: all(corretora_falsa.fila(c).empty() for c in chaves))
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+def test_ultimo_metodo_sem_bid_ask_nao_desliga_o_mercado_e_tenta_de_novo_com_espera_crescente(caplog):
+    # Hyperliquid so com watch_ticker: as primeiras mensagens sem bid/ask (ex.: impactPxs vazios) nao podem
+    # deixar a corretora sem tickers ate reiniciar o scanner.
+    espera = EsperaFalsa()
+    hl, estado, coletor = coletor_hyperliquid_um_a_um(espera)
+    btc, eth = ("watch_ticker", "BTC/USDC:USDC"), ("watch_ticker", "ETH/USDC:USDC")
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers(["BTC/USDC:USDC", "ETH/USDC:USDC"]))
+        hl.entregar(btc, so_preco())
+        hl.entregar(eth, so_preco())
+        await esperar_ate(lambda: espera.esperas == [1])
+        hl.entregar(btc, so_preco())
+        hl.entregar(eth, so_preco())
+        await esperar_ate(lambda: espera.esperas == [1, 2])     # espera crescente
+        hl.entregar(btc, tk(100.0, 100.1))                          # agora veio com bid/ask
+        await esperar_ate(lambda: estado.obter_ticker("hyperliquid", "futuro", "BTC", AGORA) is not None)
+        await parar(tarefa)
+
+    with caplog.at_level(logging.WARNING, logger="scanner"):
+        asyncio.run(cenario())
+    erros = [m for m in avisos(caplog, logging.ERROR) if "bid/ask" in m]
+    assert len(erros) == 1 and "tentando de novo em 1s" in erros[0]  # ERRO uma vez; depois so aviso
+    assert any("bid/ask" in m and "tentando de novo em 2s" in m for m in avisos(caplog))
+    assert hl.pedidos_de("watch_tickers") == []
+
+
+def test_um_a_um_so_conclui_sem_bid_ask_com_mensagens_de_simbolos_diferentes():
+    espera = EsperaFalsa()
+    hl, estado, coletor = coletor_hyperliquid_um_a_um(espera)
+    btc, eth = ("watch_ticker", "BTC/USDC:USDC"), ("watch_ticker", "ETH/USDC:USDC")
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers(["BTC/USDC:USDC", "ETH/USDC:USDC"]))
+        hl.entregar(btc, *[so_preco() for _ in range(5)])  # 5 mensagens ruins, todas do mesmo par
+        await esvaziar(hl, btc)
+        assert espera.esperas == []                          # um par so nao condena o metodo
+        hl.entregar(eth, so_preco())                         # o segundo par tambem sem bid/ask
+        await esperar_ate(lambda: espera.esperas == [1])
+        await parar(tarefa)
+
+    asyncio.run(cenario())
+
+
+def test_par_de_cotacao_nunca_e_cortado_pelo_limite_de_assinaturas():
+    # Fonte que assina um par por vez (como a BingX) com limite: o USDC/USDT (volume baixo) sempre fica.
+    markets = [BITGET_USDC_USDT, market_ccxt("BTC/USDT", "BTC"), market_ccxt("ETH/USDT", "ETH")]
+    bingx = CorretoraFalsa(markets, has={"watchTicker": True})
+    estado = EstadoMercados()
+    estado.registrar_mensagem("bingx", AGORA)
+    for ativo, simbolo, volume in (("USDC", "USDC/USDT", 1.0), ("BTC", "BTC/USDT", 9e9), ("ETH", "ETH/USDT", 1e8)):
+        estado.atualizar_ticker("bingx", "spot", ativo, 1, 2, AGORA, volume, simbolo_original=simbolo)
+    coletor = ColetorCcxt("bingx", bingx, estado=estado, relogio=relogio, limite_assinaturas=2)
+    coletor.usar_para_cotacao({"USDC/USDT"})
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers(["BTC/USDT", "ETH/USDT", "USDC/USDT"]))
+        await esperar_ate(lambda: len(bingx.pedidos_de("watch_ticker")) >= 2)
+        await asyncio.sleep(0.01)
+        await parar(tarefa)
+
+    asyncio.run(cenario())
+    assert sorted(s for (s,), _ in bingx.pedidos_de("watch_ticker")) == ["BTC/USDT", "USDC/USDT"]
+
+
+def test_par_de_cotacao_fica_tambem_na_troca_automatica_para_o_um_a_um():
+    markets = [BITGET_USDC_USDT, market_ccxt("BTC/USDT", "BTC"), market_ccxt("ETH/USDT", "ETH")]
+    bitget = CorretoraFalsa(markets, has={"watchTickers": True, "watchTicker": True})
+    coletor = ColetorCcxt("bitget", bitget, estado=EstadoMercados(), relogio=relogio, limite_assinaturas=2,
+                          mensagens_sem_bid_ask=1)
+    coletor.usar_para_cotacao({"USDC/USDT"})
+    bitget.entregar(("watch_tickers", "spot"), {"BTC/USDT": so_preco(), "ETH/USDT": so_preco()})
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers(["BTC/USDT", "ETH/USDT", "USDC/USDT"]))
+        await esperar_ate(lambda: len(bitget.pedidos_de("watch_ticker")) >= 2)
+        await asyncio.sleep(0.01)
+        await parar(tarefa)
+
+    asyncio.run(cenario())
+    pedidos = [s for (s,), _ in bitget.pedidos_de("watch_ticker")]
+    assert "USDC/USDT" in pedidos and len(pedidos) == 2
+
+
+def test_padroes_da_cotacao_no_dados_lentos_sao_os_da_config():
+    import inspect
+
+    from scanner.config.carregar import Config
+    padroes = inspect.signature(DadosLentos).parameters
+    assert padroes["fonte_cotacao"].default == Config.fonte_cotacao
+    assert padroes["faixa_cotacao_pct"].default == Config.faixa_cotacao_pct
+
+
+def test_metodo_anotado_cujo_seguinte_nao_existe_no_mercado_volta_a_ser_tentado():
+    # O watch_bids_asks esta no `has`, mas nao existe neste mercado (NotSupported): o watch_tickers, anotado
+    # como sem bid/ask, era na verdade o ultimo. Ele nao fica desligado: tenta de novo depois da espera.
+    estado = EstadoMercados()
+    espera = EsperaFalsa()
+    gate = CorretoraFalsa([market_ccxt("BTC/USDT:USDT", "BTC")], has={"watchTickers": True, "watchBidsAsks": True})
+    coletor = ColetorCcxt("gate", gate, estado=estado, relogio=relogio, mensagens_sem_bid_ask=2, esperar=espera)
+    lote = ("watch_tickers", "futuro")
+    gate.entregar(lote, {"BTC/USDT:USDT": so_preco()}, {"BTC/USDT:USDT": so_preco()})
+    gate.entregar(("watch_bids_asks", "futuro"), NotSupported("so no spot"))
+
+    async def cenario():
+        tarefa = asyncio.create_task(coletor.manter_tickers(["BTC/USDT:USDT"]))
+        await esperar_ate(lambda: espera.esperas == [1])
+        gate.entregar(lote, {"BTC/USDT:USDT": tk(100.0, 100.1)})
+        await esperar_ate(lambda: estado.obter_ticker("gate", "futuro", "BTC", AGORA) is not None)
+        await parar(tarefa)
+
+    asyncio.run(cenario())
+    assert len(gate.pedidos_de("watch_tickers")) >= 3  # 2 sem bid/ask, a espera, e de novo o lote

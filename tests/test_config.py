@@ -368,3 +368,23 @@ def test_config_yaml_do_projeto_traz_as_seis_corretoras_e_os_campos_da_fase_2():
     for campo in ("mercados_por_corretora", "metodo_ticker", "mensagens_sem_bid_ask", "fonte_cotacao",
                   "fontes_cotacao", "faixa_cotacao_pct", "intervalo_funding_h"):
         assert campo in chaves, campo
+
+
+
+def test_cabecalho_do_config_yaml_lista_os_campos_que_nao_sao_o_padrao():
+    # O cabecalho diz que apagar uma linha volta ao padrao: os campos do exemplo que NAO sao o padrao do
+    # codigo precisam estar listados la, com o motivo.
+    caminho = RAIZ / "config.yaml"
+    cabecalho = []
+    for linha in caminho.read_text(encoding="utf-8").splitlines():
+        if not linha.startswith("#"):
+            break
+        cabecalho.append(linha)
+    texto = "\n".join(cabecalho)
+    exemplo, padrao = carregar_config(str(caminho)), Config()
+    diferentes = [f.name for f in fields(Config) if getattr(exemplo, f.name) != getattr(padrao, f.name)]
+    assert diferentes, "o exemplo deveria ter campos fora do padrao (ex.: corretoras da fase 2)"
+    for campo in diferentes:
+        assert campo in texto, f"{campo} difere do padrao e nao aparece no cabecalho do config.yaml"
+    assert "Todos os valores abaixo sao os padroes" not in texto
+    assert "confirme com o dono" in texto  # o xt: [futuro] e um desvio da especificacao (secao 2)

@@ -192,20 +192,36 @@ class SemBidAsk(NotSupported):
     """O metodo de ticker so entregou tickers sem bid/ask: nao serve para a etapa 1 naquele mercado."""
 
 
+class _UltimoSemBidAsk(Exception):
+    """Interno do coletor: o ultimo metodo de ticker que sobrou num mercado so trouxe tickers sem bid/ask.
+
+    Nao e abandono: o mercado espera (espera crescente) e tenta de novo. `metodos`: os que vieram sem bid/ask.
+    """
+
+    def __init__(self, metodos: list[str]):
+        super().__init__(", ".join(metodos))
+        self.metodos = list(metodos)
+
+
 class _ConferenciaBidAsk:
     """Diz quando um metodo de ticker deve ser abandonado por so trazer tickers sem bid/ask.
 
     Conta as mensagens seguidas em que NENHUM ticker trouxe bid e ask. Basta um ticker com bid e ask
     para o metodo provar que funciona: dai em diante ele nunca e abandonado (um par iliquido sem bid
     num momento e normal e nao pode derrubar o metodo de todos). Mensagem vazia nao conta.
+    simbolos_no_mercado: no um a um (cada mensagem e de um par so), quantos pares o mercado tem; alem das
+        `maximo` mensagens, elas precisam ter vindo de min(maximo, simbolos_no_mercado) pares diferentes
+        (um par iliquido repetindo nao condena o metodo). 0 = lote (cada mensagem ja traz varios pares).
     """
 
-    def __init__(self, maximo: int):
+    def __init__(self, maximo: int, simbolos_no_mercado: int = 0):
         self._maximo = maximo
+        self._pares_exigidos = min(maximo, simbolos_no_mercado)
         self._seguidas = 0
+        self._pares_sem_bid_ask: set[str] = set()
         self._funcionou = False
 
-    def desistir(self, total: int, com_bid_ask: int) -> bool:
+    def desistir(self, total: int, com_bid_ask: int, simbolo: str | None = None) -> bool:
         """Anota uma mensagem (`total` tickers, `com_bid_ask` deles com bid e ask). True = abandonar o metodo."""
         if self._funcionou or total == 0:
             return False
@@ -213,7 +229,9 @@ class _ConferenciaBidAsk:
             self._funcionou = True
             return False
         self._seguidas += 1
-        return self._seguidas >= self._maximo
+        if simbolo is not None:
+            self._pares_sem_bid_ask.add(simbolo)
+        return self._seguidas >= self._maximo and len(self._pares_sem_bid_ask) >= self._pares_exigidos
 
 
 class ColetorCcxt(Coletor):
@@ -299,6 +317,7 @@ class ColetorCcxt(Coletor):
         self._sem_bid_ask: set[tuple[str, str]] = set()  # (mercado, metodo) que so trouxe tickers sem bid/ask
         self._fora_no_um_a_um: dict[str, int] = {}  # mercado -> pares fora do limite no um a um da troca (ultimo aviso)
         self._avisou_metodo_ausente = False  # o metodo_ticker da config nao existe na corretora (avisado uma vez)
+        self._erro_sem_bid_ask: set[str] = set()  # mercados cujo "nenhum metodo traz bid/ask" ja saiu em ERRO
         self._avisou_mercados_fora = False  # a quantidade de pares fora de `mercados` ja foi para o log
         self._simbolos_cotacao: set[str] = set()  # simbolos cujo ticker tambem alimenta as cotacoes
 
@@ -345,9 +364,10 @@ class ColetorCcxt(Coletor):
 
         Spot e futuro vao em pedidos separados, porque o ccxt escolhe o tipo de mercado
         pelo primeiro simbolo da lista. Toda mensagem registra a conexao no estado.
-        Um mercado sem nenhum metodo de ticker que sirva (o ccxt nao tem, NotSupported, ou so traz tickers
-        sem bid/ask, SemBidAsk) avisa no log e deixa o outro seguindo; se nenhum mercado tiver, levanta
-        NotSupported. Qualquer outro erro sobe (quem reconecta e
+        Um mercado sem nenhum metodo de ticker no ccxt (NotSupported) avisa no log e deixa o outro seguindo;
+        se nenhum mercado tiver, levanta NotSupported. Mercado cujos metodos so trazem tickers sem bid/ask
+        nao para: tenta de novo com espera crescente (veja _acompanhar_tickers). Qualquer outro erro sobe (quem
+        reconecta e
         `manter_tickers`). Com `limite_assinaturas`, a corretora que so assina um ticker por vez
         acompanha so os pares de maior volume 24h.
         Nao fecha a corretora: os livros da etapa 2 usam a mesma (veja `fechar`).
@@ -384,17 +404,49 @@ class ColetorCcxt(Coletor):
         return METODOS_DE_TICKER[nomes.index(self._metodo_ticker):]
 
     async def _acompanhar_tickers(self, simbolos: list[str]) -> None:
+        """Tenta os metodos de ticker em ordem (veja _tentar_metodos), sem nunca desligar o mercado por bid/ask.
+
+        Se o metodo que sobrou por ultimo tambem so traz tickers sem bid/ask, o mercado nao e abandonado: o
+        log avisa (ERRO na primeira vez; depois aviso) e o coletor tenta de novo depois de 1s, 2s, 4s... (ate
+        espera_max_reconexao_s). Ex.: as primeiras mensagens da Hyperliquid podem vir sem impactPxs.
+        Metodo que o ccxt nao tem em nenhum lugar (NotSupported) continua subindo: tentar de novo nao adianta.
+        """
+        mercado = mercado_do_simbolo(simbolos[0])
+        tentativa = 0
+        while True:
+            try:
+                await self._tentar_metodos(simbolos)
+                return  # os metodos so terminam com erro; isto e so uma protecao
+            except _UltimoSemBidAsk as erro:
+                espera = espera_reconexao(tentativa, self._espera_max_s)
+                tentativa += 1
+                self._avisar_ultimo_sem_bid_ask(mercado, erro.metodos, espera)
+                await self._esperar(espera)
+
+    def _avisar_ultimo_sem_bid_ask(self, mercado: str, metodos: list[str], espera: float) -> None:
+        if mercado not in self._erro_sem_bid_ask:
+            self._erro_sem_bid_ask.add(mercado)
+            registro.error("%s: nenhum metodo de ticker traz bid/ask no %s (so sem bid/ask: %s); tentando de novo em "
+                           "%gs. Se nunca funcionar, tire o %s da %s em mercados_por_corretora", self.nome, mercado,
+                           ", ".join(metodos), espera, mercado, self.nome)
+        else:
+            registro.warning("%s: o %s continua sem bid/ask nos tickers (%s); tentando de novo em %gs",
+                             self.nome, mercado, ", ".join(metodos), espera)
+
+    async def _tentar_metodos(self, simbolos: list[str]) -> None:
         """Tenta os metodos de ticker em ordem; se um nao servir nesse mercado, passa ao proximo.
 
         Nao serve: o ccxt nao tem o metodo nesse mercado (NotSupported; ex.: na MEXC o watch_tickers so
         existe no futuro e o watch_bids_asks so no spot) ou o metodo so traz tickers sem bid/ask (SemBidAsk;
-        ex.: o allMids da Hyperliquid). O metodo sem bid/ask fica anotado e nao e tentado de novo depois de
-        uma reconexao. Se nenhum servir, levanta NotSupported dizendo o que aconteceu.
+        ex.: o allMids da Hyperliquid). O metodo sem bid/ask que tem um seguinte fica anotado e nao e tentado
+        de novo depois de uma reconexao. O ultimo que sobra nunca e anotado: levanta _UltimoSemBidAsk e
+        `_acompanhar_tickers` tenta de novo depois de uma espera. Se nenhum existir, levanta NotSupported.
         """
         tem = getattr(self._exchange, "has", None) or {}
         mercado = mercado_do_simbolo(simbolos[0])
         ultimo_erro: Exception | None = None
         sem_bid_ask: list[str] = []  # metodos que so trouxeram tickers sem bid/ask neste mercado
+        anotado_agora: str | None = None  # o metodo anotado como sem bid/ask nesta passada
         metodos = self._metodos_de_ticker()
         for posicao, (metodo, chave) in enumerate(metodos):
             if not tem.get(chave):
@@ -411,20 +463,24 @@ class ColetorCcxt(Coletor):
                 else:
                     await self._tickers_em_lote(metodo, simbolos)
             except SemBidAsk as erro:
-                self._sem_bid_ask.add((mercado, metodo))
                 sem_bid_ask.append(metodo)
                 seguintes = [m for m, c in metodos[posicao + 1:]
                              if tem.get(c) and (mercado, m) not in self._sem_bid_ask]
+                if not seguintes:
+                    raise _UltimoSemBidAsk(sem_bid_ask) from erro  # o ultimo nunca e abandonado de vez
+                self._sem_bid_ask.add((mercado, metodo))
+                anotado_agora = metodo
                 registro.warning("%s: %s no %s: %s; passando ao proximo metodo (%s)", self.nome, metodo, mercado,
-                                 erro, seguintes[0] if seguintes else "nenhum")
-                ultimo_erro = erro
+                                 erro, seguintes[0])
             except NotSupported as erro:
                 registro.warning("%s: %s nao serve para %s (%s); tentando o proximo metodo",
                                  self.nome, metodo, mercado, erro)
                 ultimo_erro = erro
         if sem_bid_ask:
-            raise SemBidAsk(f"nenhum metodo de ticker traz bid/ask no {mercado} (so sem bid/ask: "
-                            f"{', '.join(sem_bid_ask)}); tire o {mercado} da {self.nome} em mercados_por_corretora")
+            # Os metodos seguintes nao existiam nesse mercado: o ultimo anotado volta a ser o ultimo e e tentado
+            # de novo depois da espera (nunca fica desligado de vez).
+            self._sem_bid_ask.discard((mercado, anotado_agora or sem_bid_ask[-1]))
+            raise _UltimoSemBidAsk(sem_bid_ask)
         raise ultimo_erro or NotSupported(f"{self.nome}: a corretora nao tem nenhum metodo de ticker no ccxt")
 
     def _avisar_metodo_ausente(self, metodo: str) -> None:
@@ -446,9 +502,10 @@ class ColetorCcxt(Coletor):
         atual = opcoes.get(opcao)
         opcoes[opcao] = {**(atual if isinstance(atual, dict) else {}), "method": canais[mercado]}
 
-    def _sem_bid_ask_demais(self, conferencia: _ConferenciaBidAsk, total: int, com_bid_ask: int) -> None:
+    def _sem_bid_ask_demais(self, conferencia: _ConferenciaBidAsk, total: int, com_bid_ask: int,
+                            simbolo: str | None = None) -> None:
         """Levanta SemBidAsk se o metodo ja trouxe tickers sem bid/ask por mensagens_sem_bid_ask mensagens seguidas."""
-        if conferencia.desistir(total, com_bid_ask):
+        if conferencia.desistir(total, com_bid_ask, simbolo):
             raise SemBidAsk(f"so trouxe tickers sem bid/ask em {self._max_sem_bid_ask} mensagens seguidas")
 
     async def _tickers_em_lote(self, metodo: str, simbolos: list[str]) -> None:
@@ -475,7 +532,7 @@ class ColetorCcxt(Coletor):
         """
         simbolos = await self._um_a_um_dentro_do_limite(simbolos)
         mercado = mercado_do_simbolo(simbolos[0])
-        conferencia = _ConferenciaBidAsk(self._max_sem_bid_ask)
+        conferencia = _ConferenciaBidAsk(self._max_sem_bid_ask, simbolos_no_mercado=len(simbolos))
 
         async def acompanhar(simbolo: str) -> None:
             falhas = 0  # falhas seguidas deste simbolo, sem nenhum ticker entre elas
@@ -499,7 +556,7 @@ class ColetorCcxt(Coletor):
                     await self._esperar(espera)
                     continue
                 falhas = 0
-                self._sem_bid_ask_demais(conferencia, *self._tratar_tickers({simbolo: dados}))
+                self._sem_bid_ask_demais(conferencia, *self._tratar_tickers({simbolo: dados}), simbolo=simbolo)
 
         tarefas = [asyncio.create_task(acompanhar(s)) for s in simbolos]
         try:
@@ -512,11 +569,11 @@ class ColetorCcxt(Coletor):
 
         Se a corretora ja comeca pelo um a um, `iniciar_tickers` ja aplicou o limite a lista toda e aqui nada
         muda. Na troca automatica (o lote nao trouxe bid/ask) a lista deste mercado ainda nao foi limitada:
-        ficam os pares de maior volume 24h.
+        ficam os pares de maior volume 24h (e sempre os de cotacao, veja _escolher_no_limite).
         """
         if self._limite is None or len(simbolos) <= self._limite:
             return simbolos
-        escolhidos, fora = selecionar_pares(simbolos, await self._volumes_dos_tickers(simbolos), self._limite)
+        escolhidos, fora = await self._escolher_no_limite(simbolos)
         mercado = mercado_do_simbolo(simbolos[0])
         if self._fora_no_um_a_um.get(mercado) != fora:  # so quando muda (nao a cada reconexao)
             self._fora_no_um_a_um[mercado] = fora
@@ -612,10 +669,20 @@ class ColetorCcxt(Coletor):
         if self._limite is None or len(simbolos) <= self._limite or not self._so_ticker_um_a_um():
             self._avisar_limite("tickers", 0, len(simbolos))
             return simbolos
-        volumes = await self._volumes_dos_tickers(simbolos)
-        escolhidos, fora = selecionar_pares(simbolos, volumes, self._limite)
+        escolhidos, fora = await self._escolher_no_limite(simbolos)
         self._avisar_limite("tickers", fora, len(simbolos))
         return escolhidos
+
+    async def _escolher_no_limite(self, simbolos: list[str]) -> tuple[list[str], int]:
+        """(os simbolos de ticker que cabem no limite de assinaturas, quantos ficaram de fora).
+
+        Os pares de cotacao (usar_para_cotacao, ex.: USDC/USDT na fonte) ficam SEMPRE: sem eles as cotacoes
+        param. O limite corta so o resto, pelo maior volume 24h, e conta os de cotacao no total.
+        """
+        fixos = [s for s in simbolos if s in self._simbolos_cotacao]
+        outros = [s for s in simbolos if s not in self._simbolos_cotacao]
+        escolhidos, fora = selecionar_pares(outros, await self._volumes_dos_tickers(outros), self._limite - len(fixos))
+        return fixos + escolhidos, fora
 
     def _so_ticker_um_a_um(self) -> bool:
         """True se o primeiro metodo de ticker que a corretora tem (na ordem de _metodos_de_ticker) e o watch_ticker.

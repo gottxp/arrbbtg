@@ -1,5 +1,15 @@
 # Configuracao do scanner de arbitragem.
-# Todos os valores abaixo sao os padroes: se apagar uma linha, vale o padrao.
+# Quase todos os valores abaixo sao os padroes do codigo: se apagar uma linha, vale o padrao.
+# Estas linhas do exemplo NAO sao o padrao (apagar muda o comportamento):
+#   corretoras: o padrao do codigo e so a fase 1 [mexc, gate, bitget]; aqui entram tambem bingx, xt e
+#     hyperliquid (fase 2).
+#   mercados_por_corretora: o padrao e spot e futuro em todas. hyperliquid: so futuro (especificacao,
+#     secao 2; sem a linha o spot dela entraria). xt: so futuro porque o ccxt 4.5.89 nao traz bid/ask no
+#     spot da XT; isto e um desvio da secao 2 (XT spot e futuros): confirme com o dono.
+#   metodo_ticker: o padrao e tentar watch_tickers primeiro; hyperliquid usa watch_ticker porque o lote
+#     dela (allMids) nao traz bid/ask.
+#   intervalo_funding_h: o padrao e o intervalo que o ccxt informa (ou 8h); hyperliquid: 1h, para nao
+#     depender do ccxt (ela cobra de hora em hora).
 # Percentuais estao em % (0.3 = 0,3%).
 # A explicacao completa de cada campo vem no README (ultima etapa do projeto).
 

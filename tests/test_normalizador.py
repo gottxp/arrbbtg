@@ -239,6 +239,13 @@ def test_base_name_so_vale_quando_e_a_mesma_base_em_outra_caixa():
     assert normalizar("mexc", {"base": "KAS", "quote": "USDT"}).ativo == "KAS"
 
 
+def test_base_name_so_vale_no_futuro():
+    # No spot da Hyperliquid o nome do token e livre: "kSTAKE" (ex.: token de staking) nao e x1000.
+    spot = {**HL_SPOT_BTC, "symbol": "KSTAKE/USDC", "base": "KSTAKE", "baseName": "kSTAKE"}
+    p = normalizar("hyperliquid", spot)
+    assert (p.ativo, p.multiplicador) == ("KSTAKE", 1)
+
+
 def test_indexacao_hyperliquid_kpepe_e_so_futuros():
     chaves = indexar("hyperliquid", [HL_KPEPE, HL_BTC, HL_SPOT_BTC, HL_SPOT_USDT], mercados=("futuro",))
     assert chaves == {("futuro", "PEPE"): "KPEPE/USDC:USDC", ("futuro", "BTC"): "BTC/USDC:USDC"}

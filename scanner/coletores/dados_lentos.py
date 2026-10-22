@@ -19,6 +19,7 @@ import time
 from collections import Counter
 from collections.abc import Awaitable, Callable
 
+from scanner.config.carregar import Config
 from scanner.normalizador import mercado_do_market, normalizar, prioridade_cotacao
 
 registro = logging.getLogger("scanner.coletores")
@@ -127,9 +128,9 @@ class DadosLentos:
         taxas_config: dict | None = None,
         intervalos_funding: dict | None = None,
         estado=None,
-        fonte_cotacao: str = "bitget",
+        fonte_cotacao: str = Config.fonte_cotacao,
         fontes_cotacao: dict | None = None,
-        faixa_cotacao_pct: float = 10,
+        faixa_cotacao_pct: float = Config.faixa_cotacao_pct,
         relogio: Callable[[], float] = time.time,
     ):
         self._taxas_config = dict(taxas_config) if taxas_config else {}
