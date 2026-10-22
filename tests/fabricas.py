@@ -385,6 +385,9 @@ class CorretoraFalsa:
     ("livro", simbolo). Item que e excecao e levantado. Fila vazia: a chamada espera (como o ccxt esperando
     a proxima mensagem). `pedidos` guarda (metodo, simbolos, params) de cada chamada e `canais`, o canal
     que a opcao do ccxt pedia na hora do pedido ((metodo, simbolos, options[...]["method"])), como a XT le.
+    Livros: como o ccxt, guarda o ultimo livro de cada simbolo em `orderbooks`; `livro_guardado_ao_pedir`
+    anota, a cada watch_order_book, se ja havia livro guardado do simbolo. `desassinados`: os un_watch pedidos
+    (com `erro_un_watch`, o un_watch levanta esse erro). `chamadas_intervalos`: os fetch_funding_intervals.
     """
 
     def __init__(self, markets, has=None, funding=None):
@@ -396,6 +399,11 @@ class CorretoraFalsa:
         self.canais = []
         self.options = {}
         self.chamadas_funding = 0
+        self.chamadas_intervalos = 0
+        self.orderbooks = {}
+        self.livro_guardado_ao_pedir = []
+        self.desassinados = []
+        self.erro_un_watch = None
         self._filas = {}
 
     def fila(self, chave) -> asyncio.Queue:
@@ -438,10 +446,18 @@ class CorretoraFalsa:
 
     async def watch_order_book(self, symbol, limit=None, params=None):
         self.pedidos.append(("watch_order_book", (symbol,), params))
-        return await self._proximo(("livro", symbol))
+        if isinstance(self.orderbooks, dict):
+            self.livro_guardado_ao_pedir.append(symbol in self.orderbooks)
+        livro = await self._proximo(("livro", symbol))
+        if isinstance(self.orderbooks, dict):
+            self.orderbooks[symbol] = livro
+        return livro
 
     async def un_watch_order_book(self, symbol, params=None):
         await asyncio.sleep(0)
+        self.desassinados.append(symbol)
+        if self.erro_un_watch is not None:
+            raise self.erro_un_watch
 
     async def fetch_tickers(self, symbols=None, params=None):
         await asyncio.sleep(0)
@@ -451,6 +467,11 @@ class CorretoraFalsa:
         self.chamadas_funding += 1
         await asyncio.sleep(0)
         return dict(self.funding)
+
+    async def fetch_funding_intervals(self, symbols=None, params=None):
+        self.chamadas_intervalos += 1
+        await asyncio.sleep(0)
+        return {}
 
     async def fetch_funding_rate(self, symbol, params=None):
         await asyncio.sleep(0)

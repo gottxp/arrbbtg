@@ -835,16 +835,19 @@ def test_so_a_cotacao_perdedora_pedida_tambem_e_descartada():
     assert ticker_no_estado_apos(markets, {"BTC/USDC:USDC": tk(200.0, 200.1)}, ["BTC/USDC:USDC"]) is None
 
 
-def test_ordem_de_preferencia_usdt_usdc_usdg_e_depois_as_outras():
+def test_ordem_de_preferencia_usdt_usdc_usdg_usd_e_as_outras_ficam_de_fora():
+    # Revisao final (M3): moeda fora de PREFERENCIA_COTACAO (EUR, GBP...) nao entra; antes ela entrava 1:1.
     simbolo = lambda c: f"BTC/{c}:{c}"
-    cotacoes = ["EUR", "USDG", "USDC", "USDT"]
-    while cotacoes:
+    cotacoes = ["EUR", "USD", "USDG", "USDC", "USDT"]
+    while cotacoes != ["EUR"]:
         markets = markets_com_cotacoes(*cotacoes)
         mensagem = {simbolo(c): tk(100.0, 100.1) for c in cotacoes}
         t = ticker_no_estado_apos(markets, mensagem, list(mensagem))
-        esperado = [c for c in ("USDT", "USDC", "USDG", "EUR") if c in cotacoes][0]
+        esperado = [c for c in ("USDT", "USDC", "USDG", "USD") if c in cotacoes][0]
         assert t["cotacao"] == esperado
         cotacoes.remove(esperado)
+    assert ticker_no_estado_apos(markets_com_cotacoes("EUR"), {simbolo("EUR"): tk(100.0, 100.1)}, [simbolo("EUR")]) \
+        is None
 
 
 def test_ativo_so_com_usdc_e_aceito():

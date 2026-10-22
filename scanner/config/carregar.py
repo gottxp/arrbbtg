@@ -75,6 +75,19 @@ class Config:
     dias_logs: int = 30
     # De quanto em quanto tempo o log registra memoria, CPU e o resumo dos descartes, em segundos.
     intervalo_log_recursos_s: float = 300
+    # Revisao final da coleta.
+    # Maximo de assinaturas por (corretora, mercado), contando juntos os tickers e os livros da mesma conexao,
+    # ex.: {"mexc": {"spot": 30}} (a MEXC spot aceita 30 assinaturas por conexao). Vazio = sem limite por mercado.
+    limites_assinatura_mercado: dict = field(default_factory=dict)
+    # Quantas assinaturas de cada limite de limites_assinatura_mercado ficam para os livros (etapa 2); o resto
+    # fica para os tickers (etapa 1).
+    livros_reservados_limite_mercado: int = 10
+    # Corretoras cujos livros sao assinados de novo de tempos em tempos (o ccxt delas nao confere a sequencia do
+    # livro: MEXC e XT) e o intervalo, em segundos.
+    reassinar_livros_corretoras: list = field(default_factory=lambda: ["mexc", "xt"])
+    intervalo_reassinar_livros_s: float = 900
+    # Pares pedidos que nao mandam nenhum ticker neste tempo depois de (re)abrir os tickers vao para um aviso no log.
+    prazo_primeiro_ticker_s: float = 60
 
     # Fase 2 de corretoras (Task 15).
     # Mercados usados de cada corretora, ex.: {"hyperliquid": ("futuro",)}. Corretora fora daqui usa os dois.
@@ -113,6 +126,9 @@ class Config:
     mudancas_sem_livro_completo_lighter: int = 10
     # Tempo minimo em cada modo da etapa 1 da Lighter (market_stats ou livros) antes de trocar de novo, em segundos.
     tempo_min_modo_etapa1_lighter_s: float = 300
+    # Intervalo minimo entre duas montagens do livro de um par da Lighter, em ms (as mudancas que chegam no meio
+    # entram na montagem seguinte). 0 = monta a cada mensagem.
+    intervalo_montar_livro_lighter_ms: float = 100
 
     # Painel web.
     painel: dict = field(default_factory=_painel_padrao)
@@ -147,6 +163,8 @@ CAMPOS_POSITIVOS = (
     "tempo_max_rede_lighter_s",
     "tempo_max_livro_completo_lighter_s",
     "tempo_min_modo_etapa1_lighter_s",
+    "intervalo_reassinar_livros_s",
+    "prazo_primeiro_ticker_s",
 )
 
 # Campos numericos que aceitam qualquer valor (inclusive zero ou negativo).
@@ -210,6 +228,25 @@ def _validar_limites_assinatura(valor) -> dict:
         if not _inteiro_positivo(limite):
             raise ErroConfig(f"{modelo}; '{corretora}' esta com {limite!r}")
     return {str(corretora): limite for corretora, limite in valor.items()}
+
+
+def _validar_limites_assinatura_mercado(valor) -> dict:
+    """{corretora: {mercado: maximo de assinaturas}}; vazio (ou o campo sem nada) = sem limite por mercado."""
+    if valor is None:
+        return {}
+    modelo = ("limites_assinatura_mercado: use o formato  corretora: {spot: 30}  (mercado spot ou futuro, numero "
+              "inteiro maior que zero)")
+    if not isinstance(valor, dict):
+        raise ErroConfig(modelo)
+    resultado = {}
+    for corretora, limites in valor.items():
+        if not isinstance(limites, dict) or not limites:
+            raise ErroConfig(f"{modelo}; '{corretora}' esta com {limites!r}")
+        for mercado, limite in limites.items():
+            if mercado not in MERCADOS or not _inteiro_positivo(limite):
+                raise ErroConfig(f"{modelo}; '{corretora}' esta com {mercado}: {limite!r}")
+        resultado[str(corretora)] = dict(limites)
+    return resultado
 
 
 def _validar_mercados_por_corretora(valor) -> dict:
@@ -325,7 +362,7 @@ def _validar_campo(campo: str, valor):
     """Confere um campo do yaml e devolve o valor pronto para a Config."""
     if campo == "corretoras":
         return _validar_lista_de_texto(campo, valor, pode_ser_vazia=False)
-    if campo == "corretoras_farm":
+    if campo in ("corretoras_farm", "reassinar_livros_corretoras"):
         return _validar_lista_de_texto(campo, valor, pode_ser_vazia=True)
     if campo == "taxas":
         return _validar_taxas(valor)
@@ -345,11 +382,13 @@ def _validar_campo(campo: str, valor):
         return valor
     if campo == "limites_assinatura":
         return _validar_limites_assinatura(valor)
+    if campo == "limites_assinatura_mercado":
+        return _validar_limites_assinatura_mercado(valor)
     if campo == "pasta_logs":
         if not isinstance(valor, str) or not valor:
             raise ErroConfig("pasta_logs: precisa ser o nome de uma pasta, ex.: logs")
         return valor
-    if campo in ("dias_logs", "mensagens_sem_bid_ask", *CAMPOS_INTEIROS_LIGHTER):
+    if campo in ("dias_logs", "mensagens_sem_bid_ask", "livros_reservados_limite_mercado", *CAMPOS_INTEIROS_LIGHTER):
         if not _inteiro_positivo(valor):
             raise ErroConfig(f"{campo}: precisa ser um numero inteiro maior que zero (valor recebido: {valor!r})")
         return valor
@@ -369,6 +408,11 @@ def _validar_campo(campo: str, valor):
         return _validar_url_lighter(campo, valor)
     if campo == "intervalo_ping_lighter_s":
         return _validar_ping_lighter(valor)
+    if campo == "intervalo_montar_livro_lighter_ms":
+        if not _e_numero(valor) or valor < 0:
+            raise ErroConfig(f"{campo}: precisa ser um numero maior ou igual a zero (0 = monta o livro a cada "
+                             f"mensagem); valor recebido: {valor!r}")
+        return valor
     # Sobraram os campos numericos.
     if not _e_numero(valor):
         raise ErroConfig(f"{campo}: precisa ser um numero")
@@ -405,11 +449,13 @@ def carregar_config(caminho: str) -> Config:
     config = Config(**valores)
     _conferir_nomes_das_corretoras(config)
     _conferir_fontes_de_cotacao(config, fonte_escrita="fonte_cotacao" in dados)
+    _conferir_reserva_dos_livros(config)
     return config
 
 
 # Campos {corretora: valor}: o nome da corretora precisa estar em `corretoras`.
-CAMPOS_POR_CORRETORA = ("limites_assinatura", "mercados_por_corretora", "metodo_ticker", "intervalo_funding_h")
+CAMPOS_POR_CORRETORA = ("limites_assinatura", "mercados_por_corretora", "metodo_ticker", "intervalo_funding_h",
+                        "limites_assinatura_mercado")
 
 
 def _conferir_nomes_das_corretoras(config: Config) -> None:
@@ -422,6 +468,20 @@ def _conferir_nomes_das_corretoras(config: Config) -> None:
         if fora:
             raise ErroConfig(f"{campo}: {', '.join(fora)} nao esta em corretoras (erro de digitacao?); "
                              f"corretoras: {', '.join(config.corretoras)}")
+
+
+def _conferir_reserva_dos_livros(config: Config) -> None:
+    """Cada limite de limites_assinatura_mercado precisa ser maior que livros_reservados_limite_mercado.
+
+    Os livros ficam com a reserva e os tickers com o resto: sem sobra, o mercado ficaria sem nenhum ticker.
+    """
+    for corretora, limites in config.limites_assinatura_mercado.items():
+        for mercado, limite in limites.items():
+            if limite <= config.livros_reservados_limite_mercado:
+                raise ErroConfig(f"limites_assinatura_mercado: {corretora} {mercado} com {limite} assinaturas nao "
+                                 f"sobra nada para os tickers depois das {config.livros_reservados_limite_mercado} "
+                                 "reservadas aos livros (livros_reservados_limite_mercado); aumente o limite ou "
+                                 "diminua a reserva")
 
 
 def _conferir_fontes_de_cotacao(config: Config, fonte_escrita: bool) -> None:

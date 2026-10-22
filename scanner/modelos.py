@@ -75,7 +75,7 @@ class Candidato:
     modo: Literal["lucro", "farm"]
     etiquetas: list[str] = field(default_factory=list)  # ex.: ["STOCK"]
     suspeito: bool = False
-    aviso_cotacao: bool = False  # True quando USDC/USDG foi convertido 1:1 por falta de cotacao
+    aviso_cotacao: bool = False  # True quando o preco em USDC, USDG ou USD foi convertido 1:1 por falta de cotacao
     ponta_long: Ponta
     ponta_short: Ponta
     spread_abertura_pct: float  # A atual

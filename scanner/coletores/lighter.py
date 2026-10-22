@@ -25,6 +25,9 @@ Como funciona (documentacao oficial: https://apidocs.lighter.xyz, lida em 22/10/
     pings_sem_resposta_lighter intervalos, a conexao e dada como morta e o coletor reconecta.
   - Funding: o current_funding_rate do market_stats, ja em % (a Lighter cobra de hora em hora). Funding e
     taxa taker vao direto para o DadosLentos (receber_funding e receber_taxas).
+  - CPU (revisao final): as mudancas de cada livro sao juntadas a cada mensagem, mas o Livro (os N melhores
+    niveis, convertido para o estado) e montado no maximo a cada intervalo_montar_livro_lighter_ms por par; a
+    ultima mudanca nunca se perde (uma montagem fica marcada para o fim do intervalo).
 
 O formato das mensagens segue a documentacao (as fixtures em tests/dados/ tambem); precisa ser conferido com
 uma mensagem real no PC do dono.
@@ -237,6 +240,9 @@ class _LivroAberto:
     cancelar: bool = True  # cancelar antes de assinar de novo (False: a Lighter disse que nao estava assinado)
     mudancas_sem_completo: int = 0  # mudancas que chegaram antes do livro completo (para avisar no log)
     pedido_em: float | None = None  # quando o livro foi pedido (tempo maximo do livro completo); None = esperando
+    montado_em: float | None = None  # ultima montagem do Livro (intervalo_montar_livro_lighter_ms); None = nenhuma
+    pendente: tuple[float, float | None] | None = None  # mudanca ainda nao montada: (chegada, horario da Lighter ms)
+    agendado: asyncio.Task | None = None  # a montagem marcada para o fim do intervalo
 
 
 class ColetorLighter(ColetorComSaude):
@@ -252,9 +258,11 @@ class ColetorLighter(ColetorComSaude):
     relogio: hora atual em segundos (os testes passam um relogio falso).
     esperar: espera da reconexao e do livro pedido de novo (padrao asyncio.sleep; os testes trocam).
     esperar_ping: espera entre dois pings (separada, para os testes controlarem o ping).
+    esperar_livro: espera ate a montagem marcada do livro (separada, para os testes controlarem).
     Os outros vem da Config: espera_max_reconexao_s, limites_assinatura, intervalo_ping_lighter_s,
     mensagens_sem_bid_ask, pings_sem_resposta_lighter, niveis_livro_lighter,
-    tempo_max_livro_completo_lighter_s e mudancas_sem_livro_completo_lighter.
+    tempo_max_livro_completo_lighter_s, mudancas_sem_livro_completo_lighter, intervalo_montar_livro_lighter_ms e
+    prazo_primeiro_ticker_s.
 
     A conexao vive enquanto manter_tickers roda: se ele for reiniciado (lista de pares mudou), a conexao e
     refeita e os livros desejados sao assinados de novo (cada um com um livro completo novo).
@@ -281,8 +289,12 @@ class ColetorLighter(ColetorComSaude):
         tempo_max_livro_completo_s: float = Config.tempo_max_livro_completo_lighter_s,
         mudancas_sem_livro_completo: int = Config.mudancas_sem_livro_completo_lighter,
         tempo_min_modo_s: float = Config.tempo_min_modo_etapa1_lighter_s,
+        intervalo_montar_livro_ms: float = Config.intervalo_montar_livro_lighter_ms,
+        esperar_livro: Callable[[float], Awaitable] = asyncio.sleep,
+        prazo_primeiro_ticker_s: float = Config.prazo_primeiro_ticker_s,
     ):
-        super().__init__(nome_da_instancia(instancia), estado, relogio, limite_assinaturas, espera_max_reconexao_s)
+        super().__init__(nome_da_instancia(instancia), estado, relogio, limite_assinaturas, espera_max_reconexao_s,
+                         prazo_primeiro_ticker_s)
         self.instancia = instancia
         self._cliente = cliente
         self._dados_lentos = dados_lentos
@@ -295,6 +307,8 @@ class ColetorLighter(ColetorComSaude):
         self._tempo_max_completo_s = tempo_max_livro_completo_s
         self._max_sem_completo = mudancas_sem_livro_completo
         self._tempo_min_modo_s = tempo_min_modo_s
+        self._intervalo_montar_s = intervalo_montar_livro_ms / 1000
+        self._esperar_livro = esperar_livro
         self._ao_atualizar: Callable[[Livro], None] | None = None
         self._ao_ticker: Callable[[Ticker], None] | None = None
         # Indice dos mercados (refeito quando o cliente recarrega a lista).
@@ -381,6 +395,9 @@ class ColetorLighter(ColetorComSaude):
         conexao = await self._cliente.conectar_ws()
         self._conexao = conexao
         self._cancelamentos.clear()  # as respostas da conexao velha nao vem mais
+        if simbolos_ticker:  # a conta dos pares que nunca mandaram ticker recomeca a cada conexao
+            self._comecar_conferencia_de_tickers("futuro", self._simbolos_ticker | self._simbolos_cotacao,
+                                                 self._relogio())
         ping = asyncio.create_task(self._pingar(conexao), name=f"ping {self.nome}")
         try:
             await conexao.enviar({"type": "subscribe", "channel": CANAL_TICKERS})
@@ -471,6 +488,7 @@ class ColetorLighter(ColetorComSaude):
         total = 0
         com_bid_ask: list[str] = []
         sem_bid_ask: list[str] = []
+        recebidos: list[str] = []
         for stats in itens:
             simbolo = self._simbolo_do_id.get(str(stats.get("market_id")))
             if simbolo is None:
@@ -479,6 +497,7 @@ class ColetorLighter(ColetorComSaude):
             if simbolo not in self._simbolos_ticker and simbolo not in self._simbolos_cotacao:
                 continue
             total += 1
+            recebidos.append(simbolo)
             try:
                 ticker = ticker_de_lighter(self.nome, simbolo, stats, agora)
                 if ticker is not None or (ler_numero(stats.get("best_bid_price")) is not None
@@ -499,6 +518,7 @@ class ColetorLighter(ColetorComSaude):
         horario = ler_numero(mensagem.get("timestamp"))
         if horario is not None:
             self._registrar_atraso(agora, horario / 1000)  # a Lighter manda ms
+        self._anotar_tickers_recebidos("futuro", recebidos, agora)
         self._conferir_bid_ask(total, com_bid_ask, sem_bid_ask, agora)
 
     def _guardar_estatisticas(self, simbolo: str, stats: dict) -> None:
@@ -721,7 +741,9 @@ class ColetorLighter(ColetorComSaude):
             tarefa.cancel()
         if simbolo in self._reassinar_pendentes:
             self._reassinar_pendentes.remove(simbolo)
-        self._livros.pop(simbolo, None)
+        aberto = self._livros.pop(simbolo, None)
+        if aberto is not None:
+            self._desmarcar_montagem(aberto)
         self._remover_livro_do_estado(simbolo)
         self._esquecer_ticker_do_livro(simbolo)
 
@@ -743,6 +765,8 @@ class ColetorLighter(ColetorComSaude):
                 self._quebrou(simbolo, aberto, "livro completo com nivel invalido", "livros")
                 return
             aberto.mudancas_sem_completo = 0
+            self._desmarcar_montagem(aberto)
+            aberto.montado_em = None  # o livro completo e montado na hora
         else:  # "update/order_book": so as mudancas
             resultado, detalhe = aberto.juntado.juntar_mudancas(dados)
             if resultado == IGNORADA:
@@ -792,6 +816,8 @@ class ColetorLighter(ColetorComSaude):
         self._remover_livro_do_estado(simbolo)
         self._esquecer_ticker_do_livro(simbolo)
         aberto.juntado.esvaziar()
+        self._desmarcar_montagem(aberto)  # a mudanca que esperava montagem nao vale mais
+        aberto.montado_em = None
         aberto.mudancas_sem_completo = 0
         aberto.espera = 0.0 if aberto.quebras == 0 else espera_reconexao(aberto.quebras - 1, self._espera_max_s)
         aberto.quebras += 1
@@ -847,17 +873,60 @@ class ColetorLighter(ColetorComSaude):
                 del self._reassinaturas[simbolo]
 
     def _entregar_juntado(self, simbolo: str, aberto: _LivroAberto, mensagem: dict, agora: float) -> None:
-        """Monta o Livro guardado e entrega (se for valido); com a etapa 1 pelos livros, o ticker tambem."""
-        pronto = aberto.juntado.montar(self.nome, simbolo, agora, ler_numero(mensagem.get("timestamp")), self._niveis)
+        """Monta o Livro guardado e entrega (se for valido); com a etapa 1 pelos livros, o ticker tambem.
+
+        Montar refaz o Livro inteiro (os N melhores niveis de cada lado e a conversao para o estado): com a etapa 1
+        pelos livros, sao centenas de mensagens por segundo. Por isso o Livro e montado no maximo a cada
+        intervalo_montar_livro_lighter_ms por par: a mudanca que chega antes disso ja esta juntada no livro guardado
+        e entra na montagem marcada para o fim do intervalo (a ultima mudanca nunca se perde).
+        """
+        ts_ms = ler_numero(mensagem.get("timestamp"))
+        if (self._intervalo_montar_s > 0 and aberto.montado_em is not None
+                and agora - aberto.montado_em < self._intervalo_montar_s):
+            aberto.pendente = (agora, ts_ms)
+            if aberto.agendado is None:
+                restante = self._intervalo_montar_s - (agora - aberto.montado_em)
+                aberto.agendado = asyncio.create_task(self._montar_depois(simbolo, aberto, restante),
+                                                      name=f"montagem {self.nome} {simbolo}")
+            return
+        self._montar_e_entregar(simbolo, aberto, agora, ts_ms, agora)
+
+    def _montar_e_entregar(self, simbolo: str, aberto: _LivroAberto, recebido_em: float, ts_ms: float | None,
+                           montado_em: float) -> None:
+        """Monta o Livro com o que esta juntado (recebido_em = chegada da ultima mudanca nele) e entrega."""
+        aberto.montado_em = montado_em
+        aberto.pendente = None
+        pronto = aberto.juntado.montar(self.nome, simbolo, recebido_em, ts_ms, self._niveis)
         if pronto is None:
             self._descartes["livros"] += 1
             registro.debug("%s %s: livro descartado (vazio, preco invalido ou cruzado)", self.nome, simbolo)
             return
         if pronto.ts_corretora is not None:
-            self._registrar_atraso(agora, pronto.ts_corretora)
+            self._registrar_atraso(recebido_em, pronto.ts_corretora)
         self._entregar_livro(pronto)
         if self._tickers_pelos_livros and simbolo in self._simbolos_ticker:
-            self._ticker_do_livro(pronto, agora)
+            self._ticker_do_livro(pronto, recebido_em)
+
+    async def _montar_depois(self, simbolo: str, aberto: _LivroAberto, espera: float) -> None:
+        """A montagem marcada: espera o resto do intervalo e monta com as mudancas que chegaram no meio."""
+        try:
+            await self._esperar_livro(espera)
+            if self._livros.get(simbolo) is aberto and aberto.pendente is not None and aberto.juntado.pronto:
+                recebido_em, ts_ms = aberto.pendente
+                self._montar_e_entregar(simbolo, aberto, recebido_em, ts_ms, self._relogio())
+        except Exception:  # defeito ao montar este livro: so ele fica de fora
+            self._erro_ao_tratar({"channel": "order_book"})
+        finally:
+            if aberto.agendado is asyncio.current_task():
+                aberto.agendado = None
+
+    @staticmethod
+    def _desmarcar_montagem(aberto: _LivroAberto) -> None:
+        """Cancela a montagem marcada do livro (ele quebrou, saiu ou chegou um livro completo novo)."""
+        aberto.pendente = None
+        tarefa, aberto.agendado = aberto.agendado, None
+        if tarefa is not None:
+            tarefa.cancel()
 
     def _entregar_livro(self, livro: Livro) -> None:
         if self._estado is not None:
@@ -1024,4 +1093,6 @@ def criar_coletor_lighter(nome: str, cliente, cfg: Config, estado: EstadoMercado
         tempo_max_livro_completo_s=cfg.tempo_max_livro_completo_lighter_s,
         mudancas_sem_livro_completo=cfg.mudancas_sem_livro_completo_lighter,
         tempo_min_modo_s=cfg.tempo_min_modo_etapa1_lighter_s,
+        intervalo_montar_livro_ms=cfg.intervalo_montar_livro_lighter_ms,
+        prazo_primeiro_ticker_s=cfg.prazo_primeiro_ticker_s,
     )

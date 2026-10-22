@@ -323,11 +323,13 @@ Faça os marcos nesta ordem. Os comandos são do Windows (PowerShell, na pasta `
    | `sinais ativos: N` | a cada minuto, sem buracos |
    | `recursos: memoria ... MB (atual), CPU ...%` e `descartes nos ultimos 300s: ...` | a cada 5 minutos |
    | `mexc: watch_tickers no futuro: so trouxe tickers sem bid/ask em 10 mensagens seguidas; passando ao proximo metodo (watch_ticker)` | uma vez, no começo (é o esperado; veja o [aviso A](#aviso-a-mexc-futuros-um-par-por-assinatura)) |
+   | `mexc: limite de 30 assinaturas no spot (limites_assinatura_mercado), 10 delas para os livros: N de M pares ficaram fora dos tickers` | ao ligar (é o esperado; veja o [aviso A](#aviso-a-mexc-futuros-um-par-por-assinatura)) |
+   | `kraken: N pares cotados em outras moedas ficam de fora (EUR ..., GBP ...)` | ao ligar (é o esperado: o scanner só compara preços em USDT, USDC, USDG e USD) |
 
 3. Procure as linhas que **não** deveriam aparecer:
 
    ```powershell
-   Select-String -Path "logs\scanner-*.log" -Pattern "nenhum metodo de ticker|parece de limite|mercado inativo|relogio do PC|fora da faixa|sem cotacao|ficam de fora ate a taxa|Traceback"
+   Select-String -Path "logs\scanner-*.log" -Pattern "nenhum metodo de ticker|parece de limite|mercado inativo|relogio do PC|fora da faixa|sem cotacao|ficam de fora ate a taxa|nunca mandaram ticker|intervalo do funding nao veio|requires protobuf|Traceback"
    ```
 
    | Se aparecer | O que fazer |
@@ -339,6 +341,9 @@ Faça os marcos nesta ordem. Os comandos são do Windows (PowerShell, na pasta `
    | `fora da faixa de seguranca` | avise (cotação USDC ou USD estranha) |
    | `sem cotacao de USDC em USDT` ou `sem cotacao de USD em USDT` | a bitget (USDC) ou a kraken (USD) não está ligada ou não conectou |
    | `ficam de fora ate a taxa chegar` | preencha a taxa daquele mercado em `taxas` ([parte 6](#6-mudar-a-configuração), ajuste 1) |
+   | `N de M pares pedidos no spot nunca mandaram ticker em 60s` (ou no futuro) | anote a corretora e o N. Se N for grande, a corretora está recusando assinaturas: preencha `limites_assinatura_mercado` dela (como a linha `mexc: spot: 30` do `config.yaml`) e avise |
+   | `o intervalo do funding nao veio ... eles usam 8h` | confira no site da corretora de quantas em quantas horas ela cobra e preencha `intervalo_funding_h` dela ([parte 6](#6-mudar-a-configuração)) |
+   | `requires protobuf` | o spot da MEXC não chega sem o pacote `protobuf`: avise (instalar precisa de aprovação). Enquanto isso, deixe só o futuro da MEXC: `mexc: [futuro]` em `mercados_por_corretora` |
    | `Traceback` | copie as linhas em volta e avise |
 
 4. Confira os sinais sem o painel: abra <http://localhost:8000/api/sinais>. Aparece uma lista (pode ser `[]` se não houver oportunidade agora).
@@ -454,6 +459,8 @@ limites_assinatura:
 ```
 
 4. Rode `--validar` e religue. O log passa a dizer `... 200 assinaturas ... N de M pares ficaram de fora (os de menor volume 24h)`: é o esperado. Se o aviso de limite continuar, baixe para `100`.
+5. MEXC spot: a MEXC aceita 30 assinaturas por conexão no spot. Com `limites_assinatura_mercado: mexc: spot: 30`, só os 20 pares de maior volume da MEXC spot entram na etapa 1 e sobram 10 para os livros. É o esperado (decisão pendente: a etapa 1 da MEXC spot pela API REST, que precisa da sua aprovação). O ticker da MEXC spot não traz o volume 24h: o `VOL` dela vem pela API REST (ao ligar e a cada `intervalo_dados_lentos_s`).
+6. MEXC futuros e XT: a cada 15 minutos (`intervalo_reassinar_livros_s`) cada livro é assinado de novo, porque o ccxt delas não confere a sequência do livro. Por alguns segundos o par fica sem livro: um sinal com MEXC futuros ou XT pode sumir e voltar (o histórico continua no mesmo registro se voltar em até 60 s).
 
 #### Aviso B: XT só futuros (decisão pendente)
 
@@ -799,6 +806,12 @@ O padrão vale quando a linha não está no `config.yaml`.
 | `painel.senha` | `null` | — | senha do painel |
 | `banco` | `scanner.db` | — | arquivo do banco |
 | `nivel_log` | `normal` | — | normal ou detalhado |
+| `limites_assinatura_mercado` | `{}` | assinaturas | máximo por corretora e mercado (tickers e livros juntos) |
+| `livros_reservados_limite_mercado` | `10` | assinaturas | parte de cada limite por mercado que fica para os livros |
+| `reassinar_livros_corretoras` | `[mexc, xt]` | lista | corretoras cujos livros são assinados de novo de tempos em tempos |
+| `intervalo_reassinar_livros_s` | `900` | s | intervalo entre duas assinaturas do mesmo livro nessas corretoras |
+| `prazo_primeiro_ticker_s` | `60` | s | par pedido sem nenhum ticker neste tempo vai para um aviso no log |
+| `intervalo_montar_livro_lighter_ms` | `100` | ms | intervalo mínimo entre duas montagens do livro de um par da Lighter |
 
 ---
 

@@ -8,6 +8,15 @@ Hyperliquid) vem do ticker spot ja coletado da corretora `fonte_cotacao` (padrao
 bid/ask do par USDC/USDT (ou 1/meio do par inverso USDT/USD). Nao ha REST nisso: o par entra nos
 tickers da etapa 1 da fonte (o __main__ cuida) e o motor pede `cotacoes()` a cada ciclo.
 
+Revisao final da coleta:
+  - Intervalo do funding: o da config, o do ccxt e, sem nenhum, 8h com um aviso no log (uma vez por corretora).
+    Itens sem intervalo sao completados pelo fetch_funding_intervals do ccxt, quando a corretora tem (Bitget:
+    o fetch_funding_rates padrao dela nao traz o intervalo, e ha contratos de 1h, 2h e 4h).
+  - Simbolos em uso (`usar_simbolos`, informados pelo __main__ a cada lista de tickers): o funding fica so com
+    eles, que sao os do indice do coletor (contrato ativo, mercados_por_corretora, cotacao preferida); nas
+    corretoras sem funding em lote (MEXC, XT) so eles sao perguntados, e cada funding e gravado assim que chega.
+  - Volume 24h pela API REST (fetch_tickers) dos simbolos cujo ticker nao traz volume (veja EstadoMercados).
+
 Tudo em % (0.06 = 0,06%). Sem rede nos testes: as corretoras entram por parametro.
 """
 
@@ -20,7 +29,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable
 
 from scanner.config.carregar import Config
-from scanner.normalizador import mercado_do_market, normalizar, prioridade_cotacao
+from scanner.normalizador import cotacao_usada, mercado_do_market, normalizar, prioridade_cotacao
 
 registro = logging.getLogger("scanner.coletores")
 
@@ -32,12 +41,18 @@ class TaxaDesconhecida(LookupError):
     """Nao ha taxa taker nem no config.yaml nem vinda da API para esta corretora e mercado."""
 
 
-def intervalo_funding_h(texto) -> int:
-    """Converte o "interval" do ccxt ("8h", "1h", "4h") em horas inteiras; sem formato valido, 8."""
+def ler_intervalo_funding_h(texto) -> int | None:
+    """O "interval" do ccxt ("8h", "1h", "4h") em horas inteiras, ou None se faltar ou nao estiver nesse formato."""
     achado = re.fullmatch(r"\s*(\d+)\s*h\s*", texto) if isinstance(texto, str) else None
     if achado and int(achado.group(1)) > 0:
         return int(achado.group(1))
-    return INTERVALO_FUNDING_PADRAO_H
+    return None
+
+
+def intervalo_funding_h(texto) -> int:
+    """Converte o "interval" do ccxt ("8h", "1h", "4h") em horas inteiras; sem formato valido, 8."""
+    horas = ler_intervalo_funding_h(texto)
+    return INTERVALO_FUNDING_PADRAO_H if horas is None else horas
 
 
 def _numero_valido(valor) -> bool:
@@ -85,6 +100,11 @@ def _ler_funding(item: dict | None, horas_da_config: int | None = None) -> tuple
         return None
     horas = horas_da_config if horas_da_config is not None else intervalo_funding_h(item.get("interval"))
     return _para_percentual(item["fundingRate"]), horas
+
+
+def _sem_intervalo(item) -> bool:
+    """True se o funding rate do ccxt veio sem intervalo legivel ("8h", "1h"...)."""
+    return isinstance(item, dict) and ler_intervalo_funding_h(item.get("interval")) is None
 
 
 def _meio_do_bid_ask(ticker: dict | None) -> float | None:
@@ -146,6 +166,11 @@ class DadosLentos:
         self._pares_cotacao: dict[str, tuple[str, str, bool]] = {}  # moeda -> (corretora, simbolo, inverso)
         self._sem_par_avisado: dict[str, str] = {}  # moeda -> motivo ja avisado de nao ter par (nao repete)
         self._fora_da_faixa: set[str] = set()  # moedas cuja ultima cotacao lida estava fora da faixa (ja avisado)
+        # Revisao final.
+        self._simbolos_em_uso: dict[str, set[str]] | None = None  # corretora -> simbolos dos tickers; None = todos
+        self._sem_intervalo_avisado: set[str] = set()  # corretoras ja avisadas de funding sem intervalo (uma vez)
+        self._volume_com_erro: set[str] = set()  # corretoras cujo volume pela REST falhou (avisado ate voltar)
+        self._intervalos_com_erro: set[str] = set()  # corretoras cujo fetch_funding_intervals falhou (avisado)
 
     # --- consulta (motor) ----------------------------------------------------
 
@@ -241,6 +266,26 @@ class DadosLentos:
             resultado[moeda] = valor
         return resultado
 
+    # --- simbolos em uso (o __main__ informa a cada lista de tickers) ---------
+
+    def usar_simbolos(self, corretora: str, simbolos) -> None:
+        """Os simbolos que a etapa 1 da corretora acompanha agora (a lista de tickers). Lista vazia = nenhum.
+
+        A partir da primeira chamada (de qualquer corretora), o funding so fica com os simbolos em uso: sao os do
+        indice do coletor (contrato ativo, mercados_por_corretora, cotacao preferida), o mesmo contrato cujo preco
+        o motor le. Corretora sem lista informada fica sem perguntas de funding um a um. Sem nenhuma chamada (uso
+        direto, sem o scanner), valem todos os futuros, como antes.
+        """
+        if self._simbolos_em_uso is None:
+            self._simbolos_em_uso = {}
+        self._simbolos_em_uso[corretora] = set(simbolos)
+
+    def simbolos_em_uso(self, corretora: str) -> set[str] | None:
+        """Os simbolos em uso informados para a corretora (vazio se nenhum); None se nada foi informado ainda."""
+        if self._simbolos_em_uso is None:
+            return None
+        return set(self._simbolos_em_uso.get(corretora, ()))
+
     # --- entregues pelo proprio coletor (Lighter, Task 16) --------------------
 
     def receber_taxas(self, corretora: str, markets: dict) -> None:
@@ -309,6 +354,7 @@ class DadosLentos:
                 "%s: nao consegui atualizar funding e taxas (%s: %s); mantenho os dados anteriores",
                 corretora, type(erro).__name__, erro,
             )
+        await self._buscar_volumes(corretora, exchange)  # separado: erro no funding nao impede o volume
 
     async def _atualizar_corretora(self, corretora: str, exchange) -> None:
         if not exchange.markets:
@@ -318,52 +364,153 @@ class DadosLentos:
         for mercado, taxa in _taxas_taker_dos_mercados(markets).items():
             self._taxas_api[(corretora, mercado)] = taxa
 
-        escolhidos = await self._buscar_funding(corretora, exchange, markets)
-        for ativo, (_, taxa_e_horas) in escolhidos.items():
-            self._funding[(corretora, ativo)] = taxa_e_horas
+        await self._buscar_funding(corretora, exchange, markets)
 
-    async def _buscar_funding(self, corretora: str, exchange, markets: dict) -> dict:
-        """Funding dos futuros: {ativo normalizado: (chave de preferencia, (taxa %, horas))}."""
+    def _futuros_do_funding(self, corretora: str, markets: dict) -> list[str]:
+        """Os futuros cujo funding interessa: os simbolos em uso (se informados) ou todos os perpetuos lineares
+        ativos, cotados nas moedas que o scanner usa (os mesmos que o indice do coletor aceita)."""
+        em_uso = self.simbolos_em_uso(corretora)
+        simbolos = []
+        for simbolo, market in markets.items():
+            if em_uso is not None and simbolo not in em_uso:
+                continue
+            if not isinstance(market, dict) or mercado_do_market(market) != "futuro":
+                continue
+            if market.get("active") is False or not cotacao_usada(market.get("quote")) or not market.get("base"):
+                continue
+            simbolos.append(simbolo)
+        return simbolos
+
+    async def _buscar_funding(self, corretora: str, exchange, markets: dict) -> None:
+        """Funding dos futuros que interessam (veja _futuros_do_funding), gravado em self._funding.
+
+        Em lote (fetch_funding_rates) quando a corretora tem; senao um a um, gravando cada um assim que chega.
+        """
+        futuros = self._futuros_do_funding(corretora, markets)
+        escolhidos: dict[str, tuple] = {}  # ativo -> chave de preferencia do contrato gravado nesta rodada
+        sem_intervalo: list[str] = []  # simbolos cujo intervalo veio ausente ou ilegivel (aviso no fim)
         if exchange.has.get("fetchFundingRates"):
             brutos = await exchange.fetch_funding_rates()  # todos de uma vez
+            if isinstance(brutos, dict):
+                await self._completar_intervalos(corretora, exchange, brutos, futuros)
+                for simbolo in futuros:
+                    self._gravar_funding(corretora, simbolo, markets[simbolo], brutos.get(simbolo), escolhidos,
+                                         sem_intervalo)
         else:
-            brutos = await self._funding_um_a_um(corretora, exchange, markets)
+            await self._funding_um_a_um(corretora, exchange, markets, futuros, escolhidos, sem_intervalo)
+        self._avisar_sem_intervalo(corretora, sem_intervalo, len(escolhidos))
 
-        escolhidos: dict[str, tuple] = {}
+    async def _completar_intervalos(self, corretora: str, exchange, brutos: dict, futuros: list[str]) -> None:
+        """Itens sem intervalo legivel ganham o do fetch_funding_intervals do ccxt, se a corretora tiver.
+
+        Ex.: Bitget, cujo fetch_funding_rates padrao (v2/mix/market/tickers) nao traz o fundingRateInterval; o
+        fetch_funding_intervals usa o v2/mix/market/current-fund-rate, que traz. Com intervalo_funding_h na config
+        da corretora nao precisa (a config vale sobre o ccxt). Erro aqui so vai ao log: fica o que veio.
+        """
+        if corretora in self._intervalos_config or not exchange.has.get("fetchFundingIntervals"):
+            return
+        faltam = [s for s in futuros if _sem_intervalo(brutos.get(s))]
+        if not faltam:
+            return
+        try:
+            intervalos = await exchange.fetch_funding_intervals()
+        except Exception as erro:  # rede, mudanca na API...: os sem intervalo ficam com 8h (e o aviso)
+            if corretora not in self._intervalos_com_erro:
+                self._intervalos_com_erro.add(corretora)
+                registro.warning("%s: nao consegui o intervalo do funding pela API (%s: %s); o aviso nao se repete "
+                                 "ate voltar", corretora, type(erro).__name__, erro)
+            return
+        self._intervalos_com_erro.discard(corretora)
+        for simbolo in faltam:
+            extra = (intervalos or {}).get(simbolo) if isinstance(intervalos, dict) else None
+            if isinstance(extra, dict) and not _sem_intervalo(extra):
+                brutos[simbolo] = {**brutos[simbolo], "interval": extra["interval"]}
+
+    def _gravar_funding(self, corretora: str, simbolo: str, market: dict, item, escolhidos: dict,
+                        sem_intervalo: list[str]) -> None:
+        """Grava o funding de um futuro (se valido), anotando os que vieram sem intervalo.
+
+        Mais de um futuro pode ter o mesmo ativo (BTC/USDT:USDT e BTC/USDC:USDC, sem simbolos em uso informados):
+        vale a regra do indice do coletor (moeda preferida e, em empate, ordem do simbolo), para o funding ser do
+        mesmo contrato cujo preco o motor le.
+        """
         horas_da_config = self._intervalos_config.get(corretora)
-        for simbolo, item in brutos.items():
-            market = markets.get(simbolo)
-            funding = _ler_funding(item, horas_da_config) if isinstance(item, dict) else None
-            if not isinstance(market, dict) or funding is None or mercado_do_market(market) != "futuro":
-                continue
-            if not market.get("base") or not market.get("quote"):
-                continue
-            try:
-                par = normalizar(corretora, market)
-            except (TypeError, ValueError):  # market com dados que o scanner nao entende: so ele fica de fora
-                continue
-            # Mais de um futuro pode ter o mesmo ativo (BTC/USDT:USDT e BTC/USDC:USDC): vale a mesma
-            # regra do estado (moeda preferida e, em empate, ordem do simbolo), para o funding ser do
-            # mesmo contrato cujo preco o motor le.
-            preferencia = (*prioridade_cotacao(par.cotacao), simbolo)
-            if par.ativo not in escolhidos or preferencia < escolhidos[par.ativo][0]:
-                escolhidos[par.ativo] = (preferencia, funding)
-        return escolhidos
+        funding = _ler_funding(item, horas_da_config) if isinstance(item, dict) else None
+        if funding is None:
+            return
+        try:
+            par = normalizar(corretora, market)
+        except (TypeError, ValueError):  # market com dados que o scanner nao entende: so ele fica de fora
+            return
+        preferencia = (*prioridade_cotacao(par.cotacao), simbolo)
+        if par.ativo in escolhidos and preferencia >= escolhidos[par.ativo]:
+            return
+        escolhidos[par.ativo] = preferencia
+        self._funding[(corretora, par.ativo)] = funding
+        if horas_da_config is None and _sem_intervalo(item):
+            sem_intervalo.append(simbolo)
 
-    async def _funding_um_a_um(self, corretora: str, exchange, markets: dict) -> dict:
-        """Para corretoras sem busca em lote: pergunta o funding de cada futuro, um por vez."""
-        brutos = {}
+    def _avisar_sem_intervalo(self, corretora: str, sem_intervalo: list[str], total: int) -> None:
+        """Funding sem intervalo (ou ilegivel) vira 8h: avisa no log uma vez por corretora."""
+        if not sem_intervalo or corretora in self._sem_intervalo_avisado:
+            return
+        self._sem_intervalo_avisado.add(corretora)
+        registro.warning("%s: o intervalo do funding nao veio (ou veio num formato que o scanner nao le) em %d de %d "
+                         "contratos (ex.: %s); eles usam %dh. Se a corretora cobrar em outro intervalo, preencha "
+                         "intervalo_funding_h no config.yaml", corretora, len(sem_intervalo), total,
+                         ", ".join(sorted(sem_intervalo)[:3]), INTERVALO_FUNDING_PADRAO_H)
+
+    async def _funding_um_a_um(self, corretora: str, exchange, markets: dict, futuros: list[str], escolhidos: dict,
+                               sem_intervalo: list[str]) -> None:
+        """Para corretoras sem busca em lote: pergunta o funding de cada futuro, um por vez, e grava na hora.
+
+        Com centenas de futuros (MEXC, XT) a rodada leva minutos; gravando cada um assim que chega, o motor ja
+        tem o funding dos primeiros sem esperar o fim. Um par que falha nao atrapalha os outros (tenta de novo
+        na proxima rodada).
+        """
         falhas = []
-        simbolos = [s for s, m in markets.items() if isinstance(m, dict) and mercado_do_market(m) == "futuro"]
-        for simbolo in simbolos:
+        for simbolo in futuros:
             try:
-                brutos[simbolo] = await exchange.fetch_funding_rate(simbolo)
+                item = await exchange.fetch_funding_rate(simbolo)
             except Exception as erro:  # um par com problema nao pode atrapalhar os outros
                 falhas.append((simbolo, erro))
+                continue
+            self._gravar_funding(corretora, simbolo, markets[simbolo], item, escolhidos, sem_intervalo)
         if falhas:
             simbolo, erro = falhas[0]
             registro.warning(
                 "%s: funding indisponivel em %d de %d pares (primeiro: %s: %s: %s)",
-                corretora, len(falhas), len(simbolos), simbolo, type(erro).__name__, erro,
+                corretora, len(falhas), len(futuros), simbolo, type(erro).__name__, erro,
             )
-        return brutos
+
+    async def _buscar_volumes(self, corretora: str, exchange) -> None:
+        """Volume 24h pela API REST (fetch_tickers) dos simbolos cujo ticker nao traz volume (ex.: MEXC spot).
+
+        Os simbolos vem do estado (o coletor anota: EstadoMercados.pedir_volume_rest) e o volume volta para la.
+        Um pedido por mercado (spot e futuro). Erro vai ao log (uma vez, ate voltar) e nao atrapalha o funding.
+        """
+        if self._estado is None:
+            return
+        pedidos = sorted(self._estado.volumes_rest_pedidos(corretora))
+        if not pedidos or not (getattr(exchange, "has", None) or {}).get("fetchTickers"):
+            return
+        try:
+            for grupo in ([s for s in pedidos if ":" not in s], [s for s in pedidos if ":" in s]):
+                if not grupo:
+                    continue
+                resposta = await exchange.fetch_tickers(grupo)
+                for simbolo in grupo:
+                    dados = (resposta or {}).get(simbolo)
+                    volume = dados.get("quoteVolume") if isinstance(dados, dict) else None
+                    if _numero_valido(volume) and volume >= 0:
+                        self._estado.registrar_volume_rest(corretora, simbolo, float(volume))
+        except Exception as erro:  # rede, limite de requisicoes...: fica o volume anterior
+            if corretora not in self._volume_com_erro:
+                self._volume_com_erro.add(corretora)
+                registro.warning("%s: nao consegui o volume 24h pela API (%s: %s); os pares cujo ticker nao traz "
+                                 "volume ficam com o ultimo que chegou (o aviso nao se repete ate voltar)", corretora,
+                                 type(erro).__name__, erro)
+            return
+        if corretora in self._volume_com_erro:
+            self._volume_com_erro.discard(corretora)
+            registro.info("%s: o volume 24h pela API voltou", corretora)

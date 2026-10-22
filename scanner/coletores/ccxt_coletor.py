@@ -28,6 +28,18 @@ Fase 2 de corretoras (Task 15):
     ficou sem tickers. Nenhuma corretora fica sem tickers em silencio.
   - Simbolos de cotacao (`usar_para_cotacao`): o ticker deles tambem vai para o estado pelo simbolo
     (ex.: "USDC/USDT" da fonte_cotacao), de onde o DadosLentos tira as cotacoes.
+
+Revisao final da coleta:
+  - Livro que cai por queda de conexao (ou sequencia quebrada): antes de assinar de novo, o livro guardado
+    pelo ccxt (`exchange.orderbooks`) e esquecido. Na MEXC e na XT o ccxt so pede um livro completo novo se
+    nao tiver nenhum guardado; sem isso, as mudancas novas seriam aplicadas em cima dos niveis de antes da queda.
+  - `reassinar_livros_s`: nas corretoras cujo ccxt nao confere a sequencia do livro (MEXC e XT), cada livro e
+    assinado de novo de tempos em tempos, para um livro completo novo corrigir qualquer diferenca acumulada.
+  - `limites_assinatura_mercado`: limite por mercado (ex.: 30 na MEXC spot), dividido entre os tickers (os de
+    maior volume 24h) e os livros (`livros_reservados_limite_mercado`).
+  - Ticker sem volume 24h (ex.: bookTicker da MEXC spot): o volume vem da API REST pelos dados lentos.
+  - So entram os pares cotados em USDT, USDC, USDG ou USD (PREFERENCIA_COTACAO); EUR, GBP etc. ficam de fora.
+  - Cada mensagem mantem viva so a conexao do mercado dela (spot ou futuro).
 """
 
 import asyncio
@@ -42,11 +54,24 @@ import ccxt.pro as ccxtpro
 from ccxt.base.errors import InvalidNonce, NetworkError, NotSupported
 
 from scanner.coletores.base import DICA_LIMITE, ColetorComSaude
-from scanner.coletores.reconexao import espera_reconexao, parece_limite_de_assinatura, selecionar_pares
+from scanner.coletores.reconexao import (
+    MARGEM_PARA_TROCAR_LIVRO,
+    espera_reconexao,
+    parece_limite_de_assinatura,
+    selecionar_pares,
+)
 from scanner.config.carregar import MERCADOS, METODOS_TICKER, Config
 from scanner.estado.mercados import EstadoMercados
 from scanner.modelos import Livro, Ticker
-from scanner.normalizador import ParNormalizado, converter_livro, mercado_do_market, normalizar, prioridade_cotacao
+from scanner.normalizador import (
+    PREFERENCIA_COTACAO,
+    ParNormalizado,
+    converter_livro,
+    cotacao_usada,
+    mercado_do_market,
+    normalizar,
+    prioridade_cotacao,
+)
 
 registro = logging.getLogger("scanner.coletores")
 
@@ -236,8 +261,8 @@ class ColetorCcxt(ColetorComSaude):
         como viva e cada ticker/livro valido e guardado la, ja com o ativo normalizado e
         os precos por 1 unidade do ativo (mercados lidos de `exchange.markets`). So entram
         no estado o spot e o perpetuo linear (opcoes, futuros com vencimento e contratos
-        inversos ficam de fora) e, se um ativo tem mais de uma moeda de cotacao no mesmo
-        mercado, so a preferida (USDT, depois USDC, USDG): a chave do estado e unica.
+        inversos ficam de fora), so as moedas de cotacao de PREFERENCIA_COTACAO (USDT, USDC, USDG, USD) e,
+        se um ativo tem mais de uma no mesmo mercado, so a preferida: a chave do estado e unica.
     relogio: devolve a hora atual em segundos; os testes trocam por um relogio falso.
     timeout_desassinar_s: tempo maximo esperando a corretora confirmar o cancelamento de um
         livro (timeout_desassinar_s da Config); passou disso, avisa no log e segue.
@@ -250,6 +275,12 @@ class ColetorCcxt(ColetorComSaude):
     metodo_ticker: o metodo de ticker tentado primeiro (metodo_ticker da Config); None = a ordem de
         METODOS_DE_TICKER. Os metodos antes dele nao sao tentados.
     mensagens_sem_bid_ask: mensagens seguidas so com tickers sem bid/ask para abandonar um metodo.
+    limites_assinatura_mercado: {mercado: maximo de assinaturas} desta corretora (limites_assinatura_mercado da
+        Config), contando juntos os tickers e os livros do mercado; vazio = sem limite por mercado.
+    livros_reservados_limite_mercado: quantas assinaturas de cada limite por mercado ficam para os livros.
+    reassinar_livros_s: de quanto em quanto tempo cada livro e assinado de novo (intervalo_reassinar_livros_s, so
+        para as corretoras de reassinar_livros_corretoras); None = nunca.
+    prazo_primeiro_ticker_s: pares pedidos sem nenhum ticker neste tempo vao para um aviso no log.
 
     Livro que deixa de ser acompanhado (saiu da lista ou a assinatura caiu) sai do estado na
     hora: o ultimo livro recebido nao pode continuar valendo como se fosse atual.
@@ -274,8 +305,12 @@ class ColetorCcxt(ColetorComSaude):
         mercados: tuple[str, ...] = MERCADOS,
         metodo_ticker: str | None = None,
         mensagens_sem_bid_ask: int = Config.mensagens_sem_bid_ask,
+        limites_assinatura_mercado: dict | None = None,
+        livros_reservados_limite_mercado: int = Config.livros_reservados_limite_mercado,
+        reassinar_livros_s: float | None = None,
+        prazo_primeiro_ticker_s: float = Config.prazo_primeiro_ticker_s,
     ):
-        super().__init__(nome, estado, relogio, limite_assinaturas, espera_max_reconexao_s)
+        super().__init__(nome, estado, relogio, limite_assinaturas, espera_max_reconexao_s, prazo_primeiro_ticker_s)
         if metodo_ticker is not None and metodo_ticker not in METODOS_TICKER:
             raise ValueError(f"metodo_ticker '{metodo_ticker}' invalido; use um destes: {', '.join(METODOS_TICKER)}")
         self._exchange = exchange
@@ -305,6 +340,17 @@ class ColetorCcxt(ColetorComSaude):
         self._erro_sem_bid_ask: set[str] = set()  # mercados cujo "nenhum metodo traz bid/ask" ja saiu em ERRO
         self._avisou_mercados_fora = False  # a quantidade de pares fora de `mercados` ja foi para o log
         self._simbolos_cotacao: set[str] = set()  # simbolos cujo ticker tambem alimenta as cotacoes
+        # Revisao final.
+        self._limites_mercado: dict[str, int] = dict(limites_assinatura_mercado or {})
+        self._livros_reservados = livros_reservados_limite_mercado
+        self._tickers_no_mercado: dict[str, int] = {}  # mercado -> tickers assinados agora (limite por mercado)
+        self._fora_do_limite_mercado: dict[tuple[str, str], int] = {}  # (etapa, mercado) -> fora (ultimo aviso)
+        self._reassinar_s = reassinar_livros_s
+        self._avisou_sem_reassinar = False  # sem un_watch, a reassinatura periodica desligou (avisado uma vez)
+        # Simbolos cuja assinatura de livro morreu com a conexao: o livro guardado pelo ccxt e esquecido antes do
+        # proximo watch_order_book deles, seja na mesma tarefa (nova tentativa) ou numa nova (o par voltou a lista).
+        self._livros_a_esquecer: set[str] = set()
+        self._avisou_cotacoes_fora = False  # os pares em EUR, GBP... ja foram para o log
 
     # --- etapa 1: tickers ----------------------------------------------------
 
@@ -501,10 +547,11 @@ class ColetorCcxt(ColetorComSaude):
         pedir = getattr(self._exchange, metodo)
         mercado = mercado_do_simbolo(simbolos[0])
         conferencia = _ConferenciaBidAsk(self._max_sem_bid_ask)
+        self._comecar_conferencia_de_tickers(mercado, simbolos, self._relogio())
         while True:
             self._escolher_canal(metodo, mercado)
             tickers = await pedir(simbolos)
-            self._sem_bid_ask_demais(conferencia, *self._tratar_tickers(tickers))
+            self._sem_bid_ask_demais(conferencia, *self._tratar_tickers(tickers, mercado))
 
     async def _tickers_um_a_um(self, simbolos: list[str]) -> None:
         """Ultimo recurso: uma assinatura de ticker por simbolo.
@@ -518,6 +565,7 @@ class ColetorCcxt(ColetorComSaude):
         simbolos = await self._um_a_um_dentro_do_limite(simbolos)
         mercado = mercado_do_simbolo(simbolos[0])
         conferencia = _ConferenciaBidAsk(self._max_sem_bid_ask, simbolos_no_mercado=len(simbolos))
+        self._comecar_conferencia_de_tickers(mercado, simbolos, self._relogio())
 
         async def acompanhar(simbolo: str) -> None:
             falhas = 0  # falhas seguidas deste simbolo, sem nenhum ticker entre elas
@@ -541,7 +589,7 @@ class ColetorCcxt(ColetorComSaude):
                     await self._esperar(espera)
                     continue
                 falhas = 0
-                self._sem_bid_ask_demais(conferencia, *self._tratar_tickers({simbolo: dados}), simbolo=simbolo)
+                self._sem_bid_ask_demais(conferencia, *self._tratar_tickers({simbolo: dados}, mercado), simbolo=simbolo)
 
         tarefas = [asyncio.create_task(acompanhar(s)) for s in simbolos]
         try:
@@ -558,7 +606,7 @@ class ColetorCcxt(ColetorComSaude):
         """
         if self._limite is None or len(simbolos) <= self._limite:
             return simbolos
-        escolhidos, fora = await self._escolher_no_limite(simbolos)
+        escolhidos, fora = await self._escolher_no_limite(simbolos, self._limite)
         mercado = mercado_do_simbolo(simbolos[0])
         if self._fora_no_um_a_um.get(mercado) != fora:  # so quando muda (nao a cada reconexao)
             self._fora_no_um_a_um[mercado] = fora
@@ -567,17 +615,20 @@ class ColetorCcxt(ColetorComSaude):
                              self.nome, self._limite, mercado, fora, len(simbolos))
         return escolhidos
 
-    def _tratar_tickers(self, tickers: dict | None) -> tuple[int, int]:
-        """Uma mensagem de tickers chegou: registra a conexao e entrega cada ticker valido.
+    def _tratar_tickers(self, tickers: dict | None, mercado: str | None = None) -> tuple[int, int]:
+        """Uma mensagem de tickers chegou: registra a conexao (do `mercado`) e entrega cada ticker valido.
 
         Um ticker que da erro ao ser tratado (no estado ou no callback) e descartado sozinho: os
         outros da mensagem e as proximas mensagens seguem normalmente.
         O atraso da mensagem usa o horario mais recente que a corretora informou nela (se informou).
+        Os simbolos que vieram contam para o aviso dos pares que nunca mandaram ticker.
         Devolve (quantos tickers vieram, quantos deles com bid e ask), para a troca automatica de metodo.
         """
         agora = self._relogio()
-        self._registrar_mensagem(agora)
+        self._registrar_mensagem(agora, mercado)
         self._chegou_ticker(agora)
+        if mercado is not None:
+            self._anotar_tickers_recebidos(mercado, (tickers or {}).keys(), agora)
         mais_recente = None  # maior horario (ms) informado pela corretora nesta mensagem
         total = com_bid_ask = 0
         for simbolo, dados in (tickers or {}).items():
@@ -605,28 +656,94 @@ class ColetorCcxt(ColetorComSaude):
         return total, com_bid_ask
 
     async def _tickers_dentro_do_limite(self, simbolos: list[str]) -> list[str]:
-        """Os simbolos de ticker que cabem no limite de assinaturas (os de maior volume 24h).
+        """Os simbolos de ticker que cabem nos limites de assinaturas (os de maior volume 24h).
 
-        So vale para corretora que assina um ticker por vez (so tem watch_ticker): nas outras um pedido
-        so traz todos os pares. O volume vem do estado e, para os pares que ainda nao tem ticker (ex.: ao
-        ligar), da API REST (fetch_tickers), uma vez por (re)inicio do stream.
+        Primeiro o limite por mercado (limites_assinatura_mercado), que vale para qualquer metodo de ticker:
+        cada par conta uma assinatura (ex.: o watch_bids_asks da MEXC spot assina um stream por par). Os
+        tickers ficam com o limite menos livros_reservados_limite_mercado; o resto fica para os livros.
+        Depois o limite da corretora (limites_assinatura), que so vale para corretora que assina um ticker por
+        vez (so tem watch_ticker): nas outras um pedido so traz todos os pares. O volume vem do estado e, para
+        os pares que ainda nao tem ticker (ex.: ao ligar), da API REST (fetch_tickers), uma vez por (re)inicio.
         """
+        simbolos = await self._tickers_no_limite_do_mercado(simbolos)
         if self._limite is None or len(simbolos) <= self._limite or not self._so_ticker_um_a_um():
             self._avisar_limite("tickers", 0, len(simbolos))
             return simbolos
-        escolhidos, fora = await self._escolher_no_limite(simbolos)
+        escolhidos, fora = await self._escolher_no_limite(simbolos, self._limite)
         self._avisar_limite("tickers", fora, len(simbolos))
         return escolhidos
 
-    async def _escolher_no_limite(self, simbolos: list[str]) -> tuple[list[str], int]:
-        """(os simbolos de ticker que cabem no limite de assinaturas, quantos ficaram de fora).
+    async def _tickers_no_limite_do_mercado(self, simbolos: list[str]) -> list[str]:
+        """Os simbolos de ticker de cada mercado com limite por mercado, cortados ao que cabe (veja acima)."""
+        self._tickers_no_mercado = {}
+        if not self._limites_mercado:
+            return simbolos
+        resultado = []
+        for grupo in _agrupar_por_mercado(simbolos):
+            mercado = mercado_do_simbolo(grupo[0])
+            limite = self._limites_mercado.get(mercado)
+            if limite is not None:
+                vagas = max(1, limite - self._livros_reservados)
+                total, fora = len(grupo), 0
+                if total > vagas:
+                    grupo, fora = await self._escolher_no_limite(grupo, vagas)
+                self._avisar_limite_do_mercado("tickers", mercado, limite, fora, total)
+            self._tickers_no_mercado[mercado] = len(grupo)
+            resultado.extend(grupo)
+        return resultado
+
+    def _avisar_limite_do_mercado(self, etapa: str, mercado: str, limite: int, fora: int, total: int) -> None:
+        """Registra quantos pares ficaram fora do limite por mercado, so quando esse numero muda."""
+        if self._fora_do_limite_mercado.get((etapa, mercado), 0) == fora:
+            return
+        self._fora_do_limite_mercado[(etapa, mercado)] = fora
+        if not fora:
+            registro.info("%s: todos os %s do %s cabem de novo no limite de %d assinaturas "
+                          "(limites_assinatura_mercado)", self.nome, etapa, mercado, limite)
+        elif etapa == "tickers":
+            registro.warning("%s: limite de %d assinaturas no %s (limites_assinatura_mercado), %d delas para os "
+                             "livros: %d de %d pares ficaram fora dos tickers (os de menor volume 24h)", self.nome,
+                             limite, mercado, self._livros_reservados, fora, total)
+        else:
+            registro.warning("%s: limite de %d assinaturas no %s (limites_assinatura_mercado), com %d tickers: %d de "
+                             "%d livros pedidos ficaram de fora (os de menor volume 24h)", self.nome, limite, mercado,
+                             self._tickers_no_mercado.get(mercado, 0), fora, total)
+
+    def _livros_no_limite_do_mercado(self, desejados: set[str]) -> set[str]:
+        """Em cada mercado com limite por mercado, os livros ficam com o que os tickers do mercado nao usam.
+
+        Ficam os de maior volume 24h, com preferencia aos ja abertos (a mesma histerese do limite da corretora).
+        Chamada pelo _livros_dentro_do_limite da base, antes do limite da corretora (limites_assinatura).
+        """
+        if not self._limites_mercado:
+            return desejados
+        por_mercado: dict[str, list[str]] = {}
+        for simbolo in sorted(desejados):
+            por_mercado.setdefault(mercado_do_simbolo(simbolo), []).append(simbolo)
+        resultado: set[str] = set()
+        for mercado in set(por_mercado) | set(self._limites_mercado):
+            simbolos = por_mercado.get(mercado, [])
+            limite = self._limites_mercado.get(mercado)
+            if limite is None:
+                resultado.update(simbolos)
+                continue
+            vagas = max(0, limite - self._tickers_no_mercado.get(mercado, 0))
+            volumes = {s: v for s in simbolos if (v := self._volume_conhecido(s)) is not None}
+            escolhidos, fora = selecionar_pares(simbolos, volumes, vagas, abertos=self._livros_abertos(),
+                                                margem=MARGEM_PARA_TROCAR_LIVRO)
+            self._avisar_limite_do_mercado("livros", mercado, limite, fora, len(simbolos))
+            resultado.update(escolhidos)
+        return resultado
+
+    async def _escolher_no_limite(self, simbolos: list[str], limite: int) -> tuple[list[str], int]:
+        """(os simbolos de ticker que cabem em `limite` assinaturas, quantos ficaram de fora).
 
         Os pares de cotacao (usar_para_cotacao, ex.: USDC/USDT na fonte) ficam SEMPRE: sem eles as cotacoes
         param. O limite corta so o resto, pelo maior volume 24h, e conta os de cotacao no total.
         """
         fixos = [s for s in simbolos if s in self._simbolos_cotacao]
         outros = [s for s in simbolos if s not in self._simbolos_cotacao]
-        escolhidos, fora = selecionar_pares(outros, await self._volumes_dos_tickers(outros), self._limite - len(fixos))
+        escolhidos, fora = selecionar_pares(outros, await self._volumes_dos_tickers(outros), limite - len(fixos))
         return fixos + escolhidos, fora
 
     def _so_ticker_um_a_um(self) -> bool:
@@ -670,7 +787,8 @@ class ColetorCcxt(ColetorComSaude):
         """Volume 24h do simbolo: o do ticker guardado no estado (o mais novo) ou o ultimo que o coletor viu.
 
         O ultimo visto fica no coletor e sobrevive a queda (marcar_desconectada apaga o estado): assim a
-        reconexao nao precisa perguntar o volume a API REST de novo.
+        reconexao nao precisa perguntar o volume a API REST de novo. Ticker sem volume (ex.: MEXC spot): o
+        volume que os dados lentos trouxeram pela API REST.
         """
         if self._estado is not None:
             self._indexar_se_preciso()
@@ -680,11 +798,28 @@ class ColetorCcxt(ColetorComSaude):
                 volume = None if ticker is None else _numero_ou_none(ticker.get("volume_24h_usd"))
                 if volume is not None:
                     return volume
+            volume = self._estado.volume_rest(self.nome, simbolo)
+            if volume is not None:
+                return volume
         return self._volumes_conhecidos.get(simbolo)
 
+    def _volume_sem_o_ticker(self, simbolo: str) -> float | None:
+        """O ticker veio sem volume 24h: pede o volume aos dados lentos (API REST) e usa o ultimo que chegou.
+
+        Sem nenhum pela REST ainda, usa o que o coletor perguntou a API ao escolher os pares no limite (se perguntou).
+        """
+        if self._estado is None:
+            return None
+        self._estado.pedir_volume_rest(self.nome, simbolo)
+        volume = self._estado.volume_rest(self.nome, simbolo)
+        return volume if volume is not None else self._volumes_conhecidos.get(simbolo)
+
     def _entregar_ticker(self, ticker: Ticker) -> None:
-        if ticker.volume_24h_usd is not None:
-            self._volumes_conhecidos[ticker.simbolo_original] = ticker.volume_24h_usd
+        volume = ticker.volume_24h_usd
+        if volume is not None:
+            self._volumes_conhecidos[ticker.simbolo_original] = volume
+        else:
+            volume = self._volume_sem_o_ticker(ticker.simbolo_original)  # ex.: bookTicker da MEXC spot
         if self._estado is not None:
             if ticker.simbolo_original in self._simbolos_cotacao:
                 # Par de cotacao (ex.: USDC/USDT na fonte_cotacao): guardado pelo simbolo, com o preco cru. Ele
@@ -699,7 +834,7 @@ class ColetorCcxt(ColetorComSaude):
                 self._estado.atualizar_ticker(
                     self.nome, ticker.mercado, par.ativo,
                     ticker.bid / par.multiplicador, ticker.ask / par.multiplicador,
-                    ticker.recebido_em, ticker.volume_24h_usd, ticker.variacao_24h_pct,
+                    ticker.recebido_em, volume, ticker.variacao_24h_pct,
                     simbolo_original=ticker.simbolo_original, cotacao=par.cotacao,
                 )
         if self._ao_ticker is not None:
@@ -764,21 +899,26 @@ class ColetorCcxt(ColetorComSaude):
         """Os livros abertos agora (preferencia no limite de assinaturas da base)."""
         return set(self._tarefas_livro)
 
-    async def _desassinar_livro(self, simbolo: str) -> None:
+    async def _desassinar_livro(self, simbolo: str) -> bool:
         """Pede ao ccxt para largar a assinatura do livro do simbolo. Erro vai para o log, nunca sobe.
 
         Verifica o metodo e nao `exchange.has`: a Bitget tem `un_watch_order_book` mas `has` diz None.
         O ccxt base levanta NotSupported nas corretoras sem suporte; nesse caso avisa uma vez e para de tentar.
         Espera a confirmacao da corretora no maximo `timeout_desassinar_s`: sem resposta, avisa e segue
         (a tarefa local ja foi cancelada e o livro ja saiu do estado).
+        Cancelada a assinatura, nenhuma mudanca velha chega mais: o livro guardado pelo ccxt e esquecido (a
+        proxima assinatura do par comeca de um livro completo novo; veja _esquecer_livro_do_ccxt).
+        Devolve True se o ccxt aceitou o cancelamento (sem erro e dentro do prazo).
         """
         metodo = getattr(self._exchange, "un_watch_order_book", None)
         if metodo is None or self._sem_un_watch:
-            return
+            return False
         prazo = asyncio.timeout(self._timeout_desassinar_s)
         try:
             async with prazo:
                 await metodo(simbolo)
+            self._esquecer_livro_do_ccxt(simbolo)
+            return True
         except TimeoutError as erro:
             if prazo.expired():  # foi o nosso tempo maximo que acabou
                 registro.warning("%s %s: a corretora nao confirmou o cancelamento do livro em %ss; seguindo sem "
@@ -794,6 +934,7 @@ class ColetorCcxt(ColetorComSaude):
         except Exception as erro:  # rede, timeout...: o par ja saiu da lista, so registra
             registro.warning("%s %s: nao consegui cancelar a assinatura do livro (un_watch_order_book: %s: %s)",
                              self.nome, simbolo, type(erro).__name__, erro)
+        return False
 
     async def fechar(self) -> None:
         """Para tudo (livros e tickers em andamento) e fecha a corretora no ccxt (libera as conexoes).
@@ -816,13 +957,20 @@ class ColetorCcxt(ColetorComSaude):
         (sair da lista cancela esta tarefa, inclusive no meio da espera). Um livro bom volta a espera a 1s.
         Sequencia quebrada pede o livro de novo na hora, sem traceback (e esperado); so espera se quebrar
         outra vez antes de chegar um livro bom. Traceback no log so na primeira falha do simbolo.
+        Queda de conexao (inclui sequencia quebrada e checksum, que no ccxt tambem sao erros de rede): antes de
+        assinar de novo, o livro guardado pelo ccxt e esquecido (veja _esquecer_livro_do_ccxt). Com reassinar_livros_s,
+        o livro e assinado de novo depois desse tempo (veja _reassinar_livro).
         """
         falhas = 0  # falhas seguidas que esperaram, sem nenhum livro bom entre elas
         reassinou_na_hora = False  # a sequencia quebrou e o livro ja foi pedido de novo sem esperar
         try:
             while True:
+                if simbolo in self._livros_a_esquecer:  # a conexao do livro caiu (nesta tarefa ou numa anterior)
+                    self._livros_a_esquecer.discard(simbolo)
+                    self._esquecer_livro_do_ccxt(simbolo)
                 try:
-                    await self._acompanhar_livro(simbolo)
+                    if await self._acompanhar_livro(simbolo, ate=self._prazo_para_reassinar()):
+                        await self._reassinar_livro(simbolo)  # passou o intervalo: o livro e assinado de novo
                 except Exception as erro:  # cancelamento nao entra aqui (nao e Exception)
                     if self._tarefas_livro.get(simbolo) is not asyncio.current_task():
                         return  # outra tarefa ja cuida deste simbolo: esta so termina, sem mexer no livro dela
@@ -839,6 +987,13 @@ class ColetorCcxt(ColetorComSaude):
                     else:
                         espera = espera_reconexao(falhas, self._espera_max_s)
                         falhas += 1
+                    # So na queda de conexao (o ccxt rejeita tudo da conexao morta com um erro de rede; sequencia
+                    # quebrada e checksum tambem sao erros de rede no ccxt, e nesses o ccxt ja largou a assinatura).
+                    # Com a conexao viva (par recusado, defeito do scanner) o livro do ccxt fica: na Kraken a proxima
+                    # mudanca daria KeyError dentro do ccxt e derrubaria a leitura da conexao inteira. Fica anotado
+                    # por simbolo: se o par sair da lista durante a espera, a proxima assinatura dele tambem esquece.
+                    if _erro_de_conexao(erro):
+                        self._livros_a_esquecer.add(simbolo)
                     self._registrar_falha_do_livro(simbolo, erro, espera)
                     if espera > 0:
                         await self._esperar(espera)
@@ -870,13 +1025,17 @@ class ColetorCcxt(ColetorComSaude):
         registro.warning("%s %s: livro parou (%s: %s); tentando de novo em %gs enquanto o par continuar na lista.%s",
                          self.nome, simbolo, type(erro).__name__, erro, espera, dica, exc_info=primeira)
 
-    async def _acompanhar_livro(self, simbolo: str) -> None:
-        """Repete para sempre: espera o livro mudar e entrega o livro novo, se for valido."""
+    async def _acompanhar_livro(self, simbolo: str, ate: float | None = None) -> bool:
+        """Repete: espera o livro mudar e entrega o livro novo, se for valido.
+
+        ate: horario (do relogio) a partir do qual o livro deve ser assinado de novo; o primeiro livro que chega
+        depois dele e entregue e a funcao devolve True. None = repete para sempre.
+        """
         mercado = mercado_do_simbolo(simbolo)
         while True:
             ob = await self._exchange.watch_order_book(simbolo)
             agora = self._relogio()
-            self._registrar_mensagem(agora)  # vale ate para livro que sera descartado: a conexao esta viva
+            self._registrar_mensagem(agora, mercado)  # vale ate para livro que sera descartado: a conexao esta viva
             livro = livro_de_ccxt(self.nome, mercado, simbolo, ob, agora)
             if livro is None:
                 self._descartes["livros"] += 1
@@ -886,6 +1045,42 @@ class ColetorCcxt(ColetorComSaude):
                 self._registrar_atraso(agora, livro.ts_corretora)
             self._entregar_livro(livro)
             self._livros_que_chegaram.add(simbolo)
+            if ate is not None and agora >= ate:
+                return True
+
+    def _esquecer_livro_do_ccxt(self, simbolo: str) -> None:
+        """Apaga o livro que o ccxt guarda do simbolo (`exchange.orderbooks`), para a assinatura nova comecar do zero.
+
+        Na MEXC futuros e na XT o ccxt so pede um livro completo novo (snapshot) quando nao tem livro guardado;
+        com o livro de antes da queda guardado, as mudancas novas seriam aplicadas por cima dos niveis velhos (que
+        ficariam para sempre). So pode ser chamada sem nenhuma assinatura viva do livro (veja quem chama).
+        """
+        livros = getattr(self._exchange, "orderbooks", None)
+        if isinstance(livros, dict):
+            livros.pop(simbolo, None)
+
+    def _prazo_para_reassinar(self) -> float | None:
+        """Quando o livro que esta sendo assinado agora deve ser assinado de novo (None = nunca)."""
+        if self._reassinar_s is None or self._sem_un_watch:
+            return None
+        return self._relogio() + self._reassinar_s
+
+    async def _reassinar_livro(self, simbolo: str) -> None:
+        """Assina o livro de novo (reassinar_livros_corretoras): cancela, esquece o livro do ccxt e o proximo
+        watch_order_book recomeca com um livro completo novo.
+
+        O ccxt da MEXC e da XT nao confere a sequencia das mudancas do livro: uma mudanca perdida deixaria um nivel
+        errado para sempre. Enquanto o livro novo nao chega, o par fica sem livro (o anterior sai do estado: deixou
+        de ser acompanhado). Sem un_watch_order_book (ou se o cancelamento falhar), o livro do ccxt nao e apagado
+        (a assinatura antiga pode continuar viva) e o mesmo livro segue; sem un_watch, a reassinatura desliga.
+        """
+        self._remover_livro_do_estado(simbolo)
+        if await self._desassinar_livro(simbolo):  # cancelada: o livro do ccxt ja foi esquecido
+            registro.debug("%s %s: livro assinado de novo (reassinar_livros_corretoras)", self.nome, simbolo)
+        elif self._sem_un_watch and not self._avisou_sem_reassinar:
+            self._avisou_sem_reassinar = True
+            registro.warning("%s: sem un_watch_order_book no ccxt, os livros nao sao assinados de novo de tempos em "
+                             "tempos (reassinar_livros_corretoras); seguem com a assinatura atual", self.nome)
 
     def _entregar_livro(self, livro: Livro) -> None:
         if self._estado is not None:
@@ -963,8 +1158,10 @@ class ColetorCcxt(ColetorComSaude):
         """Escolhe, para cada (mercado, ativo), o unico simbolo que alimenta o estado.
 
         A escolha olha todos os markets da corretora, e nao so os simbolos pedidos, para nao mudar
-        conforme a lista de pares: vence a moeda preferida (USDT, USDC, USDG, as outras) e, se a
+        conforme a lista de pares: vence a moeda preferida (USDT, USDC, USDG, USD) e, se a
         moeda for a mesma (ex.: "1000PEPE" e "PEPE"), o simbolo que vem primeiro em ordem alfabetica.
+        So entram as moedas de cotacao de PREFERENCIA_COTACAO: as outras (EUR, GBP...) nao tem cotacao em USDT
+        e viriam 1:1 (o GBP vale ~1,27 USDT: um spread falso de ~27%). O log mostra quantos ficaram de fora, uma vez.
 
         Um market com dados que o scanner nao entende (ex.: tamanho de contrato em texto) e pulado,
         com um aviso no log (uma vez por simbolo), sem atrapalhar os outros. Market inativo
@@ -974,6 +1171,7 @@ class ColetorCcxt(ColetorComSaude):
         """
         melhores: dict[tuple[str, str], tuple[tuple, str, ParNormalizado]] = {}
         fora_dos_mercados = Counter()  # mercado fora de `mercados` -> quantos markets ficaram de fora
+        outras_cotacoes = Counter()  # moeda de cotacao fora de PREFERENCIA_COTACAO -> quantos markets
         for simbolo, market in markets.items():
             try:
                 mercado = mercado_do_market(market)
@@ -981,6 +1179,9 @@ class ColetorCcxt(ColetorComSaude):
                     continue
                 if mercado not in self._mercados:
                     fora_dos_mercados[mercado] += 1
+                    continue
+                if not cotacao_usada(market["quote"]):
+                    outras_cotacoes[str(market["quote"])] += 1
                     continue
                 if market.get("active") is False:  # suspenso ou saindo da corretora (o ccxt ainda lista)
                     if simbolo not in self._avisados:
@@ -1006,6 +1207,12 @@ class ColetorCcxt(ColetorComSaude):
             registro.info("%s: usando so %s (mercados_por_corretora); ficam de fora %s", self.nome,
                           " e ".join(self._mercados),
                           ", ".join(f"{n} pares de {m}" for m, n in sorted(fora_dos_mercados.items())))
+        if outras_cotacoes and not self._avisou_cotacoes_fora:
+            self._avisou_cotacoes_fora = True
+            registro.warning("%s: %d pares cotados em outras moedas ficam de fora (%s): o scanner so compara precos em "
+                             "%s, que tem cotacao em USDT", self.nome, sum(outras_cotacoes.values()),
+                             ", ".join(f"{moeda} {n}" for moeda, n in sorted(outras_cotacoes.items())),
+                             ", ".join(PREFERENCIA_COTACAO))
 
     def _motivo_fora_do_estado(self, simbolo: str, market: dict | None) -> str:
         """Texto para o log: por que os dados deste simbolo nao vao para o estado."""
@@ -1019,10 +1226,15 @@ class ColetorCcxt(ColetorComSaude):
                     f"(usando so {', '.join(self._mercados)})")
         if not market.get("base") or not market.get("quote"):
             return "mercado sem base ou cotacao nos markets do ccxt"
+        if not cotacao_usada(market["quote"]):
+            return (f"cotado em {market['quote']}, que o scanner nao usa (so {', '.join(PREFERENCIA_COTACAO)}, que "
+                    "tem cotacao em USDT)")
+        if market.get("active") is False:
+            return "mercado inativo na corretora (active=False no ccxt)"
         par = normalizar(self.nome, market)
         vencedor = self._vencedor_da_chave.get((mercado, par.ativo), "outro simbolo")
         return (f"mercado descartado: {vencedor} ja ocupa o lugar de {par.ativo} no {mercado} "
-                f"(preferencia: cotacao USDT > USDC > USDG; mesma cotacao: ordem do simbolo)")
+                f"(preferencia: cotacao {' > '.join(PREFERENCIA_COTACAO)}; mesma cotacao: ordem do simbolo)")
 
     @staticmethod
     async def _cancelar(tarefas: list[asyncio.Task]) -> None:

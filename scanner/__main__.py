@@ -126,7 +126,8 @@ class _Tickers:
 
     A recarga da lista de mercados e a corretora que entra depois usam isto para reiniciar so as
     corretoras cuja lista mudou. `trava`: so um ajuste das listas por vez (veja _ajustar_tickers).
-    `cotacao`: o DadosLentos que escolhe os pares de cotacao que entram nas listas (None = nenhum).
+    `cotacao`: o DadosLentos que escolhe os pares de cotacao que entram nas listas (None = nenhum). Ele
+    tambem fica sabendo de cada lista (usar_simbolos): o funding so e perguntado dos simbolos em uso.
     """
 
     def __init__(self, coletores: dict[str, ColetorDoScanner], cotacao: DadosLentos | None = None):
@@ -147,6 +148,8 @@ class _Tickers:
         else:
             anterior = None
         self.simbolos[nome] = list(simbolos)
+        if self.cotacao is not None:
+            self.cotacao.usar_simbolos(nome, simbolos)
         self.tarefas[nome] = asyncio.create_task(
             self._comecar(self._coletores[nome], list(simbolos), anterior), name=f"tickers {nome}"
         )
@@ -165,6 +168,8 @@ class _Tickers:
     async def parar(self, nome: str) -> None:
         """Para os tickers da corretora `nome` e espera a tarefa terminar de verdade."""
         self.simbolos.pop(nome, None)
+        if self.cotacao is not None:
+            self.cotacao.usar_simbolos(nome, [])
         tarefa = self.tarefas.pop(nome, None)
         if tarefa is not None:
             tarefa.cancel()
@@ -176,16 +181,24 @@ async def _recarregar_mercados(exchanges: dict, coletores: dict[str, ColetorDoSc
     """Recarrega a lista de mercados de todas as corretoras (especificacao, secao 8: mudancas nas corretoras).
 
     load_markets(reload=True) em todas ao mesmo tempo; a que falhar vai para o log e segue com a lista
-    anterior. Depois ajusta os tickers de todas (veja _ajustar_tickers).
+    anterior. Cada corretora que recarregou ajusta os tickers logo em seguida (veja _ajustar_tickers), sem
+    esperar as outras: o ccxt confere os simbolos a cada pedido, e o stream que continuasse pedindo um par que
+    acabou de sair daria BadSymbol, tratado como queda (corretora apagada do estado, sinais encerrados).
+    Um erro no ajuste de uma corretora vai para o log e nao impede o das outras.
     """
-    nomes = list(coletores)
-    resultados = await asyncio.gather(*(exchanges[n].load_markets(reload=True) for n in nomes),
-                                      return_exceptions=True)
-    for nome, resultado in zip(nomes, resultados):
-        if isinstance(resultado, Exception):
+    async def recarregar(nome: str) -> None:
+        try:
+            await exchanges[nome].load_markets(reload=True)
+        except Exception as erro:
             registro.warning("%s: nao consegui recarregar a lista de mercados (%s: %s); sigo com a lista anterior",
-                             nome, type(resultado).__name__, resultado)
-    await _ajustar_tickers(coletores, tickers, estado)
+                             nome, type(erro).__name__, erro)
+            return
+        try:
+            await _ajustar_tickers(coletores, tickers, estado)
+        except Exception:
+            registro.exception("%s: erro ao ajustar os tickers depois de recarregar a lista de mercados", nome)
+
+    await asyncio.gather(*(recarregar(nome) for nome in list(coletores)))
 
 
 async def _ajustar_tickers(coletores: dict[str, ColetorDoScanner], tickers: _Tickers, estado: EstadoMercados) -> None:
@@ -543,6 +556,12 @@ async def rodar(
                 mercados=cfg.mercados_da_corretora(nome),
                 metodo_ticker=cfg.metodo_ticker.get(nome),
                 mensagens_sem_bid_ask=cfg.mensagens_sem_bid_ask,
+                # Revisao final da coleta: limite por mercado, reassinatura dos livros e aviso dos pares sem ticker.
+                limites_assinatura_mercado=cfg.limites_assinatura_mercado.get(nome, {}),
+                livros_reservados_limite_mercado=cfg.livros_reservados_limite_mercado,
+                reassinar_livros_s=(cfg.intervalo_reassinar_livros_s if nome in cfg.reassinar_livros_corretoras
+                                    else None),
+                prazo_primeiro_ticker_s=cfg.prazo_primeiro_ticker_s,
             )
 
         for nome in carregadas:

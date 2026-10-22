@@ -16,11 +16,14 @@
 #     futuro, porque o ccxt 4.5.89 nao traz bid/ask no spot da XT. XT so futuro e um desvio da secao 2 (XT spot
 #     e futuros) ainda sem aprovacao: confirme com o dono.
 #   metodo_ticker: o padrao e tentar watch_tickers primeiro; hyperliquid usa watch_ticker porque o lote dela
-#     (allMids) nao traz bid/ask.
+#     (allMids) nao traz bid/ask; kraken usa watch_bids_asks (o ticker dela so muda a cada negocio; o
+#     watch_bids_asks muda a cada mudanca do melhor bid/ask e continua trazendo o volume).
 #   fontes_cotacao: o padrao e vazio; aqui USD: kraken (os futuros da Kraken cotam em USD e a cotacao vem do
 #     par spot USDT/USD da propria Kraken).
 #   intervalo_funding_h: o padrao e o intervalo que o ccxt informa (ou 8h); aqui hyperliquid: 1 e lighter: 1
 #     (as duas cobram de hora em hora).
+#   limites_assinatura_mercado: o padrao e vazio (sem limite por mercado); aqui mexc spot: 30, o limite que a
+#     MEXC documenta para o spot ("One ws connection supports a maximum of 30 subscriptions").
 
 # Corretoras ligadas, uma por linha com "- ". Nomes aceitos: mexc, gate, bitget, bingx, xt, hyperliquid,
 #   kraken (Kraken Pro spot), krakenfutures (Kraken Pro futuros, perpetuos em USD), lighter (Lighter principal,
@@ -157,8 +160,12 @@ mercados_por_corretora:
 #   o scanner passa ao seguinte sozinho (o log avisa). Unidade: corretora: metodo. Padrao: {} (cada corretora
 #   tenta nessa ordem). Quando mexer: raramente.
 #   hyperliquid: o watch_tickers dela (allMids) so traz o preco medio, sem bid/ask.
+#   kraken: o watch_tickers dela so manda o ticker quando ha negocio (par pouco negociado fica com bid/ask velho
+#     e sai da etapa 1); o watch_bids_asks assina o mesmo canal com o gatilho bbo: manda a cada mudanca do melhor
+#     bid/ask, com o volume e a variacao do dia (conferido no codigo do ccxt 4.5.89).
 metodo_ticker:
   hyperliquid: watch_ticker
+  kraken: watch_bids_asks
 # Quantas mensagens seguidas de tickers sem bid/ask (sem nenhum ticker bom antes) fazem o scanner trocar de
 #   metodo de ticker (na Lighter: passar a etapa 1 para os livros). Unidade: mensagens (inteiro). Padrao: 10.
 #   Quando mexer: raramente.
@@ -221,6 +228,32 @@ dias_logs: 30
 #   intervalo o banco grava o atraso e as reconexoes de cada corretora para a validacao. Unidade: segundos.
 #   Padrao: 300 (5 minutos). Quando mexer: raramente.
 intervalo_log_recursos_s: 300
+# Maximo de assinaturas por corretora e mercado, contando juntos os tickers (etapa 1) e os livros (etapa 2) do
+#   mesmo mercado, que usam a mesma conexao. Vale para qualquer metodo de ticker (o watch_bids_asks da MEXC spot
+#   assina um par por vez). Os tickers ficam com o limite menos livros_reservados_limite_mercado (os pares de
+#   maior volume 24h); os livros, com o que sobrar. Unidade: corretora: {mercado: assinaturas (inteiro)}.
+#   Padrao: {} (sem limite por mercado). Quando mexer: se o log avisar "nunca mandaram ticker" ou "parece de
+#   limite de assinaturas" numa corretora que limita por conexao.
+#   mexc spot: 30 e o limite da documentacao da MEXC (spot v3, websocket). Com ele, so 20 pares da MEXC spot
+#     ficam na etapa 1 (os de maior volume) e 10 livros; o log diz quantos ficaram de fora.
+limites_assinatura_mercado:
+  mexc:
+    spot: 30
+# Quantas assinaturas de cada limite de limites_assinatura_mercado ficam reservadas para os livros (etapa 2); o
+#   resto fica para os tickers. Precisa ser menor que cada limite. Unidade: assinaturas (inteiro). Padrao: 10.
+#   Quando mexer: aumente se o log disser que livros pedidos ficaram de fora do limite por mercado.
+livros_reservados_limite_mercado: 10
+# Corretoras cujos livros sao assinados de novo de tempos em tempos: o ccxt delas nao confere a sequencia das
+#   mudancas do livro (MEXC e XT), e um livro completo novo corrige qualquer diferenca. Pode listar corretora
+#   desligada. Unidade: lista de nomes. Padrao: [mexc, xt]. Quando mexer: raramente.
+reassinar_livros_corretoras: [mexc, xt]
+# De quanto em quanto tempo cada livro dessas corretoras e assinado de novo. Enquanto o livro novo nao chega
+#   (alguns segundos; mais num par pouco negociado), o par fica sem livro e o sinal dele pode sumir e voltar.
+#   Unidade: segundos. Padrao: 900 (15 minutos). Quando mexer: raramente.
+intervalo_reassinar_livros_s: 900
+# Pares pedidos que nao mandam nenhum ticker neste tempo depois de (re)abrir os tickers vao para um aviso no log
+#   ("X de Y pares pedidos ... nunca mandaram ticker"). Unidade: segundos. Padrao: 60. Quando mexer: raramente.
+prazo_primeiro_ticker_s: 60
 
 # Lighter principal: endereco da API REST (lista de mercados). Unidade: endereco https://. Padrao: o oficial
 #   abaixo. Quando mexer: so se a Lighter mudar o endereco.
@@ -259,6 +292,11 @@ mudancas_sem_livro_completo_lighter: 10
 #   e tudo ou nada: com alguns pares sempre com bid/ask e outros sempre sem, nao troca. Unidade: segundos.
 #   Padrao: 300. Quando mexer: raramente.
 tempo_min_modo_etapa1_lighter_s: 300
+# Intervalo minimo entre duas montagens do livro de um par da Lighter (as mudancas que chegam no meio entram na
+#   montagem seguinte; a ultima nunca se perde). Poupa CPU quando a etapa 1 vem dos livros. Unidade: ms.
+#   Padrao: 100. Quando mexer: aumente se a CPU da linha "recursos:" ficar alta com a Lighter; 0 = monta a cada
+#   mensagem.
+intervalo_montar_livro_lighter_ms: 100
 
 # Painel web: endereco, porta, usuario e senha (cada item explicado abaixo). Unidade: bloco com 4 itens.
 #   Padrao: os valores abaixo.

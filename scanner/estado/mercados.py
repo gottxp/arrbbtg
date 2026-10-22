@@ -6,6 +6,14 @@ silenciosa ou quando o dado ficou parado alem do limite.
 
 Aqui fica tambem a saude de cada corretora, mostrada no painel (`saude`): conectada, reconectando
 ou atrasada, o atraso medio dos dados e quantas vezes ela reconectou.
+
+Conexao viva por mercado (revisao final): o spot e o futuro de uma corretora costumam ter conexoes
+WebSocket separadas. A mensagem registrada com o mercado so mantem vivo aquele mercado; a registrada sem
+mercado (conexao unica, ex.: Lighter) vale para a corretora toda.
+
+Volume 24h pela API REST (revisao final): o ticker de algumas corretoras nao traz volume (ex.: bookTicker da
+MEXC spot). O coletor anota esses simbolos (`pedir_volume_rest`), os dados lentos buscam o volume pela REST
+(`registrar_volume_rest`) e o coletor usa esse volume no ticker (`volume_rest`). E dado lento: nao some na queda.
 """
 
 import logging
@@ -28,7 +36,8 @@ class EstadoMercados:
     """Guarda, por corretora, o horario da ultima mensagem e o ultimo ticker e livro de cada par.
 
     max_silencio_s: maximo de segundos sem NENHUMA mensagem da corretora (o stream de
-        tickers serve de heartbeat) antes de ela ser tratada como atrasada.
+        tickers serve de heartbeat) antes de ela ser tratada como atrasada. Para o livro e o ticker de um
+        mercado conta so a mensagem daquele mercado (ou a sem mercado; veja conexao_viva).
     max_idade_livro_s: maximo de segundos que um livro (ou ticker) pode ficar parado.
         O WebSocket so manda quando o livro muda, entao parado ainda vale ate aqui.
     atraso_max_valido_s: atraso (chegada - horario informado pela corretora) acima disto, para
@@ -46,7 +55,8 @@ class EstadoMercados:
         self._max_silencio_s = max_silencio_s
         self._max_idade_livro_s = max_idade_livro_s
         self._atraso_max_valido_s = atraso_max_valido_s
-        self._ultima_mensagem: dict[str, float] = {}  # corretora -> horario da ultima mensagem
+        self._ultima_mensagem: dict[str, float] = {}  # corretora -> ultima mensagem sem mercado (vale para todos)
+        self._ultima_do_mercado: dict[tuple[str, str], float] = {}  # (corretora, mercado) -> ultima mensagem
         self._livros: dict[tuple[str, str, str], Livro] = {}
         self._tickers: dict[tuple[str, str, str], dict] = {}
         self._cotacoes: dict[tuple[str, str], dict] = {}  # (corretora, simbolo) -> ticker do par de cotacao
@@ -56,12 +66,22 @@ class EstadoMercados:
         self._nunca_conectou: set[str] = set()  # esperando a primeira conexao: ela nao conta como reconexao
         self._atrasos: dict[str, deque] = {}  # corretora -> blocos [numero do bloco, soma dos atrasos, quantidade]
         self._avisados_relogio: set[str] = set()  # corretoras ja avisadas de relogio errado (uma vez cada)
+        # Volume 24h pela API REST (dado lento, nao e apagado na queda).
+        self._volumes_rest: dict[tuple[str, str], float] = {}  # (corretora, simbolo) -> volume 24h
+        self._volumes_pedidos: dict[str, set[str]] = {}  # corretora -> simbolos cujo ticker nao traz volume
 
     # --- escrita (coletores) -------------------------------------------------
 
-    def registrar_mensagem(self, corretora: str, agora: float) -> None:
-        """Anota que a corretora mandou alguma mensagem agora (ticker, livro ou heartbeat)."""
-        self._ultima_mensagem[corretora] = agora
+    def registrar_mensagem(self, corretora: str, agora: float, mercado: str | None = None) -> None:
+        """Anota que a corretora mandou alguma mensagem agora (ticker, livro ou heartbeat).
+
+        mercado: "spot" ou "futuro" quando a mensagem veio da conexao daquele mercado; so mantem ele vivo.
+        Sem mercado (conexao unica da corretora): mantem vivos todos os mercados dela.
+        """
+        if mercado is None:
+            self._ultima_mensagem[corretora] = agora
+        else:
+            self._ultima_do_mercado[(corretora, mercado)] = agora
 
     def atualizar_ticker(
         self,
@@ -137,6 +157,8 @@ class EstadoMercados:
         candidato usa os precos dela; os sinais que dependiam dela sao encerrados no proximo ciclo.
         """
         self._ultima_mensagem.pop(corretora, None)
+        for chave in [c for c in self._ultima_do_mercado if c[0] == corretora]:
+            del self._ultima_do_mercado[chave]
         self._reconectando.add(corretora)
         for dados in (self._livros, self._tickers, self._cotacoes):
             for chave in [c for c in dados if c[0] == corretora]:
@@ -213,15 +235,24 @@ class EstadoMercados:
 
     # --- leitura (motor) -----------------------------------------------------
 
-    def conexao_viva(self, corretora: str, agora: float) -> bool:
-        """True se a corretora mandou mensagem ha no maximo `max_silencio_s` segundos."""
+    def conexao_viva(self, corretora: str, agora: float, mercado: str | None = None) -> bool:
+        """True se a corretora mandou mensagem ha no maximo `max_silencio_s` segundos.
+
+        mercado: so conta a mensagem daquele mercado (ou a sem mercado, que vale para todos). Sem mercado:
+        qualquer mensagem da corretora (como no painel).
+        """
         ultima = self._ultima_mensagem.get(corretora)
-        return ultima is not None and agora - ultima <= self._max_silencio_s
+        if mercado is None:
+            do_mercado = [h for (c, _), h in self._ultima_do_mercado.items() if c == corretora]
+        else:
+            do_mercado = [self._ultima_do_mercado.get((corretora, mercado))]
+        horarios = [h for h in (ultima, *do_mercado) if h is not None]
+        return bool(horarios) and agora - max(horarios) <= self._max_silencio_s
 
     def obter_livro(self, corretora: str, mercado: str, ativo: str, agora: float) -> Livro | None:
         """O livro do par, ou None se nao existe, a conexao nao esta viva ou ele esta velho demais."""
         livro = self._livros.get((corretora, mercado, ativo))
-        if livro is None or not self.conexao_viva(corretora, agora):
+        if livro is None or not self.conexao_viva(corretora, agora, mercado):
             return None
         if agora - livro.recebido_em > self._max_idade_livro_s:
             return None
@@ -230,10 +261,10 @@ class EstadoMercados:
     def obter_ticker(self, corretora: str, mercado: str, ativo: str, agora: float) -> dict | None:
         """O ticker do par (bid, ask, recebido_em, volume_24h_usd, variacao_24h_pct, simbolo_original, cotacao), ou None.
 
-        Vale a mesma regra do livro: conexao viva e dado com no maximo `max_idade_livro_s`.
+        Vale a mesma regra do livro: conexao viva (do mercado) e dado com no maximo `max_idade_livro_s`.
         """
         ticker = self._tickers.get((corretora, mercado, ativo))
-        if ticker is None or not self.conexao_viva(corretora, agora):
+        if ticker is None or not self.conexao_viva(corretora, agora, mercado):
             return None
         if agora - ticker["recebido_em"] > self._max_idade_livro_s:
             return None
@@ -242,10 +273,11 @@ class EstadoMercados:
     def obter_cotacao(self, corretora: str, simbolo: str, agora: float) -> dict | None:
         """O ticker do par de cotacao ({"bid", "ask", "recebido_em"}), ou None.
 
-        Mesma regra de obter_ticker: conexao viva e dado com no maximo `max_idade_livro_s`.
+        Mesma regra de obter_ticker: conexao viva (do spot: o par de cotacao e sempre spot) e dado com no maximo
+        `max_idade_livro_s`.
         """
         ticker = self._cotacoes.get((corretora, simbolo))
-        if ticker is None or not self.conexao_viva(corretora, agora):
+        if ticker is None or not self.conexao_viva(corretora, agora, "spot"):
             return None
         if agora - ticker["recebido_em"] > self._max_idade_livro_s:
             return None
@@ -279,6 +311,24 @@ class EstadoMercados:
             "atraso_medio_ms": self.atraso_medio_ms(corretora, agora),
             "reconexoes": self._reconexoes.get(corretora, 0),
         }
+
+    # --- volume 24h pela API REST (coletor e dados lentos) ------------------
+
+    def pedir_volume_rest(self, corretora: str, simbolo: str) -> None:
+        """O ticker deste simbolo (do ccxt) chega sem volume 24h: os dados lentos buscam pela API REST."""
+        self._volumes_pedidos.setdefault(corretora, set()).add(simbolo)
+
+    def volumes_rest_pedidos(self, corretora: str) -> set[str]:
+        """Os simbolos da corretora cujo volume 24h precisa vir pela API REST (veja pedir_volume_rest)."""
+        return set(self._volumes_pedidos.get(corretora, ()))
+
+    def registrar_volume_rest(self, corretora: str, simbolo: str, volume: float) -> None:
+        """Guarda o volume 24h do simbolo que veio pela API REST (na moeda de cotacao, como o ticker)."""
+        self._volumes_rest[(corretora, simbolo)] = volume
+
+    def volume_rest(self, corretora: str, simbolo: str) -> float | None:
+        """O ultimo volume 24h do simbolo vindo pela API REST, ou None."""
+        return self._volumes_rest.get((corretora, simbolo))
 
     def ticker_guardado(self, corretora: str, mercado: str, ativo: str) -> dict | None:
         """O ultimo ticker guardado do par, SEM checar idade nem conexao (None se nao existe).

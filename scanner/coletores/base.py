@@ -5,7 +5,8 @@
 - `ColetorComSaude`: o codigo comum de saude, reconexao, limite de assinaturas e descartes (especificacao,
   secao 8), para os dois conectores seguirem exatamente a mesma regra: queda apaga a corretora do estado e
   mostra "reconectando", a primeira mensagem boa conta a reconexao, traceback so uma vez, o limite fica com
-  os livros de maior volume 24h (com histerese a favor dos ja abertos).
+  os livros de maior volume 24h (com histerese a favor dos ja abertos), e o aviso dos pares pedidos que
+  nunca mandaram ticker (revisao final: a corretora pode recusar assinaturas sem avisar).
 """
 
 import logging
@@ -15,6 +16,7 @@ from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 from scanner.coletores.reconexao import MARGEM_PARA_TROCAR_LIVRO, parece_limite_de_assinatura, selecionar_pares
+from scanner.config.carregar import Config
 from scanner.estado.mercados import EstadoMercados
 from scanner.modelos import Livro, Ticker
 
@@ -26,6 +28,19 @@ TIPOS_DE_DESCARTE = ("livros", "tickers", "sequencia_quebrada")
 # Dica que vai no log quando o erro da corretora parece ser o limite de assinaturas por conexao.
 DICA_LIMITE = (" A mensagem parece de limite de assinaturas da corretora: confira limites_assinatura "
                "no config.yaml.")
+
+# Quantos pares de exemplo o aviso "nunca mandaram ticker" mostra (detalhe do log).
+EXEMPLOS_NO_AVISO = 5
+
+
+class _ConferenciaDeTickers:
+    """Os pares pedidos num mercado desde o (re)inicio dos tickers e os que ja mandaram algum ticker."""
+
+    def __init__(self, simbolos, inicio: float):
+        self.pedidos = set(simbolos)
+        self.recebidos: set[str] = set()
+        self.inicio = inicio
+        self.feita = False  # o prazo ja passou e a conta ja foi feita (avisa uma vez por (re)inicio)
 
 
 class Coletor(ABC):
@@ -79,6 +94,7 @@ class ColetorComSaude(Coletor):
     estado: EstadoMercados opcional (sem ele, nada vai ao estado). relogio: hora atual em segundos.
     limite_assinaturas: maximo de livros abertos (limites_assinatura da Config); None = sem limite.
     espera_max_reconexao_s: maior espera entre duas tentativas de reconexao (da Config).
+    prazo_primeiro_ticker_s: pares pedidos sem nenhum ticker neste tempo vao para um aviso (da Config).
 
     Quem herda informa:
       - `_TEXTO_DA_CONEXAO`: o que caiu, no log ("a conexao dos tickers", "a conexao da lighter");
@@ -91,7 +107,8 @@ class ColetorComSaude(Coletor):
     _ERROS_DE_CONEXAO: tuple[type[BaseException], ...] = (OSError,)
 
     def __init__(self, nome: str, estado: EstadoMercados | None, relogio: Callable[[], float],
-                 limite_assinaturas: int | None, espera_max_reconexao_s: float):
+                 limite_assinaturas: int | None, espera_max_reconexao_s: float,
+                 prazo_primeiro_ticker_s: float = Config.prazo_primeiro_ticker_s):
         super().__init__(nome)
         self._estado = estado
         self._relogio = relogio
@@ -104,12 +121,15 @@ class ColetorComSaude(Coletor):
         self._descartes: Counter = Counter()  # tipo de descarte -> quantos desde o ultimo tirar_descartes
         self._fora_do_limite = {"livros": 0, "tickers": 0}  # quantos pares ficaram de fora (ultimo aviso)
         self._livros_no_estado: dict[str, tuple[str, str]] = {}  # simbolo -> (mercado, ativo) do livro guardado
+        self._prazo_primeiro_ticker_s = prazo_primeiro_ticker_s
+        self._conferencias: dict[str, _ConferenciaDeTickers] = {}  # mercado -> pares pedidos e os que chegaram
 
     # --- estado e saude ------------------------------------------------------
 
-    def _registrar_mensagem(self, agora: float) -> None:
+    def _registrar_mensagem(self, agora: float, mercado: str | None = None) -> None:
+        """A conexao mandou uma mensagem: com `mercado`, so a conexao daquele mercado fica viva (veja o estado)."""
         if self._estado is not None:
-            self._estado.registrar_mensagem(self.nome, agora)
+            self._estado.registrar_mensagem(self.nome, agora, mercado)
 
     def _registrar_atraso(self, agora: float, horario_da_corretora: float) -> None:
         """Manda ao estado o atraso do dado: quando chegou menos o horario que a corretora informou (s)."""
@@ -174,6 +194,34 @@ class ColetorComSaude(Coletor):
         self._descartes.clear()
         return resumo
 
+    # --- pares pedidos que nunca mandaram ticker ------------------------------
+
+    def _comecar_conferencia_de_tickers(self, mercado: str, simbolos, agora: float) -> None:
+        """Os tickers de `simbolos` acabaram de ser pedidos neste mercado: a conta recomeca agora."""
+        self._conferencias[mercado] = _ConferenciaDeTickers(simbolos, agora)
+
+    def _anotar_tickers_recebidos(self, mercado: str, simbolos, agora: float) -> None:
+        """Chegou ticker (valido ou nao) destes simbolos. Passado o prazo, avisa uma vez dos que nunca mandaram.
+
+        Uma corretora que recusa a assinatura em silencio (ex.: acima de 30 assinaturas na MEXC spot) deixa os
+        pares sem ticker; sem este aviso, eles sumiriam do scanner sem nenhuma linha no log.
+        """
+        conferencia = self._conferencias.get(mercado)
+        if conferencia is None or conferencia.feita:
+            return
+        conferencia.recebidos.update(simbolos)
+        if agora - conferencia.inicio < self._prazo_primeiro_ticker_s:
+            return
+        conferencia.feita = True
+        faltam = sorted(conferencia.pedidos - conferencia.recebidos)
+        if faltam:
+            exemplos = ", ".join(faltam[:EXEMPLOS_NO_AVISO]) + (", ..." if len(faltam) > EXEMPLOS_NO_AVISO else "")
+            registro.warning("%s: %d de %d pares pedidos no %s nunca mandaram ticker em %gs (ex.: %s); eles ficam "
+                             "fora do scanner. Pode ser par sem negocio ou a corretora recusando assinaturas: "
+                             "confira limites_assinatura e limites_assinatura_mercado no config.yaml",
+                             self.nome, len(faltam), len(conferencia.pedidos), mercado,
+                             self._prazo_primeiro_ticker_s, exemplos)
+
     # --- limite de assinaturas -----------------------------------------------
 
     def _volume_conhecido(self, simbolo: str) -> float | None:
@@ -184,8 +232,16 @@ class ColetorComSaude(Coletor):
         """Os simbolos com livro aberto agora (tem preferencia no limite, para nao trocar a cada ciclo)."""
         return set()
 
+    def _livros_no_limite_do_mercado(self, desejados: set[str]) -> set[str]:
+        """Limite dos livros por (corretora, mercado): quem herda informa (ColetorCcxt: limites_assinatura_mercado)."""
+        return desejados
+
     def _livros_dentro_do_limite(self, desejados: set[str]) -> set[str]:
-        """Os livros que cabem no limite de assinaturas: os de maior volume 24h, com preferencia aos ja abertos."""
+        """Os livros que cabem no limite de assinaturas: os de maior volume 24h, com preferencia aos ja abertos.
+
+        Primeiro o limite por mercado (_livros_no_limite_do_mercado), depois o da corretora (limites_assinatura).
+        """
+        desejados = self._livros_no_limite_do_mercado(desejados)
         if self._limite is None or len(desejados) <= self._limite:
             self._avisar_limite("livros", 0, len(desejados))
             return desejados

@@ -23,16 +23,21 @@ MULTIPLICADORES = (
 )
 
 
-# Moedas de cotacao em ordem de preferencia, quando um ativo tem mais de um par na mesma
+# Moedas de cotacao que o scanner usa, em ordem de preferencia, quando um ativo tem mais de um par na mesma
 # corretora e mercado (ex.: BTC/USDT:USDT e BTC/USDC:USDC): so uma entra no estado.
-# Moeda fora da lista vem depois de todas, em ordem alfabetica.
-# USD (Task 16): na Kraken muitos ativos so tem par em USD e EUR; o USD tem cotacao (USDT/USD da Kraken) e o
-# EUR nao (viraria 1:1 com aviso_cotacao, uns 15% fora). Sem o USD aqui, o EUR venceria pela ordem alfabetica.
+# USD (Task 16): na Kraken muitos ativos so tem par em USD e EUR; o USD tem cotacao (USDT/USD da Kraken).
+# Revisao final: moeda fora da lista (EUR, GBP...) nao entra no scanner (veja cotacao_usada): sem cotacao em
+# USDT ela viraria 1:1, e o GBP (~1,27 USDT) daria um spread falso de ~27%.
 PREFERENCIA_COTACAO = ("USDT", "USDC", "USDG", "USD")
 
 
+def cotacao_usada(cotacao) -> bool:
+    """True se o scanner usa pares cotados nesta moeda (as de PREFERENCIA_COTACAO); EUR, GBP etc. ficam de fora."""
+    return cotacao in PREFERENCIA_COTACAO
+
+
 def prioridade_cotacao(cotacao: str) -> tuple[int, str]:
-    """Chave de ordenacao da moeda de cotacao: menor = preferida (USDT, depois USDC, USDG, as outras)."""
+    """Chave de ordenacao da moeda de cotacao: menor = preferida (USDT, depois USDC, USDG, USD, as outras)."""
     if cotacao in PREFERENCIA_COTACAO:
         return PREFERENCIA_COTACAO.index(cotacao), cotacao
     return len(PREFERENCIA_COTACAO), cotacao
