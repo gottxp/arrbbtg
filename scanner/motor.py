@@ -19,9 +19,9 @@ No spot x futuro o spot e sempre o long; o futuro x futuro e sempre entre corret
 e vale nas duas direcoes.
 
 Desempenho: com 9 corretoras e centenas de ativos sao dezenas de milhares de combinacoes. Por
-isso cada mercado e lido uma vez so por ciclo (e nao uma vez por combinacao), as combinacoes sao
-montadas so com os mercados que tem dado valido, e a lista montada fica guardada enquanto esses
-mercados nao mudam.
+isso cada mercado e lido uma vez so por ciclo (e nao uma vez por combinacao), e as combinacoes
+montadas ficam guardadas enquanto os mercados nao mudam. Os candidatos so olham as combinacoes
+com livro valido nas duas pontas. As metricas do periodo sao incrementais (JanelaMetricas).
 
 Nada aqui acessa a rede: tudo vem do estado (coletores) e dos dados lentos (funding e taxas).
 Regra geral: dado em que nao se pode confiar (velho, sem liquidez, sem taxa, numero invalido)
@@ -30,7 +30,6 @@ nao gera candidato.
 
 import logging
 import math
-from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -290,52 +289,29 @@ class _PrecosDosTickers(NamedTuple):
 
 
 class _Historico:
-    """Amostras do periodo de uma combinacao: A e F (para as metricas) e o lote de cada ponta (lote medio).
+    """Amostras do periodo de uma combinacao e o horario da ultima amostra.
 
-    As amostras chegam em ordem de horario. As que ficam mais velhas que o periodo saem.
+    A janela (JanelaMetricas) guarda A, F e o lote de cada ponta de cada amostra, da as metricas
+    e os lotes medios, e tira sozinha as amostras mais velhas que o periodo. As amostras chegam
+    em ordem de horario.
     """
 
     def __init__(self, periodo_s: float):
-        self.periodo_s = periodo_s
         self.janela = JanelaMetricas(periodo_s)
         self.ultima_amostra: float | None = None  # horario da ultima amostra (None = nenhuma)
-        self._lotes: deque[tuple[float, float, float]] = deque()  # (ts, lote_long, lote_short)
-        # Somas dos lotes no periodo, atualizadas a cada entrada/saida: a media sai sem percorrer tudo.
-        self._soma_long = 0.0
-        self._soma_short = 0.0
 
     def adicionar(self, ts: float, a: float, f: float, lote_long: float, lote_short: float) -> None:
-        """Guarda uma amostra. Recusa NaN e infinito (ValueError): eles estragariam as medias."""
-        if not _todos_validos(ts, a, f, lote_long, lote_short):
-            raise ValueError(f"amostra com numero invalido: ts={ts} a={a} f={f} lotes={lote_long}/{lote_short}")
-        self.janela.adicionar(ts, a, f)
-        self._lotes.append((ts, lote_long, lote_short))
-        self._soma_long += lote_long
-        self._soma_short += lote_short
+        """Guarda uma amostra. A janela recusa NaN e infinito (ValueError): eles estragariam as medias."""
+        self.janela.adicionar(ts, a, f, lote_long, lote_short)
         self.ultima_amostra = ts
-        self._descartar_antigas(ts)
-
-    def _descartar_antigas(self, agora: float) -> None:
-        limite = agora - self.periodo_s
-        while self._lotes and self._lotes[0][0] < limite:
-            _, lote_long, lote_short = self._lotes.popleft()
-            self._soma_long -= lote_long
-            self._soma_short -= lote_short
-        if not self._lotes:  # zera de verdade, sem sobra de arredondamento
-            self._soma_long = self._soma_short = 0.0
 
     def lotes_medios(self, agora: float) -> tuple[float | None, float | None]:
         """(lote medio do long, lote medio do short) no periodo, em $; (None, None) sem amostras."""
-        self._descartar_antigas(agora)
-        if not self._lotes:
-            return None, None
-        n = len(self._lotes)
-        return self._soma_long / n, self._soma_short / n
+        return self.janela.lotes_medios(agora)
 
     def vazio(self, agora: float) -> bool:
         """True se nao sobrou nenhuma amostra dentro do periodo."""
-        self._descartar_antigas(agora)
-        return not self._lotes
+        return self.janela.vazia(agora)
 
 
 # ---------------------------------------------------------------------------

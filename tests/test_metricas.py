@@ -1,11 +1,17 @@
-"""Testes das metricas do periodo (Task 6): janela, medias, maiores e invertidas.
+"""Testes das metricas do periodo (Task 6; versao incremental na Task 13): janela, medias, maiores e invertidas.
 
 Nenhum teste acessa a internet.
 """
 
+import dataclasses
+import heapq
+import math
+import random
+import tracemalloc
+
 import pytest
 
-from scanner.metricas import JanelaMetricas
+from scanner.metricas import JanelaMetricas, Metricas
 
 
 # ---------------------------------------------------------------------------
@@ -129,3 +135,175 @@ def test_cache_bate_com_recalcular_do_zero_em_janela_cheia():
     primeiro = j.resumo(agora=agora, duracao_min_invertida_s=10)
     assert j.resumo(agora=agora, duracao_min_invertida_s=10) is primeiro
     assert primeiro == janela_com(amostras, periodo_s=4 * 3600).resumo(agora=agora, duracao_min_invertida_s=10)
+
+
+# ---------------------------------------------------------------------------
+# Versao incremental (Task 13, correcao pos-revisao): o resultado tem de ser o mesmo de
+# recalcular do zero. O calculo "ingenuo" abaixo e a regra original, escrita de novo aqui:
+# olha todas as amostras da janela a cada resumo.
+# ---------------------------------------------------------------------------
+
+def invertidas_ingenuas(dentro, duracao_min_s) -> int:
+    """Conta as sequencias seguidas de F >= 0 que duram pelo menos duracao_min_s (a aberta no fim tambem)."""
+    invertidas, inicio, fim = 0, None, None
+    for ts, _, valor_f, *_ in dentro:
+        if valor_f >= 0:
+            inicio = ts if inicio is None else inicio
+            fim = ts
+        else:
+            if inicio is not None and fim - inicio >= duracao_min_s:
+                invertidas += 1
+            inicio = None
+    if inicio is not None and fim - inicio >= duracao_min_s:
+        invertidas += 1
+    return invertidas
+
+
+def resumo_ingenuo(amostras, agora, periodo_s, duracao_min_s):
+    """Metricas das amostras (ts, A, F, lote_long, lote_short) com ts >= agora - periodo_s, contando do zero."""
+    dentro = [x for x in amostras if x[0] >= agora - periodo_s]
+    if not dentro:
+        return None
+    a = [x[1] for x in dentro]
+    f = [x[2] for x in dentro]
+    maiores_a, maiores_f = heapq.nlargest(10, a), heapq.nlargest(10, f)
+    return Metricas(
+        abertura_media=sum(a) / len(a),
+        fechamento_medio=sum(f) / len(f),
+        maior_abertura=max(a),
+        maior_fechamento=max(f),
+        media_10_maiores_abertura=sum(maiores_a) / len(maiores_a),
+        media_10_maiores_fechamento=sum(maiores_f) / len(maiores_f),
+        invertidas=invertidas_ingenuas(dentro, duracao_min_s),
+    )
+
+
+def lotes_ingenuos(amostras, agora, periodo_s):
+    dentro = [x for x in amostras if x[0] >= agora - periodo_s]
+    if not dentro:
+        return None, None
+    return sum(x[3] for x in dentro) / len(dentro), sum(x[4] for x in dentro) / len(dentro)
+
+
+def conferir(janela, amostras, agora, periodo_s, duracoes):
+    """A janela incremental bate com o calculo ingenuo: exato em tudo, menos as medias (tolerancia de float)."""
+    esperado = resumo_ingenuo(amostras, agora, periodo_s, duracoes[0])
+    novo = janela.resumo(agora=agora, duracao_min_invertida_s=duracoes[0])
+    medio_long, medio_short = janela.lotes_medios(agora)
+    if esperado is None:
+        assert novo is None and (medio_long, medio_short) == (None, None)
+        assert all(janela.resumo(agora=agora, duracao_min_invertida_s=d) is None for d in duracoes)
+        return
+    medias_novas = (novo.abertura_media, novo.fechamento_medio, medio_long, medio_short)
+    medias_esperadas = (esperado.abertura_media, esperado.fechamento_medio, *lotes_ingenuos(amostras, agora, periodo_s))
+    assert medias_novas == pytest.approx(medias_esperadas, rel=1e-12, abs=1e-12)
+    # O resto e exato: os maiores, a media dos 10 maiores (mesma soma, na mesma ordem) e as invertidas.
+    assert (novo.maior_abertura, novo.maior_fechamento, novo.media_10_maiores_abertura,
+            novo.media_10_maiores_fechamento) == (esperado.maior_abertura, esperado.maior_fechamento,
+                                                  esperado.media_10_maiores_abertura,
+                                                  esperado.media_10_maiores_fechamento)
+    dentro = [x for x in amostras if x[0] >= agora - periodo_s]
+    for duracao in duracoes:
+        outro = janela.resumo(agora=agora, duracao_min_invertida_s=duracao)
+        assert outro.invertidas == invertidas_ingenuas(dentro, duracao)
+        assert dataclasses.replace(outro, invertidas=0) == dataclasses.replace(novo, invertidas=0)
+
+
+def serie(padrao: str, n: int, semente: int):
+    """n amostras (ts, A, F, lote_long, lote_short) em ordem de horario, no `padrao` pedido."""
+    rnd = random.Random(semente)
+    ts, a, f = 1000.0, 0.5, 0.0
+    for i in range(n):
+        passos = [5.0, 5.0, 40.0, 400.0] if padrao == "lacunas" else [5.0, 5.0, 5.0, 4.5, 5.5, 10.0]
+        ts += rnd.choice(passos)
+        if padrao == "descendo":  # o maior sai sempre primeiro: obriga a refazer a lista dos maiores
+            a, f = 100.0 - i * 0.01, 1.0 - i * 0.001
+        elif padrao == "subindo":
+            a, f = i * 0.01, -1.0 + i * 0.001
+        elif padrao == "repetidos":  # muitos valores iguais e F == 0 exato
+            a, f = float(rnd.randint(-3, 3)), rnd.choice([-0.5, 0.0, 0.0, 0.5])
+        else:  # passeio aleatorio em volta de 0 (F cruza o zero o tempo todo)
+            a += rnd.gauss(0, 0.05)
+            f = rnd.gauss(0, 0.2) if rnd.random() < 0.3 else f + rnd.gauss(0, 0.05)
+        yield ts, a, f, rnd.uniform(100, 5000), rnd.uniform(100, 5000)
+
+
+@pytest.mark.parametrize("padrao", ["passeio", "descendo", "subindo", "repetidos", "lacunas"])
+def test_incremental_igual_ao_calculo_ingenuo(padrao):
+    periodo_s = 300  # ~60 amostras: muitas saem da janela durante o teste
+    duracoes = [0, 4.9, 5, 10, 60, 1000]
+    janela, vistas = JanelaMetricas(periodo_s=periodo_s), []
+    for i, amostra in enumerate(serie(padrao, 3000, semente=11)):
+        janela.adicionar(*amostra)
+        vistas.append(amostra)
+        agora = amostra[0] + (i % 3)  # as vezes o resumo e pedido um pouco depois da amostra
+        conferir(janela, vistas, agora, periodo_s, duracoes)
+        vistas = [x for x in vistas if x[0] >= agora - periodo_s]  # o relogio so anda: as velhas nunca voltam
+
+
+def test_incremental_igual_ao_calculo_ingenuo_com_4h_cheias():
+    periodo_s, janela, vistas = 4 * 3600, JanelaMetricas(periodo_s=4 * 3600), []
+    for i, amostra in enumerate(serie("passeio", 3500, semente=5)):
+        janela.adicionar(*amostra)
+        vistas.append(amostra)
+        if i % 50 == 0 or i > 3450:
+            conferir(janela, vistas, amostra[0], periodo_s, [0, 30])
+
+
+def test_janela_que_esvazia_e_volta_a_encher():
+    periodo_s, janela, vistas = 60, JanelaMetricas(periodo_s=60), []
+    for amostra in serie("repetidos", 200, semente=3):
+        janela.adicionar(*amostra)
+        vistas.append(amostra)
+    agora = vistas[-1][0] + 1000  # tudo sai da janela
+    conferir(janela, vistas, agora, periodo_s, [0, 5])
+    assert janela.resumo(agora=agora, duracao_min_invertida_s=0) is None and janela.vazia(agora)
+    for amostra in serie("passeio", 200, semente=4):  # amostras novas depois de agora
+        amostra = (amostra[0] + agora, *amostra[1:])
+        janela.adicionar(*amostra)
+        vistas.append(amostra)
+        conferir(janela, vistas, amostra[0], periodo_s, [0, 5])
+        vistas = [x for x in vistas if x[0] >= amostra[0] - periodo_s]
+
+
+def test_lotes_medios_do_periodo():
+    j = JanelaMetricas(periodo_s=10)
+    assert j.lotes_medios(agora=0) == (None, None)
+    j.adicionar(0, 1.0, -1.0, lote_long=100.0, lote_short=300.0)
+    j.adicionar(5, 1.0, -1.0, lote_long=200.0, lote_short=500.0)
+    assert j.lotes_medios(agora=5) == (pytest.approx(150.0), pytest.approx(400.0))
+    assert j.lotes_medios(agora=12) == (pytest.approx(200.0), pytest.approx(500.0))  # a de ts 0 saiu
+    assert j.lotes_medios(agora=100) == (None, None)
+
+
+def test_somas_sem_erro_acumulado_depois_de_muitas_saidas():
+    # Valores que se perderiam numa soma comum de float (1e16 + 1 - 1e16 = 0): a soma exata nao perde nada.
+    j = JanelaMetricas(periodo_s=10)
+    for ts in range(0, 100_000, 5):
+        j.adicionar(ts, 1e16 if ts % 10 else 1.0, -1.0)
+    j.adicionar(100_000, 1.0, -1.0)
+    # Ficaram ts 99.990 (1.0), 99.995 (1e16) e 100.000 (1.0).
+    assert j.resumo(agora=100_000, duracao_min_invertida_s=0).abertura_media == (1e16 + 2.0) / 3
+
+
+@pytest.mark.parametrize("valores", [(math.nan, 0.0), (0.0, math.inf), (-math.inf, 1.0)])
+def test_numero_invalido_e_recusado(valores):
+    j = JanelaMetricas(periodo_s=10)
+    with pytest.raises(ValueError):
+        j.adicionar(0, *valores)
+    assert j.resumo(agora=0, duracao_min_invertida_s=0) is None  # nada entrou
+
+
+def test_janela_cheia_de_4h_ocupa_pouca_memoria():
+    # 2.880 amostras de 5 s (4 h), com os lotes. Os numeros sao criados dentro da medida, como no motor.
+    rnd = random.Random(1)
+    tracemalloc.start()
+    try:
+        j = JanelaMetricas(periodo_s=4 * 3600)
+        for i in range(2880):
+            j.adicionar(i * 5.0, rnd.gauss(0, 1), rnd.gauss(0, 1), rnd.uniform(100, 5000), rnd.uniform(100, 5000))
+        j.resumo(agora=2879 * 5.0, duracao_min_invertida_s=0)
+        memoria, _ = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert memoria <= 150 * 1024
