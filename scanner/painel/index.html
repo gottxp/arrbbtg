@@ -1,0 +1,349 @@
+<!doctype html>
+<!--
+  Painel do scanner de arbitragem (especificacao, secao 7).
+
+  Tres arquivos, sem nada para instalar ou compilar:
+    index.html  - a estrutura da pagina (este arquivo)
+    estilo.css  - as cores e o layout
+    app.js      - o comportamento (tabela ao vivo, filtros, grafico, barra de status)
+
+  Cada controle de filtro tem o atributo data-campo com o nome EXATO do campo em
+  scanner/filtros/filtros.py, e data-tipo dizendo que controle ele e (numero, lista, multi,
+  booleano, selecao, fixados). O app.js le e escreve os filtros por esses atributos.
+  (O teste tests/test_painel.py confere que todo campo dos Filtros tem um controle aqui.)
+-->
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Scanner de Arbitragem</title>
+  <link rel="stylesheet" href="estilo.css">
+  <!-- Biblioteca do grafico (versao fixa). "async": se nao carregar (sem internet), o resto do
+       painel funciona igual; so o grafico mostra um aviso. -->
+  <script async src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"
+          onerror="window.falhaBibliotecaGraficos = true"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+
+<!-- ===================== Topo: modo, comparacao e botao dos filtros ===================== -->
+<header class="topo">
+  <div class="marca">Scanner de Arbitragem</div>
+  <div class="topo-controles">
+    <div class="segmentado" role="group" aria-label="Modo">
+      <button type="button" class="segmento" data-modo="lucro" aria-pressed="true">Lucro</button>
+      <button type="button" class="segmento" data-modo="farm" aria-pressed="false">Farm</button>
+    </div>
+    <label class="interruptor" title="Mostra e decide pelo RP bruto (sem custos), como o Arbimax calcula">
+      <input type="checkbox" id="comparacao">
+      <span class="interruptor-trilho" aria-hidden="true"></span>
+      <span>Modo comparação</span>
+    </label>
+    <button type="button" id="botao-filtros" class="botao" aria-expanded="true" aria-controls="filtros">
+      Filtros <span class="seta" aria-hidden="true"></span>
+    </button>
+  </div>
+</header>
+
+<div id="faixa-comparacao" class="faixa-comparacao" hidden>
+  MODO COMPARAÇÃO: o destaque da coluna Resultado é o RP bruto (sem taxas, slippage e funding), como o Arbimax calcula.
+</div>
+
+<main class="conteudo">
+
+  <!-- ===================== Filtros ===================== -->
+  <section id="filtros" class="filtros" aria-label="Filtros">
+
+    <div class="linha-grupo">
+      <div class="campo campo-grupo">
+        <label for="grupo">Grupo de filtros</label>
+        <div class="grupo-controles">
+          <select id="grupo"></select>
+          <button type="button" id="grupo-editar" class="botao-icone" title="Renomear o grupo" aria-label="Renomear o grupo">
+            <svg class="icone" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16v4zM13.5 6.5l4 4"/></svg>
+          </button>
+          <button type="button" id="grupo-apagar" class="botao-icone perigo" title="Apagar o grupo" aria-label="Apagar o grupo">
+            <svg class="icone" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+          <button type="button" id="grupo-criar" class="botao-icone sucesso" title="Criar um grupo com os filtros atuais" aria-label="Criar grupo">
+            <svg class="icone" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          </button>
+          <button type="button" id="grupo-duplicar" class="botao-icone" title="Duplicar o grupo" aria-label="Duplicar o grupo">
+            <svg class="icone" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9h11v11H9zM5 15H4V4h11v1"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Nome do grupo (criar, renomear, duplicar): dentro da pagina, sem caixa do navegador. -->
+      <div id="grupo-formulario" class="grupo-caixa" hidden>
+        <label for="grupo-nome" id="grupo-formulario-rotulo">Nome do grupo</label>
+        <div class="grupo-controles">
+          <input type="text" id="grupo-nome" maxlength="60" autocomplete="off">
+          <button type="button" id="grupo-salvar" class="botao primario">Salvar</button>
+          <button type="button" id="grupo-cancelar" class="botao">Cancelar</button>
+        </div>
+      </div>
+
+      <!-- Confirmacao de apagar. -->
+      <div id="grupo-confirmacao" class="grupo-caixa" hidden>
+        <span id="grupo-confirmacao-texto"></span>
+        <div class="grupo-controles">
+          <button type="button" id="grupo-confirmar-apagar" class="botao perigo">Apagar</button>
+          <button type="button" id="grupo-cancelar-apagar" class="botao">Cancelar</button>
+        </div>
+      </div>
+
+      <div id="grupo-mensagem" class="mensagem" role="status"></div>
+    </div>
+
+    <div id="erro-filtros" class="erro-filtros" role="alert" hidden></div>
+    <p class="dica">Campo vazio = filtro desligado. Percentuais em % (0,4 = 0,4%). Listas de moedas: BTC, ETH.</p>
+
+    <!-- ----- Corretoras ----- -->
+    <h3 class="titulo-bloco">Corretoras</h3>
+    <div class="grade grade-larga">
+      <div class="campo">
+        <span class="rotulo" id="r-corretoras_lado1">Corretoras 1 (ponta long)</span>
+        <div class="multi" data-campo="corretoras_lado1" data-tipo="multi" data-opcoes="corretoras"
+             data-vazio="Todas" aria-labelledby="r-corretoras_lado1"></div>
+      </div>
+      <div class="campo">
+        <span class="rotulo" id="r-corretoras_lado2">Corretoras 2 (ponta short)</span>
+        <div class="multi" data-campo="corretoras_lado2" data-tipo="multi" data-opcoes="corretoras"
+             data-vazio="Todas" aria-labelledby="r-corretoras_lado2"></div>
+      </div>
+      <div class="campo">
+        <span class="rotulo" id="r-tipos">Tipos de oportunidade</span>
+        <div class="multi" data-campo="tipos" data-tipo="multi" data-opcoes="tipos"
+             data-vazio="Todos" aria-labelledby="r-tipos"></div>
+      </div>
+    </div>
+
+    <!-- ----- Geral ----- -->
+    <h3 class="titulo-bloco">Geral</h3>
+    <div class="grade">
+      <div class="campo">
+        <label for="f-periodo_metricas_h">Período das métricas</label>
+        <div class="entrada"><input id="f-periodo_metricas_h" data-campo="periodo_metricas_h" data-tipo="numero"
+             inputmode="decimal" autocomplete="off" placeholder="padrão"><span class="sufixo">h</span></div>
+      </div>
+      <div class="campo">
+        <label for="f-volume_min_usd">Volume mín. 24h</label>
+        <div class="entrada"><span class="prefixo">$</span><input id="f-volume_min_usd" data-campo="volume_min_usd"
+             data-tipo="numero" inputmode="decimal" autocomplete="off"></div>
+      </div>
+      <div class="campo">
+        <label for="f-spread_min_pct">Spread mín. (A atual)</label>
+        <div class="entrada"><input id="f-spread_min_pct" data-campo="spread_min_pct" data-tipo="numero"
+             inputmode="decimal" autocomplete="off"><span class="sufixo">%</span></div>
+      </div>
+      <div class="campo">
+        <label for="f-lote_min_usd">Lote mín.</label>
+        <div class="entrada"><span class="prefixo">$</span><input id="f-lote_min_usd" data-campo="lote_min_usd"
+             data-tipo="numero" inputmode="decimal" autocomplete="off"></div>
+      </div>
+      <div class="campo">
+        <label for="f-lote_medio_min_usd">Lote médio mín.</label>
+        <div class="entrada"><span class="prefixo">$</span><input id="f-lote_medio_min_usd" data-campo="lote_medio_min_usd"
+             data-tipo="numero" inputmode="decimal" autocomplete="off"></div>
+      </div>
+      <div class="campo">
+        <label for="f-limite_ordem_min_usd">Limite de ordem mín.</label>
+        <div class="entrada"><span class="prefixo">$</span><input id="f-limite_ordem_min_usd" data-campo="limite_ordem_min_usd"
+             data-tipo="numero" inputmode="decimal" autocomplete="off"></div>
+      </div>
+      <div class="campo">
+        <label for="f-invertidas_min">Invertidas mín.</label>
+        <div class="entrada"><input id="f-invertidas_min" data-campo="invertidas_min" data-tipo="numero"
+             inputmode="decimal" autocomplete="off"></div>
+      </div>
+      <div class="campo">
+        <label for="f-invertidas_duracao_min_s">Invertidas: duração mín.</label>
+        <div class="entrada"><input id="f-invertidas_duracao_min_s" data-campo="invertidas_duracao_min_s" data-tipo="numero"
+             inputmode="decimal" autocomplete="off"><span class="sufixo">s</span></div>
+      </div>
+      <div class="campo">
+        <label for="f-funding_min_pct">Funding mín.</label>
+        <div class="entrada"><input id="f-funding_min_pct" data-campo="funding_min_pct" data-tipo="numero"
+             inputmode="decimal" autocomplete="off"><span class="sufixo">%</span></div>
+      </div>
+      <div class="campo">
+        <label for="f-funding_max_pct">Funding máx.</label>
+        <div class="entrada"><input id="f-funding_max_pct" data-campo="funding_max_pct" data-tipo="numero"
+             inputmode="decimal" autocomplete="off"><span class="sufixo">%</span></div>
+      </div>
+      <div class="campo">
+        <label for="f-fr_yield_min_pct">FR Yield mín.</label>
+        <div class="entrada"><input id="f-fr_yield_min_pct" data-campo="fr_yield_min_pct" data-tipo="numero"
+             inputmode="decimal" autocomplete="off"><span class="sufixo">%</span></div>
+      </div>
+      <div class="campo">
+        <span class="rotulo" id="r-intervalos_funding">Intervalo de funding</span>
+        <div class="multi" data-campo="intervalos_funding" data-tipo="multi" data-opcoes="intervalos"
+             data-vazio="Todos" aria-labelledby="r-intervalos_funding"></div>
+      </div>
+      <div class="campo">
+        <span class="rotulo">Funding sincronizado</span>
+        <label class="interruptor" title="As duas pontas futuras cobram no mesmo intervalo">
+          <input type="checkbox" data-campo="funding_sincronizado" data-tipo="booleano">
+          <span class="interruptor-trilho" aria-hidden="true"></span>
+          <span class="interruptor-texto">Mesmo intervalo</span>
+        </label>
+      </div>
+      <div class="campo">
+        <label for="f-maior_abertura_min_pct">Maior spread de abertura mín.</label>
+        <div class="entrada"><input id="f-maior_abertura_min_pct" data-campo="maior_abertura_min_pct" data-tipo="numero"
+             inputmode="decimal" autocomplete="off"><span class="sufixo">%</span></div>
+      </div>
+      <div class="campo">
+        <label for="f-maior_fechamento_min_pct">Maior spread de fechamento mín.</label>
+        <div class="entrada"><input id="f-maior_fechamento_min_pct" data-campo="maior_fechamento_min_pct" data-tipo="numero"
+             inputmode="decimal" autocomplete="off"><span class="sufixo">%</span></div>
+      </div>
+      <div class="campo">
+        <label for="f-abertura_media_min_pct">Média de spread de abertura mín.</label>
+        <div class="entrada"><input id="f-abertura_media_min_pct" data-campo="abertura_media_min_pct" data-tipo="numero"
+             inputmode="decimal" autocomplete="off"><span class="sufixo">%</span></div>
+      </div>
+      <div class="campo">
+        <label for="f-fechamento_medio_min_pct">Média de spread de fechamento mín.</label>
+        <div class="entrada"><input id="f-fechamento_medio_min_pct" data-campo="fechamento_medio_min_pct" data-tipo="numero"
+             inputmode="decimal" autocomplete="off"><span class="sufixo">%</span></div>
+      </div>
+      <div class="campo">
+        <label for="f-metrica_spread">Métrica de spread</label>
+        <select id="f-metrica_spread" data-campo="metrica_spread" data-tipo="selecao">
+          <option value="">Padrão (config.)</option>
+          <option value="medio">Spread médio</option>
+          <option value="maior">Maior spread</option>
+          <option value="media_10_maiores">Média dos 10 maiores</option>
+        </select>
+      </div>
+      <div class="campo">
+        <label for="f-rp_min_pct">Resultado projetado mín. (Lucro)</label>
+        <div class="entrada"><input id="f-rp_min_pct" data-campo="rp_min_pct" data-tipo="numero"
+             inputmode="decimal" autocomplete="off" placeholder="padrão"><span class="sufixo">%</span></div>
+      </div>
+      <div class="campo">
+        <label for="f-custo_max_farm_pct">Custo máx. (Farm)</label>
+        <div class="entrada"><input id="f-custo_max_farm_pct" data-campo="custo_max_farm_pct" data-tipo="numero"
+             inputmode="decimal" autocomplete="off" placeholder="padrão"><span class="sufixo">%</span></div>
+      </div>
+    </div>
+
+    <!-- ----- Organizacao ----- -->
+    <h3 class="titulo-bloco">Organização</h3>
+    <div class="grade">
+      <div class="campo">
+        <label for="f-sempre_mostrar">Sempre mostrar</label>
+        <input id="f-sempre_mostrar" data-campo="sempre_mostrar" data-tipo="lista" autocomplete="off" placeholder="BTC, ETH">
+      </div>
+      <div class="campo">
+        <label for="f-nunca_mostrar">Nunca mostrar</label>
+        <input id="f-nunca_mostrar" data-campo="nunca_mostrar" data-tipo="lista" autocomplete="off" placeholder="BTC, ETH">
+      </div>
+      <div class="campo">
+        <label for="f-apenas_mostrar">Apenas mostrar</label>
+        <input id="f-apenas_mostrar" data-campo="apenas_mostrar" data-tipo="lista" autocomplete="off" placeholder="todas">
+      </div>
+      <div class="campo">
+        <label for="f-ordenar_por">Ordenar por</label>
+        <select id="f-ordenar_por" data-campo="ordenar_por" data-tipo="selecao">
+          <option value="">Resultado (padrão)</option>
+          <option value="horario">Horário</option>
+          <option value="spread">Spread</option>
+          <option value="volume">Volume</option>
+        </select>
+      </div>
+      <div class="campo">
+        <span class="rotulo">Suspeitos</span>
+        <label class="interruptor" title="Mostra os sinais marcados como suspeitos (spread alto demais: pode ser outro token)">
+          <input type="checkbox" data-campo="mostrar_suspeitos" data-tipo="booleano">
+          <span class="interruptor-trilho" aria-hidden="true"></span>
+          <span class="interruptor-texto">Mostrar suspeitos</span>
+        </label>
+      </div>
+      <div class="campo">
+        <span class="rotulo">Fixados no topo</span>
+        <div class="fixados" data-campo="fixados" data-tipo="fixados"></div>
+      </div>
+    </div>
+
+    <!-- ----- Lista negra ----- -->
+    <h3 class="titulo-bloco">Lista negra</h3>
+    <div class="grade">
+      <div class="campo campo-largo">
+        <label for="f-lista_negra">Moedas excluídas</label>
+        <input id="f-lista_negra" data-campo="lista_negra" data-tipo="lista" autocomplete="off" placeholder="BTC, ETH">
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== Tabela de sinais ===================== -->
+  <section class="area-tabela" aria-label="Sinais ao vivo">
+    <div id="contorno-tabela" class="contorno-tabela">
+      <table class="tabela">
+        <thead>
+          <tr>
+            <th class="col-moeda">Moeda</th>
+            <th class="col-ponta">Ponta long</th>
+            <th class="col-ponta">Ponta short</th>
+            <th class="col-resultado" id="cabecalho-resultado">Resultado</th>
+            <th class="col-historico" id="cabecalho-historico">Histórico</th>
+            <th class="col-fixar"><span class="invisivel">Fixar</span></th>
+          </tr>
+        </thead>
+        <tbody id="corpo-tabela"></tbody>
+      </table>
+      <div id="tabela-vazia" class="tabela-vazia">Conectando ao scanner…</div>
+    </div>
+  </section>
+</main>
+
+<!-- ===================== Barra de status (rodape) ===================== -->
+<footer class="rodape">
+  <div class="rodape-info">
+    <span>Última atualização: <b id="ultima-atualizacao">—</b></span>
+    <span id="contagem">0 oportunidades</span>
+    <span id="conexao" class="conexao conexao-conectando"><i aria-hidden="true"></i><span id="conexao-texto">Conectando…</span></span>
+    <span id="aviso-pausa" class="aviso-pausa" hidden>PAUSADO</span>
+  </div>
+  <div id="saude-corretoras" class="saude-corretoras" aria-label="Saúde das corretoras"></div>
+  <div class="rodape-acoes">
+    <input type="search" id="busca" placeholder="Buscar moeda…" autocomplete="off" aria-label="Buscar moeda">
+    <button type="button" id="pausar" class="botao" aria-pressed="false">Pausar</button>
+  </div>
+</footer>
+
+<!-- ===================== Grafico do historico (janela por cima da pagina) ===================== -->
+<div id="modal-grafico" class="modal" hidden>
+  <div class="modal-caixa" role="dialog" aria-modal="true" aria-labelledby="grafico-titulo">
+    <div class="modal-topo">
+      <div class="modal-titulos">
+        <h2 id="grafico-titulo">Histórico</h2>
+        <div id="grafico-subtitulo" class="menor"></div>
+      </div>
+      <div class="modal-controles">
+        <div class="segmentado" role="group" aria-label="Intenção">
+          <button type="button" class="segmento" data-intencao="abertura" aria-pressed="true">Abertura</button>
+          <button type="button" class="segmento" data-intencao="fechamento" aria-pressed="false">Fechamento</button>
+        </div>
+        <span id="grafico-periodo" class="menor"></span>
+        <button type="button" id="grafico-fechar" class="botao-icone" title="Fechar (Esc)" aria-label="Fechar">
+          <svg class="icone" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+    </div>
+    <div id="grafico-resumo" class="grafico-resumo"></div>
+    <div id="grafico-legenda" class="grafico-legenda"></div>
+    <div class="grafico-area">
+      <div id="grafico-tela" class="grafico-tela"></div>
+      <div id="grafico-mensagem" class="grafico-mensagem" hidden></div>
+      <div id="grafico-dica" class="grafico-dica" hidden></div>
+    </div>
+    <p class="menor nota-grafico">As linhas mostram os preços de abertura (ask do long e bid do short) nas duas intenções; o que muda entre abertura e fechamento é o spread.</p>
+  </div>
+</div>
+
+</body>
+</html>

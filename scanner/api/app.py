@@ -10,10 +10,10 @@
 - GET    /api/sessao, PUT /api/sessao   modo, filtros e comparacao em uso pelo motor
 - GET    /api/status                 saude de cada corretora
 - WS     /ws/sinais                  um retrato dos sinais ao conectar e depois cada evento do motor
+- GET    /                           o painel web (arquivos de scanner/painel: index.html, app.js, estilo.css)
 
-Senha: com `painel.usuario` no config.yaml, TUDO exige HTTP Basic (rotas /api, WebSocket e, na
-Task 12, os arquivos do painel). A conferencia e um middleware, entao rotas e arquivos novos ja
-nascem protegidos.
+Senha: com `painel.usuario` no config.yaml, TUDO exige HTTP Basic (rotas /api, WebSocket e os
+arquivos do painel). A conferencia e um middleware, entao rotas e arquivos novos ja nascem protegidos.
 
 Threads: as rotas que leem ou mudam o motor sao `async def`, ou seja, rodam no laco do asyncio,
 o mesmo do motor, e nunca no meio de um ciclo. As que so falam com o banco (que tem trava propria)
@@ -25,15 +25,18 @@ import base64
 import heapq
 import json
 import logging
+import mimetypes
 import secrets
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Literal
 
 import anyio
 from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, StrictBool
+from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from scanner.api.transmissor import Transmissor
@@ -49,6 +52,17 @@ registro = logging.getLogger("scanner.api")
 # (painel lento demais, derrubado pelo Transmissor: ele reconecta e recebe o snapshot de novo).
 CODIGO_SENHA_ERRADA = 1008
 CODIGO_PAINEL_LENTO = 1013
+
+# A pasta do painel, achada a partir deste arquivo (scanner/api/app.py -> scanner/painel): funciona
+# de qualquer pasta em que o scanner for iniciado, no Windows e no Linux.
+PASTA_PAINEL = Path(__file__).resolve().parent.parent / "painel"
+
+# O tipo de cada arquivo vem do modulo `mimetypes`, que no Windows le o registro do sistema; em
+# alguns PCs o registro diz que .js e "text/plain", e o navegador pode recusar o script. Aqui o
+# tipo certo fica garantido, em qualquer sistema.
+mimetypes.add_type("text/javascript", ".js")
+mimetypes.add_type("text/css", ".css")
+mimetypes.add_type("text/html", ".html")
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +127,18 @@ class ExigirSenha:
         usuario_certo = secrets.compare_digest(usuario, self._usuario)
         senha_certa = secrets.compare_digest(senha, self._senha)
         return usuario_certo and senha_certa
+
+
+class ArquivosDoPainel(StaticFiles):
+    """Os arquivos do painel, com `Cache-Control: no-cache`: o navegador pode guardar uma copia, mas
+    confere com o servidor antes de usar (resposta 304 se nao mudou). Assim, depois de atualizar o
+    scanner, ninguem fica com um app.js velho na tela.
+    """
+
+    def file_response(self, *argumentos, **nomeados):
+        resposta = super().file_response(*argumentos, **nomeados)
+        resposta.headers["Cache-Control"] = "no-cache"
+        return resposta
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +334,12 @@ def criar_app(
             await _ate_um_terminar(lambda: _enviar(ws, fila, retrato), lambda: _esperar_desconexao(ws))
         finally:
             transmissor.remover(fila)
+
+    # --- Painel web (arquivos estaticos) -------------------------------------
+    # Montado POR ULTIMO: o "/" pega qualquer endereco, entao as rotas /api e /ws precisam vir antes
+    # (o FastAPI confere as rotas na ordem em que foram criadas). html=True: "/" entrega o index.html.
+    # Endereco que nao existe da 404; WebSocket em endereco desconhecido e fechado.
+    app.mount("/", ArquivosDoPainel(directory=PASTA_PAINEL, html=True), name="painel")
 
     return app
 
