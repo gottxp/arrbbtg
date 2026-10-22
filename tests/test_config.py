@@ -248,3 +248,123 @@ def test_limite_de_corretora_que_nao_esta_em_corretoras_da_erro_claro(tmp_path):
         carregar_config(escrever(tmp_path, "limites_assinatura:\n  bingx: 200\n"))
     c = carregar_config(escrever(tmp_path, "corretoras: [bingx, gate]\nlimites_assinatura:\n  bingx: 200\n"))
     assert c.limites_assinatura == {"bingx": 200}
+
+
+# ---------------------------------------------------------------------------
+# Campos da Task 15 (fase 2 de corretoras: mercados, tickers, cotacao e funding)
+# ---------------------------------------------------------------------------
+
+SEIS = "corretoras: [mexc, gate, bitget, bingx, xt, hyperliquid]\n"
+
+
+def test_campos_da_fase_2_com_os_padroes(tmp_path):
+    c = carregar_config(escrever(tmp_path, ""))
+    assert c.mercados_por_corretora == {}
+    assert c.metodo_ticker == {}
+    assert c.mensagens_sem_bid_ask == 10
+    assert c.fonte_cotacao == "bitget"
+    assert c.fontes_cotacao == {}
+    assert c.faixa_cotacao_pct == 10
+    assert c.intervalo_funding_h == {}
+    assert c.mercados_da_corretora("mexc") == ("spot", "futuro")  # sem nada: os dois mercados
+
+
+def test_campos_da_fase_2_lidos_do_yaml(tmp_path):
+    c = carregar_config(escrever(tmp_path, SEIS + (
+        "mercados_por_corretora:\n  hyperliquid: [futuro]\n  xt: [futuro, spot]\n"
+        "metodo_ticker:\n  hyperliquid: watch_ticker\n  xt: watch_tickers\n"
+        "mensagens_sem_bid_ask: 3\n"
+        "fonte_cotacao: gate\n"
+        "fontes_cotacao:\n  usdg: bingx\n"
+        "faixa_cotacao_pct: 2.5\n"
+        "intervalo_funding_h:\n  hyperliquid: 1\n"
+    )))
+    assert c.mercados_por_corretora == {"hyperliquid": ("futuro",), "xt": ("futuro", "spot")}
+    assert c.mercados_da_corretora("hyperliquid") == ("futuro",)
+    assert c.mercados_da_corretora("gate") == ("spot", "futuro")
+    assert c.metodo_ticker == {"hyperliquid": "watch_ticker", "xt": "watch_tickers"}
+    assert c.mensagens_sem_bid_ask == 3
+    assert c.fonte_cotacao == "gate"
+    assert c.fontes_cotacao == {"USDG": "bingx"}  # a moeda fica em maiuscula, como o ccxt escreve
+    assert c.faixa_cotacao_pct == 2.5
+    assert c.intervalo_funding_h == {"hyperliquid": 1}
+
+
+def test_campos_da_fase_2_vazios_ou_nulos(tmp_path):
+    c = carregar_config(escrever(tmp_path, "mercados_por_corretora:\nmetodo_ticker: {}\nfontes_cotacao:\n"
+                                           "intervalo_funding_h: {}\n"))
+    assert (c.mercados_por_corretora, c.metodo_ticker, c.fontes_cotacao, c.intervalo_funding_h) == ({}, {}, {}, {})
+
+
+@pytest.mark.parametrize("texto, campo", [
+    ("mercados_por_corretora: [mexc]\n", "mercados_por_corretora"),
+    ("mercados_por_corretora:\n  mexc: futuro\n", "mercados_por_corretora"),
+    ("mercados_por_corretora:\n  mexc: []\n", "mercados_por_corretora"),
+    ("mercados_por_corretora:\n  mexc: [margem]\n", "mercados_por_corretora"),
+    ("mercados_por_corretora:\n  mexc: [futuro, futuro]\n", "mercados_por_corretora"),
+    ("metodo_ticker: watch_ticker\n", "metodo_ticker"),
+    ("metodo_ticker:\n  mexc: watch_order_book\n", "metodo_ticker"),
+    ("mensagens_sem_bid_ask: 0\n", "mensagens_sem_bid_ask"),
+    ("mensagens_sem_bid_ask: 2.5\n", "mensagens_sem_bid_ask"),
+    ("mensagens_sem_bid_ask: true\n", "mensagens_sem_bid_ask"),
+    ("fonte_cotacao: 5\n", "fonte_cotacao"),
+    ("fonte_cotacao: ''\n", "fonte_cotacao"),
+    ("fontes_cotacao: [bitget]\n", "fontes_cotacao"),
+    ("fontes_cotacao:\n  USDC: 5\n", "fontes_cotacao"),
+    ("fontes_cotacao:\n  USDT: bitget\n", "fontes_cotacao"),  # USDT e a base: nao tem cotacao
+    ("faixa_cotacao_pct: 0\n", "faixa_cotacao_pct"),
+    ("faixa_cotacao_pct: -1\n", "faixa_cotacao_pct"),
+    ("intervalo_funding_h: 8\n", "intervalo_funding_h"),
+    ("intervalo_funding_h:\n  mexc: 0\n", "intervalo_funding_h"),
+    ("intervalo_funding_h:\n  mexc: 2.5\n", "intervalo_funding_h"),
+    ("intervalo_funding_h:\n  mexc: true\n", "intervalo_funding_h"),
+])
+def test_campos_da_fase_2_com_formato_errado(tmp_path, texto, campo):
+    with pytest.raises(ErroConfig, match=campo):
+        carregar_config(escrever(tmp_path, texto))
+
+
+@pytest.mark.parametrize("texto, campo", [
+    ("mercados_por_corretora:\n  hyperliqiud: [futuro]\n", "mercados_por_corretora.*hyperliqiud"),
+    ("metodo_ticker:\n  bingks: watch_ticker\n", "metodo_ticker.*bingks"),
+    ("intervalo_funding_h:\n  hyperliqiud: 1\n", "intervalo_funding_h.*hyperliqiud"),
+    ("fontes_cotacao:\n  USDC: krakn\n", "fontes_cotacao.*krakn"),
+    ("fonte_cotacao: bitgte\n", "fonte_cotacao.*bitgte"),
+])
+def test_corretora_dos_campos_da_fase_2_precisa_estar_em_corretoras(tmp_path, texto, campo):
+    # Erro de digitacao no nome desligaria o ajuste em silencio.
+    with pytest.raises(ErroConfig, match=campo):
+        carregar_config(escrever(tmp_path, SEIS + texto))
+
+
+def test_fonte_da_cotacao_precisa_ter_spot(tmp_path):
+    # A cotacao vem do ticker SPOT da fonte (ex.: USDC/USDT da Bitget).
+    with pytest.raises(ErroConfig, match="fonte_cotacao.*hyperliquid.*spot"):
+        carregar_config(escrever(tmp_path, SEIS + "mercados_por_corretora:\n  hyperliquid: [futuro]\n"
+                                                  "fonte_cotacao: hyperliquid\n"))
+    with pytest.raises(ErroConfig, match="fontes_cotacao.*USDC.*bitget.*spot"):
+        carregar_config(escrever(tmp_path, SEIS + "mercados_por_corretora:\n  bitget: [futuro]\n"
+                                                  "fontes_cotacao:\n  USDC: bitget\n"))
+    with pytest.raises(ErroConfig, match="fonte_cotacao.*bitget.*spot"):  # o padrao (bitget) tambem
+        carregar_config(escrever(tmp_path, SEIS + "mercados_por_corretora:\n  bitget: [futuro]\n"))
+
+
+def test_fonte_padrao_fora_das_corretoras_nao_e_erro(tmp_path):
+    # Sem escrever fonte_cotacao, a Bitget pode nem estar ligada (ex.: so [gate, mexc]): sem erro; no uso,
+    # a cotacao fica de fora (1:1 com aviso_cotacao) e o log avisa.
+    c = carregar_config(escrever(tmp_path, "corretoras: [gate, mexc]\n"))
+    assert c.fonte_cotacao == "bitget"
+
+
+def test_config_yaml_do_projeto_traz_as_seis_corretoras_e_os_campos_da_fase_2():
+    caminho = RAIZ / "config.yaml"
+    c = carregar_config(str(caminho))
+    assert c.corretoras == ["mexc", "gate", "bitget", "bingx", "xt", "hyperliquid"]
+    assert c.mercados_da_corretora("hyperliquid") == ("futuro",)   # spec, secao 2: so futuros
+    assert c.metodo_ticker.get("hyperliquid") == "watch_ticker"     # o lote (allMids) nao tem bid/ask
+    assert c.intervalo_funding_h.get("hyperliquid") == 1            # funding de hora em hora
+    assert c.fonte_cotacao == "bitget"
+    chaves = yaml.safe_load(caminho.read_text(encoding="utf-8")) or {}
+    for campo in ("mercados_por_corretora", "metodo_ticker", "mensagens_sem_bid_ask", "fonte_cotacao",
+                  "fontes_cotacao", "faixa_cotacao_pct", "intervalo_funding_h"):
+        assert campo in chaves, campo

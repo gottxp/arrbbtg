@@ -17,14 +17,17 @@ from scanner.coletores.ccxt_coletor import (
     livro_de_ccxt,
     mercado_do_simbolo,
 )
+from scanner.config.carregar import Config
 from scanner.ferramentas.imprimir_precos import (
     formatar_linha,
     imprimir_precos,
     main,
-    simbolos_padrao,
+    preparar,
+    simbolos_da_corretora,
     texto_preco,
 )
 from scanner.modelos import Livro
+from tests.fabricas import HL_BTC, HL_SPOT_BTC, market_ccxt
 
 
 # ---------------------------------------------------------------------------
@@ -326,13 +329,6 @@ def test_formatar_linha_mostra_corretora_mercado_simbolo_bid_e_ask():
     assert "\n" not in linha
 
 
-def test_simbolos_padrao_tem_spot_e_futuro_de_btc_eth_sol():
-    assert simbolos_padrao() == [
-        "BTC/USDT", "ETH/USDT", "SOL/USDT",
-        "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
-    ]
-
-
 class ColetorFalso(Coletor):
     """Entrega livros prontos e depois espera, como um coletor de verdade."""
 
@@ -462,3 +458,91 @@ def test_imprimir_precos_termina_quando_todos_os_coletores_terminam_sem_erro():
 def test_main_com_uma_corretora_inexistente_entre_varias_avisa_e_devolve_1(capsys):
     assert main(["bitget", "corretora_que_nao_existe", "gate"]) == 1
     assert "corretora_que_nao_existe" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# imprimir_precos com as 6 corretoras (marco da Task 15): os pares de cada corretora
+# ---------------------------------------------------------------------------
+
+def markets_hyperliquid():
+    """BTC, ETH e SOL perpetuos em USDC (como o ccxt entrega a Hyperliquid) e o spot BTC/USDC (UBTC)."""
+    markets = {"BTC/USDC:USDC": HL_BTC, "BTC/USDC": HL_SPOT_BTC}
+    for ativo in ("ETH", "SOL"):
+        markets[f"{ativo}/USDC:USDC"] = {**HL_BTC, "symbol": f"{ativo}/USDC:USDC", "base": ativo, "baseName": ativo}
+    return markets
+
+
+class ExchangeSoMarkets:
+    """Corretora falsa so com load_markets (e close), para escolher os pares sem rede."""
+
+    def __init__(self, markets, erro=None):
+        self.markets = None
+        self._para_carregar = markets
+        self.erro = erro
+        self.has = {"watchTickers": True}
+        self.fechada = False
+
+    async def load_markets(self, reload=False, params=None):
+        if self.erro is not None:
+            raise self.erro
+        self.markets = self._para_carregar
+        return self.markets
+
+    async def close(self):
+        self.fechada = True
+
+
+def test_simbolos_da_corretora_usa_os_pares_que_ela_tem():
+    ex = ExchangeSoMarkets(markets_hyperliquid())
+    asyncio.run(ex.load_markets())
+    coletor = ColetorCcxt("hyperliquid", ex, mercados=("futuro",))
+    assert simbolos_da_corretora(coletor) == ["BTC/USDC:USDC", "ETH/USDC:USDC", "SOL/USDC:USDC"]
+    # Com os dois mercados ligados, o spot dela (BTC/USDC) tambem aparece.
+    assert simbolos_da_corretora(ColetorCcxt("hyperliquid", ex)) == [
+        "BTC/USDC", "BTC/USDC:USDC", "ETH/USDC:USDC", "SOL/USDC:USDC"]
+
+
+def test_simbolos_da_corretora_prefere_usdt_e_usa_o_prefixo_que_ela_lista():
+    markets = {s: market_ccxt(s, b) for s, b in (("BTC/USDT", "BTC"), ("BTC/USDT:USDT", "BTC"),
+                                                  ("ETH/USDT:USDT", "ETH"), ("SOL/USDT", "SOL"))}
+    markets["BTC/USDC:USDC"] = market_ccxt("BTC/USDC:USDC", "BTC", quote="USDC")
+    ex = ExchangeSoMarkets(markets)
+    asyncio.run(ex.load_markets())
+    assert simbolos_da_corretora(ColetorCcxt("bingx", ex)) == ["BTC/USDT", "SOL/USDT", "BTC/USDT:USDT", "ETH/USDT:USDT"]
+
+
+def test_preparar_le_os_mercados_da_config_e_pula_quem_nao_carregou():
+    mexc_markets = {s: market_ccxt(s, "BTC") for s in ("BTC/USDT", "BTC/USDT:USDT")}
+    exchanges = {"mexc": ExchangeSoMarkets(mexc_markets), "hyperliquid": ExchangeSoMarkets(markets_hyperliquid()),
+                 "xt": ExchangeSoMarkets({}, erro=ErroDaCorretora("fora do ar"))}
+    cfg = Config(corretoras=["mexc", "hyperliquid", "xt"], mercados_por_corretora={"hyperliquid": ("futuro",)})
+    coletores, simbolos, erros = asyncio.run(preparar(exchanges, cfg))
+    assert [c.nome for c in coletores] == ["mexc", "hyperliquid"]
+    assert simbolos == {"mexc": ["BTC/USDT", "BTC/USDT:USDT"],
+                        "hyperliquid": ["BTC/USDC:USDC", "ETH/USDC:USDC", "SOL/USDC:USDC"]}
+    assert len(erros) == 1 and "xt" in erros[0] and "fora do ar" in erros[0]
+    assert exchanges["xt"].fechada  # quem nao carregou e fechada na hora
+
+
+def test_preparar_corretora_sem_nenhum_dos_pares_vira_erro():
+    exchanges = {"gate": ExchangeSoMarkets({"DOGE/USDT": market_ccxt("DOGE/USDT", "DOGE")})}
+    coletores, simbolos, erros = asyncio.run(preparar(exchanges, Config(corretoras=["gate"])))
+    assert coletores == [] and simbolos == {} and "gate" in erros[0] and "BTC" in erros[0]
+    assert exchanges["gate"].fechada
+
+
+def test_imprimir_precos_com_os_pares_de_cada_corretora():
+    mexc = ColetorFalsoNomeado("mexc", [livro_de_teste("BTC/USDT:USDT", "futuro", bid=100.0, corretora="mexc")])
+    hl = ColetorFalsoNomeado("hyperliquid", [livro_de_teste("BTC/USDC:USDC", "futuro", bid=99.0,
+                                                            corretora="hyperliquid")])
+    linhas = rodar_imprimir([mexc, hl], {"mexc": ["BTC/USDT:USDT"], "hyperliquid": ["BTC/USDC:USDC"]})
+    assert any(l.startswith("mexc") and "BTC/USDT:USDT" in l and "bid 100.0" in l for l in linhas)
+    assert any(l.startswith("hyperliquid") and "BTC/USDC:USDC" in l and "bid 99.0" in l for l in linhas)
+    assert not any(l.startswith("hyperliquid") and "USDT" in l for l in linhas)  # cada uma so com os seus pares
+
+
+def test_main_com_config_invalida_avisa_e_devolve_1(tmp_path, capsys):
+    arq = tmp_path / "config.yaml"
+    arq.write_text("ciclo_ms: -1\n")
+    assert main(["mexc", "--config", str(arq)]) == 1
+    assert "ciclo_ms" in capsys.readouterr().err

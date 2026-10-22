@@ -35,7 +35,11 @@ class EstadoMercados:
         mais ou para menos, e relogio errado e fica fora do atraso medio.
 
     Os valores vem da Config (max_silencio_conexao_s, max_idade_livro_s e atraso_max_valido_s).
-    Chave de tudo: (corretora, mercado, ativo normalizado).
+    Chave de tudo: (corretora, mercado, ativo normalizado). A excecao sao os tickers dos pares de
+    cotacao (ex.: USDC/USDT da fonte_cotacao), guardados por (corretora, simbolo do ccxt): o mesmo
+    ativo pode ter varios pares spot e a cotacao precisa ler exatamente o seu (ex.: USDT/USD da Kraken,
+    e nao o USDT/EUR que ocupa a chave do ativo USDT). Eles nao entram em `mercados()`: nao formam
+    combinacao nenhuma por estarem aqui.
     """
 
     def __init__(self, max_silencio_s: float = 2, max_idade_livro_s: float = 30, atraso_max_valido_s: float = 30):
@@ -45,6 +49,7 @@ class EstadoMercados:
         self._ultima_mensagem: dict[str, float] = {}  # corretora -> horario da ultima mensagem
         self._livros: dict[tuple[str, str, str], Livro] = {}
         self._tickers: dict[tuple[str, str, str], dict] = {}
+        self._cotacoes: dict[tuple[str, str], dict] = {}  # (corretora, simbolo) -> ticker do par de cotacao
         # Saude das corretoras (painel).
         self._reconectando: set[str] = set()  # caiu e ainda nao voltou
         self._reconexoes: dict[str, int] = {}  # corretora -> quantas vezes voltou depois de cair
@@ -86,6 +91,14 @@ class EstadoMercados:
             "cotacao": cotacao,
         }
 
+    def atualizar_cotacao(self, corretora: str, simbolo: str, bid: float, ask: float, recebido_em: float) -> None:
+        """Guarda o melhor bid/ask de um par de cotacao pelo simbolo do ccxt (ex.: "USDC/USDT"), com o preco cru."""
+        self._cotacoes[(corretora, simbolo)] = {"bid": bid, "ask": ask, "recebido_em": recebido_em}
+
+    def remover_cotacao(self, corretora: str, simbolo: str) -> None:
+        """Apaga o ticker do par de cotacao (a assinatura dele parou). Se nao existe, nao faz nada."""
+        self._cotacoes.pop((corretora, simbolo), None)
+
     def atualizar_livro(self, livro: Livro, ativo: str | None = None) -> None:
         """Etapa 2: guarda o livro completo. `ativo` e o nome normalizado (padrao: o nome original)."""
         chave = (livro.corretora, livro.mercado, ativo if ativo is not None else livro.simbolo_original)
@@ -125,7 +138,7 @@ class EstadoMercados:
         """
         self._ultima_mensagem.pop(corretora, None)
         self._reconectando.add(corretora)
-        for dados in (self._livros, self._tickers):
+        for dados in (self._livros, self._tickers, self._cotacoes):
             for chave in [c for c in dados if c[0] == corretora]:
                 del dados[chave]
 
@@ -220,6 +233,18 @@ class EstadoMercados:
         Vale a mesma regra do livro: conexao viva e dado com no maximo `max_idade_livro_s`.
         """
         ticker = self._tickers.get((corretora, mercado, ativo))
+        if ticker is None or not self.conexao_viva(corretora, agora):
+            return None
+        if agora - ticker["recebido_em"] > self._max_idade_livro_s:
+            return None
+        return ticker
+
+    def obter_cotacao(self, corretora: str, simbolo: str, agora: float) -> dict | None:
+        """O ticker do par de cotacao ({"bid", "ask", "recebido_em"}), ou None.
+
+        Mesma regra de obter_ticker: conexao viva e dado com no maximo `max_idade_livro_s`.
+        """
+        ticker = self._cotacoes.get((corretora, simbolo))
         if ticker is None or not self.conexao_viva(corretora, agora):
             return None
         if agora - ticker["recebido_em"] > self._max_idade_livro_s:

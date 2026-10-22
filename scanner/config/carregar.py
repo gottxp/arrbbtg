@@ -17,6 +17,8 @@ class ErroConfig(Exception):
 METRICAS_SPREAD = ("medio", "maior", "media_10_maiores")
 NIVEIS_LOG = ("normal", "detalhado")
 MERCADOS = ("spot", "futuro")
+# Metodos do ccxt para os tickers da etapa 1 (veja METODOS_DE_TICKER no coletor), na ordem de preferencia.
+METODOS_TICKER = ("watch_tickers", "watch_bids_asks", "watch_ticker")
 
 
 def _painel_padrao() -> dict:
@@ -74,11 +76,31 @@ class Config:
     # De quanto em quanto tempo o log registra memoria, CPU e o resumo dos descartes, em segundos.
     intervalo_log_recursos_s: float = 300
 
+    # Fase 2 de corretoras (Task 15).
+    # Mercados usados de cada corretora, ex.: {"hyperliquid": ("futuro",)}. Corretora fora daqui usa os dois.
+    mercados_por_corretora: dict = field(default_factory=dict)
+    # Metodo do ccxt que cada corretora tenta primeiro para os tickers, ex.: {"hyperliquid": "watch_ticker"}.
+    metodo_ticker: dict = field(default_factory=dict)
+    # Mensagens seguidas de tickers sem bid/ask (sem nenhum bom antes) para trocar de metodo de ticker.
+    mensagens_sem_bid_ask: int = 10
+    # Corretora cujo ticker SPOT da a cotacao das outras moedas (USDC/USDT...) e a excecao por moeda,
+    # ex.: {"USD": "kraken"}.
+    fonte_cotacao: str = "bitget"
+    fontes_cotacao: dict = field(default_factory=dict)
+    # Cotacao mais longe de 1 do que isto, em %, e tratada como sem cotacao (1:1 com aviso_cotacao).
+    faixa_cotacao_pct: float = 10
+    # Intervalo do funding em horas por corretora, ex.: {"hyperliquid": 1}. Vale sobre o que o ccxt informa.
+    intervalo_funding_h: dict = field(default_factory=dict)
+
     # Painel web.
     painel: dict = field(default_factory=_painel_padrao)
 
     banco: str = "scanner.db"
     nivel_log: str = "normal"
+
+    def mercados_da_corretora(self, corretora: str) -> tuple[str, ...]:
+        """Os mercados usados da corretora: os de mercados_por_corretora ou, se ela nao estiver la, os dois."""
+        return tuple(self.mercados_por_corretora.get(corretora, MERCADOS))
 
 
 # Campos numericos que precisam ser maiores que zero.
@@ -99,6 +121,7 @@ CAMPOS_POSITIVOS = (
     "espera_max_reconexao_s",
     "atraso_max_valido_s",
     "intervalo_log_recursos_s",
+    "faixa_cotacao_pct",
 )
 
 # Campos numericos que aceitam qualquer valor (inclusive zero ou negativo).
@@ -164,6 +187,66 @@ def _validar_limites_assinatura(valor) -> dict:
     return {str(corretora): limite for corretora, limite in valor.items()}
 
 
+def _validar_mercados_por_corretora(valor) -> dict:
+    """{corretora: (mercados,)}; vazio (ou o campo sem nada) = as duas para todas."""
+    if valor is None:
+        return {}
+    modelo = "mercados_por_corretora: use o formato  corretora: [futuro]  (lista com spot e/ou futuro, sem repetir)"
+    if not isinstance(valor, dict):
+        raise ErroConfig(modelo)
+    resultado = {}
+    for corretora, mercados in valor.items():
+        lista_ok = isinstance(mercados, list) and bool(mercados) and all(
+            isinstance(m, str) and m in MERCADOS for m in mercados)
+        if not lista_ok or len(set(mercados)) != len(mercados):
+            raise ErroConfig(f"{modelo}; '{corretora}' esta com {mercados!r}")
+        resultado[str(corretora)] = tuple(mercados)
+    return resultado
+
+
+def _validar_metodo_ticker(valor) -> dict:
+    """{corretora: metodo do ccxt}; vazio = cada corretora usa a ordem padrao."""
+    if valor is None:
+        return {}
+    modelo = f"metodo_ticker: use o formato  corretora: watch_ticker  (opcoes: {', '.join(METODOS_TICKER)})"
+    if not isinstance(valor, dict):
+        raise ErroConfig(modelo)
+    for corretora, metodo in valor.items():
+        if not isinstance(metodo, str) or metodo not in METODOS_TICKER:
+            raise ErroConfig(f"{modelo}; '{corretora}' esta com {metodo!r}")
+    return {str(corretora): metodo for corretora, metodo in valor.items()}
+
+
+def _validar_intervalo_funding(valor) -> dict:
+    """{corretora: horas inteiras > 0}; vazio = vale o que o ccxt informa (ou 8h)."""
+    if valor is None:
+        return {}
+    modelo = "intervalo_funding_h: use o formato  corretora: 1  (horas inteiras, maior que zero)"
+    if not isinstance(valor, dict):
+        raise ErroConfig(modelo)
+    for corretora, horas in valor.items():
+        if not _inteiro_positivo(horas):
+            raise ErroConfig(f"{modelo}; '{corretora}' esta com {horas!r}")
+    return {str(corretora): horas for corretora, horas in valor.items()}
+
+
+def _validar_fontes_cotacao(valor) -> dict:
+    """{MOEDA: corretora}, com a moeda em maiuscula (como o ccxt escreve); vazio = todas da fonte_cotacao."""
+    if valor is None:
+        return {}
+    modelo = "fontes_cotacao: use o formato  MOEDA: corretora  (ex.: USD: kraken)"
+    if not isinstance(valor, dict):
+        raise ErroConfig(modelo)
+    resultado = {}
+    for moeda, corretora in valor.items():
+        if not isinstance(moeda, str) or not moeda or not isinstance(corretora, str) or not corretora:
+            raise ErroConfig(f"{modelo}; '{moeda}' esta com {corretora!r}")
+        if moeda.upper() == "USDT":
+            raise ErroConfig("fontes_cotacao: USDT e a moeda base do scanner e nao precisa de cotacao")
+        resultado[moeda.upper()] = corretora
+    return resultado
+
+
 def _validar_painel(valor) -> dict:
     """Completa o que faltar no painel com os padroes e confere cada item."""
     if not isinstance(valor, dict):
@@ -212,9 +295,21 @@ def _validar_campo(campo: str, valor):
         if not isinstance(valor, str) or not valor:
             raise ErroConfig("pasta_logs: precisa ser o nome de uma pasta, ex.: logs")
         return valor
-    if campo == "dias_logs":
+    if campo in ("dias_logs", "mensagens_sem_bid_ask"):
         if not _inteiro_positivo(valor):
-            raise ErroConfig(f"dias_logs: precisa ser um numero inteiro maior que zero (valor recebido: {valor!r})")
+            raise ErroConfig(f"{campo}: precisa ser um numero inteiro maior que zero (valor recebido: {valor!r})")
+        return valor
+    if campo == "mercados_por_corretora":
+        return _validar_mercados_por_corretora(valor)
+    if campo == "metodo_ticker":
+        return _validar_metodo_ticker(valor)
+    if campo == "intervalo_funding_h":
+        return _validar_intervalo_funding(valor)
+    if campo == "fontes_cotacao":
+        return _validar_fontes_cotacao(valor)
+    if campo == "fonte_cotacao":
+        if not isinstance(valor, str) or not valor:
+            raise ErroConfig("fonte_cotacao: precisa ser o nome de uma corretora com spot, ex.: bitget")
         return valor
     # Sobraram os campos numericos.
     if not _e_numero(valor):
@@ -251,15 +346,44 @@ def carregar_config(caminho: str) -> Config:
         valores[campo] = _validar_campo(campo, valor)
     config = Config(**valores)
     _conferir_nomes_das_corretoras(config)
+    _conferir_fontes_de_cotacao(config, fonte_escrita="fonte_cotacao" in dados)
     return config
 
 
-def _conferir_nomes_das_corretoras(config: Config) -> None:
-    """Campo por corretora (limites_assinatura) so com corretoras que estao em `corretoras`.
+# Campos {corretora: valor}: o nome da corretora precisa estar em `corretoras`.
+CAMPOS_POR_CORRETORA = ("limites_assinatura", "mercados_por_corretora", "metodo_ticker", "intervalo_funding_h")
 
-    Um nome com erro de digitacao seria ignorado em silencio (o limite ficaria desligado).
+
+def _conferir_nomes_das_corretoras(config: Config) -> None:
+    """Campos por corretora (veja CAMPOS_POR_CORRETORA) so com corretoras que estao em `corretoras`.
+
+    Um nome com erro de digitacao seria ignorado em silencio (o ajuste ficaria desligado).
     """
-    fora = sorted(set(config.limites_assinatura) - set(config.corretoras))
-    if fora:
-        raise ErroConfig(f"limites_assinatura: {', '.join(fora)} nao esta em corretoras (erro de digitacao?); "
+    for campo in CAMPOS_POR_CORRETORA:
+        fora = sorted(set(getattr(config, campo)) - set(config.corretoras))
+        if fora:
+            raise ErroConfig(f"{campo}: {', '.join(fora)} nao esta em corretoras (erro de digitacao?); "
+                             f"corretoras: {', '.join(config.corretoras)}")
+
+
+def _conferir_fontes_de_cotacao(config: Config, fonte_escrita: bool) -> None:
+    """A fonte da cotacao (e a de cada moeda em fontes_cotacao) precisa estar em `corretoras` e ter spot.
+
+    A cotacao vem do ticker SPOT da fonte (ex.: USDC/USDT da Bitget). A fonte padrao (bitget) so e
+    conferida se foi escrita no config.yaml ou se a Bitget esta ligada: com outras corretoras (ex.: so
+    [gate, mexc]) nao e erro; sem a fonte, as moedas fora de USDT usam 1:1 com aviso_cotacao (e o log avisa).
+    """
+    for moeda, corretora in config.fontes_cotacao.items():
+        _conferir_fonte(f"fontes_cotacao ({moeda})", corretora, config)
+    if fonte_escrita or config.fonte_cotacao in config.corretoras:
+        campo = "fonte_cotacao" if fonte_escrita else "fonte_cotacao (padrao)"
+        _conferir_fonte(campo, config.fonte_cotacao, config)
+
+
+def _conferir_fonte(campo: str, corretora: str, config: Config) -> None:
+    if corretora not in config.corretoras:
+        raise ErroConfig(f"{campo}: {corretora} nao esta em corretoras (erro de digitacao?); "
                          f"corretoras: {', '.join(config.corretoras)}")
+    if "spot" not in config.mercados_da_corretora(corretora):
+        raise ErroConfig(f"{campo}: {corretora} esta sem spot em mercados_por_corretora, e a cotacao vem do "
+                         "ticker spot da fonte; escolha outra corretora")

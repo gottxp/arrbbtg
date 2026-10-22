@@ -86,13 +86,34 @@ def separar_multiplicador(base: str) -> tuple[str, float]:
     return base, 1.0
 
 
+def _base_original(market: dict) -> str:
+    """O nome da base como a corretora escreve, quando o ccxt so mudou a caixa dele; senao a base do ccxt.
+
+    O ccxt poe o codigo da moeda em maiuscula: o "kPEPE" da Hyperliquid chega como base "KPEPE", com o
+    nome original em `baseName`. Sem o original, o "k" minusculo (multiplicador 1000) se perderia. So vale
+    quando o `baseName` e a mesma palavra em outra caixa: "UBTC" -> "BTC" (token embrulhado) e
+    "xyz:TSLA" -> "XYZ-TSLA" (outro nome) continuam com a base do ccxt.
+    """
+    base = market["base"]
+    original = market.get("baseName")
+    if isinstance(original, str) and isinstance(base, str) and len(original) == len(base) \
+            and original != base and original.upper() == base:
+        return original
+    return base
+
+
 def normalizar(corretora: str, market: dict) -> ParNormalizado:
     """Monta o ParNormalizado a partir de um market do ccxt.
 
     corretora: nome da corretora (ex.: "mexc"). Hoje as regras sao as mesmas
     para todas; o argumento fica para regras especificas por corretora.
+    O prefixo de multiplicador e procurado no nome original da base (veja _base_original), e o
+    ativo fica com o nome do ccxt sem o prefixo: "kPEPE"/"KPEPE" -> "PEPE" x1000.
     """
-    ativo, multiplicador = separar_multiplicador(market["base"])
+    base = market["base"]
+    original = _base_original(market)
+    resto, multiplicador = separar_multiplicador(original)
+    ativo = base[len(original) - len(resto):]  # mesmo tamanho: corta o prefixo na base do ccxt
     # No spot o ccxt manda contractSize None (ou nem manda): conta como 1.
     tamanho = market.get("contractSize")
     if tamanho is None:

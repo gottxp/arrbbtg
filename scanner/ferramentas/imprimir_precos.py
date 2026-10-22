@@ -3,16 +3,20 @@
 Como usar (no terminal, na pasta do projeto):
 
     python -m scanner.ferramentas.imprimir_precos bitget
-    python -m scanner.ferramentas.imprimir_precos mexc gate bitget
+    python -m scanner.ferramentas.imprimir_precos mexc gate bitget bingx xt hyperliquid
 
 Ela conecta na(s) corretora(s) e, a cada 5 segundos, escreve o bid (melhor preco de
 compra) e o ask (melhor preco de venda) de BTC, ETH e SOL, no spot e no futuro.
-Compare com o site da corretora: os precos tem que bater. Com varias corretoras, uma
-que cair aparece como "parou" e as outras continuam. Ctrl+C para parar.
+Cada corretora mostra os pares que ela tem, com o mesmo simbolo que o scanner usa (ex.: na
+Hyperliquid, "BTC/USDC:USDC", em USDC), e so os mercados ligados em mercados_por_corretora
+do config.yaml (a Hyperliquid, so o futuro). Compare com o site da corretora: os precos tem
+que bater. Com varias corretoras, uma que cair aparece como "parou" e as outras continuam.
+Ctrl+C para parar. --config escolhe outro config.yaml (padrao: o da pasta, se existir).
 """
 
 import argparse
 import asyncio
+import os
 import sys
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
@@ -20,6 +24,7 @@ from decimal import Decimal
 
 from scanner.coletores.base import Coletor
 from scanner.coletores.ccxt_coletor import ColetorCcxt, criar_exchange_ccxt, mercado_do_simbolo
+from scanner.config.carregar import MERCADOS, Config, ErroConfig, carregar_config
 from scanner.modelos import Livro
 
 # Ativos mostrados e intervalo padrao entre uma impressao e outra (muda com --intervalo).
@@ -27,9 +32,40 @@ ATIVOS = ("BTC", "ETH", "SOL")
 INTERVALO_PADRAO_S = 5
 
 
-def simbolos_padrao() -> list[str]:
-    """Spot ("BTC/USDT") e futuro perpetuo ("BTC/USDT:USDT") de cada ativo."""
-    return [f"{ativo}/USDT" for ativo in ATIVOS] + [f"{ativo}/USDT:USDT" for ativo in ATIVOS]
+def simbolos_da_corretora(coletor: ColetorCcxt) -> list[str]:
+    """Os simbolos de BTC, ETH e SOL (spot e futuro) que o scanner usa nesta corretora, os spot primeiro.
+
+    Sao os mesmos que vao para o estado do scanner: a cotacao preferida (USDT, depois USDC...) e so os
+    mercados do coletor (mercados_por_corretora). Os markets precisam estar carregados (load_markets).
+    """
+    chaves = coletor.simbolos_por_chave()
+    return [chaves[(mercado, ativo)] for mercado in MERCADOS for ativo in ATIVOS if (mercado, ativo) in chaves]
+
+
+async def preparar(exchanges: dict, cfg: Config) -> tuple[list[ColetorCcxt], dict[str, list[str]], list[str]]:
+    """Carrega a lista de mercados de cada corretora e escolhe os pares dela (veja simbolos_da_corretora).
+
+    exchanges: {nome: corretora do ccxt}. Devolve (coletores, {nome: simbolos}, erros). A corretora que nao
+    carrega a lista ou nao tem nenhum dos pares vira uma linha em `erros`, e fechada e fica de fora.
+    """
+    nomes = list(exchanges)
+    resultados = await asyncio.gather(*(exchanges[n].load_markets() for n in nomes), return_exceptions=True)
+    coletores, simbolos, erros = [], {}, []
+    for nome, resultado in zip(nomes, resultados):
+        if isinstance(resultado, BaseException):
+            erros.append(f"{nome}: nao consegui carregar a lista de mercados ({type(resultado).__name__}: {resultado})")
+            await exchanges[nome].close()
+            continue
+        coletor = ColetorCcxt(nome, exchanges[nome], mercados=cfg.mercados_da_corretora(nome))
+        pares = simbolos_da_corretora(coletor)
+        if not pares:
+            mercados = ", ".join(cfg.mercados_da_corretora(nome))
+            erros.append(f"{nome}: nenhum par de {', '.join(ATIVOS)} nos mercados {mercados}")
+            await exchanges[nome].close()
+            continue
+        coletores.append(coletor)
+        simbolos[nome] = pares
+    return coletores, simbolos, erros
 
 
 def texto_preco(preco: float) -> str:
@@ -50,24 +86,28 @@ def _linha_sem_dados(corretora: str, simbolo: str) -> str:
 
 async def imprimir_precos(
     coletores: Sequence[Coletor],
-    simbolos: list[str],
+    simbolos: list[str] | dict[str, list[str]],
     intervalo_s: float,
     escrever: Callable[[str], None] = print,
 ) -> None:
     """Liga os coletores e, a cada `intervalo_s`, escreve o ultimo preco de cada simbolo de cada corretora.
 
+    simbolos: a mesma lista para todas, ou {corretora: [simbolos]} (cada uma com os seus pares).
     Se um coletor cair, ele aparece como "parou" e os outros continuam. Termina quando
     todos terminarem (se algum caiu com erro, o ultimo erro sobe para quem chamou) ou
     quando for cancelada.
     """
     ultimos: dict[tuple[str, str], Livro] = {}  # (corretora, simbolo) -> livro mais recente
 
+    def pares_de(nome: str) -> list[str]:
+        return simbolos.get(nome, []) if isinstance(simbolos, dict) else simbolos
+
     def guardador(nome: str) -> Callable[[Livro], None]:
         def guardar(livro: Livro) -> None:
             ultimos[(nome, livro.simbolo_original)] = livro
         return guardar
 
-    coletas = {asyncio.create_task(c.iniciar(simbolos, guardador(c.nome))): c for c in coletores}
+    coletas = {asyncio.create_task(c.iniciar(pares_de(c.nome), guardador(c.nome))): c for c in coletores}
     vivas = set(coletas)
     paradas: dict[str, str] = {}  # corretora -> motivo de ter parado
     ultimo_erro: BaseException | None = None
@@ -93,7 +133,7 @@ async def imprimir_precos(
                     if coletor.nome in paradas:
                         escrever(f"{coletor.nome:<8} parou: {paradas[coletor.nome]}")
                         continue
-                    for simbolo in simbolos:
+                    for simbolo in pares_de(coletor.nome):
                         livro = ultimos.get((coletor.nome, simbolo))
                         escrever(formatar_linha(livro) if livro else _linha_sem_dados(coletor.nome, simbolo))
         if ultimo_erro is not None:
@@ -109,27 +149,55 @@ def main(argv=None) -> int:
         prog="python -m scanner.ferramentas.imprimir_precos",
         description="Mostra os precos (bid/ask) de BTC, ETH e SOL, no spot e no futuro, de uma ou mais corretoras.",
     )
-    parser.add_argument("corretoras", nargs="+", metavar="corretora", help="nome(s) da(s) corretora(s) no ccxt, ex.: mexc gate bitget")
+    parser.add_argument("corretoras", nargs="+", metavar="corretora",
+                        help="nome(s) da(s) corretora(s) no ccxt, ex.: mexc gate bitget bingx xt hyperliquid")
     parser.add_argument(
         "--intervalo",
         type=float,
         default=INTERVALO_PADRAO_S,
         help=f"segundos entre uma impressao e outra (padrao: {INTERVALO_PADRAO_S})",
     )
+    parser.add_argument("--config", default=None,
+                        help="config.yaml de onde vem mercados_por_corretora (padrao: ./config.yaml, se existir)")
     args = parser.parse_args(argv)
     if args.intervalo <= 0:
         parser.error("--intervalo precisa ser maior que zero")
 
     try:
+        cfg = _ler_config(args.config)
+    except ErroConfig as erro:
+        print(f"Erro na configuracao: {erro}", file=sys.stderr)
+        return 1
+
+    try:
         nomes = list(dict.fromkeys(args.corretoras))  # tira nomes repetidos, mantendo a ordem
-        coletores = [ColetorCcxt(nome, criar_exchange_ccxt(nome)) for nome in nomes]
-        asyncio.run(imprimir_precos(coletores, simbolos_padrao(), args.intervalo))
+        exchanges = {nome: criar_exchange_ccxt(nome) for nome in nomes}
+        asyncio.run(_conferir(exchanges, cfg, args.intervalo))
     except KeyboardInterrupt:
         print("\nEncerrado.")
     except Exception as erro:  # mostra o motivo em uma linha, sem o textao do traceback
         print(f"Erro: {type(erro).__name__}: {erro}", file=sys.stderr)
         return 1
     return 0
+
+
+def _ler_config(caminho: str | None) -> Config:
+    """O config.yaml pedido; sem pedir, o ./config.yaml se existir, senao os padroes."""
+    if caminho is None:
+        caminho = "config.yaml"
+        if not os.path.exists(caminho):
+            return Config()
+    return carregar_config(caminho)
+
+
+async def _conferir(exchanges: dict, cfg: Config, intervalo_s: float) -> None:
+    """Escolhe os pares de cada corretora e imprime os precos ate Ctrl+C (veja preparar e imprimir_precos)."""
+    coletores, simbolos, erros = await preparar(exchanges, cfg)
+    for erro in erros:
+        print(f"Erro: {erro}", file=sys.stderr)
+    if not coletores:
+        raise RuntimeError("nenhuma corretora pronta para mostrar precos")
+    await imprimir_precos(coletores, simbolos, intervalo_s)
 
 
 if __name__ == "__main__":

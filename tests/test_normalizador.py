@@ -12,7 +12,22 @@ from scanner.normalizador import (
     preco_unitario_usdt,
     prioridade_cotacao,
 )
-from tests.fabricas import livro, market_ccxt
+from scanner.coletores.ccxt_coletor import ColetorCcxt
+from scanner.motor import simbolos_para_tickers
+from tests.fabricas import (
+    BINGX_1000PEPE,
+    BINGX_BTC,
+    BINGX_BTC_USDC,
+    BINGX_PEPE_SPOT,
+    HL_BTC,
+    HL_KPEPE,
+    HL_SPOT_BTC,
+    HL_SPOT_USDT,
+    XT_1000PEPE,
+    XT_PEPE_SPOT,
+    livro,
+    market_ccxt,
+)
 
 
 def test_prefixo_1000():
@@ -180,3 +195,70 @@ def test_mercado_do_market_sem_flags_ou_com_linear_desconhecido_e_rejeitado():
 def test_prioridade_cotacao_usdt_usdc_usdg_depois_as_outras_em_ordem_alfabetica():
     ordenadas = sorted(["USDG", "EUR", "USDC", "USDT", "BRL"], key=prioridade_cotacao)
     assert ordenadas == ["USDT", "USDC", "USDG", "BRL", "EUR"]
+
+
+# ---------------------------------------------------------------------------
+# Task 15: fase 2 de corretoras (BingX, XT, Hyperliquid)
+# ---------------------------------------------------------------------------
+
+def test_hyperliquid_kpepe_contra_mexc():
+    h = normalizar("hyperliquid", {"base": "kPEPE", "quote": "USDC", "contractSize": 1})
+    m = normalizar("mexc", {"base": "1000PEPE", "quote": "USDT", "contractSize": 1})
+    ph, aviso = preco_unitario_usdt(0.010, h, {"USDC": 1.0}); pm, _ = preco_unitario_usdt(0.010, m, {})
+    assert ph == pytest.approx(pm) and aviso is False
+
+
+class _SoMarkets:
+    """Corretora falsa so com os markets (a indexacao do coletor nao acessa mais nada)."""
+
+    def __init__(self, markets):
+        self.markets = {m["symbol"]: m for m in markets}
+        self.has = {"watchTickers": True}
+
+
+def indexar(corretora, markets, mercados=("spot", "futuro")):
+    """{(mercado, ativo): simbolo} que o coletor da corretora escolhe para o estado."""
+    return ColetorCcxt(corretora, _SoMarkets(markets), mercados=mercados).simbolos_por_chave()
+
+
+def test_kpepe_da_hyperliquid_como_o_ccxt_entrega_vira_pepe_vezes_1000():
+    # O ccxt entrega "KPEPE" (maiuscula); o nome original "kPEPE" fica no baseName.
+    p = normalizar("hyperliquid", HL_KPEPE)
+    assert (p.ativo, p.multiplicador, p.cotacao, p.tamanho_contrato) == ("PEPE", 1000, "USDC", 1)
+
+
+def test_base_name_so_vale_quando_e_a_mesma_base_em_outra_caixa():
+    # "UBTC" -> "BTC" e um token embrulhado (outro nome, nao outra caixa): fica a base do ccxt.
+    assert normalizar("hyperliquid", HL_SPOT_BTC).ativo == "BTC"
+    # Builder (hip3): "xyz:TSLA" -> "XYZ-TSLA"; continua o nome do ccxt.
+    hip3 = {**HL_BTC, "base": "XYZ-TSLA", "baseName": "xyz:TSLA"}
+    assert normalizar("hyperliquid", hip3).ativo == "XYZ-TSLA"
+    # Nome original com minuscula que nao e prefixo: o ativo fica como o ccxt escreve (maiuscula).
+    assert normalizar("hyperliquid", {**HL_BTC, "base": "MOODENG", "baseName": "Moodeng"}).ativo == "MOODENG"
+    # Sem baseName (as outras corretoras) nada muda.
+    assert normalizar("mexc", {"base": "KAS", "quote": "USDT"}).ativo == "KAS"
+
+
+def test_indexacao_hyperliquid_kpepe_e_so_futuros():
+    chaves = indexar("hyperliquid", [HL_KPEPE, HL_BTC, HL_SPOT_BTC, HL_SPOT_USDT], mercados=("futuro",))
+    assert chaves == {("futuro", "PEPE"): "KPEPE/USDC:USDC", ("futuro", "BTC"): "BTC/USDC:USDC"}
+
+
+def test_indexacao_prefixo_1000_da_bingx_e_da_xt():
+    for corretora, futuro, spot in (("bingx", BINGX_1000PEPE, BINGX_PEPE_SPOT), ("xt", XT_1000PEPE, XT_PEPE_SPOT)):
+        assert indexar(corretora, [futuro, spot]) == {("futuro", "PEPE"): "1000PEPE/USDT:USDT",
+                                                      ("spot", "PEPE"): "PEPE/USDT"}, corretora
+
+
+def test_indexacao_usdt_e_usdc_do_mesmo_ativo_fica_com_usdt_em_qualquer_ordem():
+    for ordem in ([BINGX_BTC, BINGX_BTC_USDC], [BINGX_BTC_USDC, BINGX_BTC]):
+        assert indexar("bingx", ordem) == {("futuro", "BTC"): "BTC/USDT:USDT"}
+    # So USDC (Hyperliquid): o USDC entra.
+    assert indexar("hyperliquid", [HL_BTC], mercados=("futuro",)) == {("futuro", "BTC"): "BTC/USDC:USDC"}
+
+
+def test_kpepe_da_hyperliquid_e_1000pepe_da_mexc_formam_combinacao():
+    mexc = {**BINGX_1000PEPE, "id": "1000PEPE_USDT", "taker": 0.0002}
+    vencedores = {"hyperliquid": indexar("hyperliquid", [HL_KPEPE], mercados=("futuro",)),
+                  "mexc": indexar("mexc", [mexc])}
+    assert simbolos_para_tickers(vencedores) == {"hyperliquid": ["KPEPE/USDC:USDC"], "mexc": ["1000PEPE/USDT:USDT"]}

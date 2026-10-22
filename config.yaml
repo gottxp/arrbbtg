@@ -3,8 +3,8 @@
 # Percentuais estao em % (0.3 = 0,3%).
 # A explicacao completa de cada campo vem no README (ultima etapa do projeto).
 
-# Corretoras do modo normal (fase 1).
-corretoras: [mexc, gate, bitget]
+# Corretoras do modo normal (fases 1 e 2).
+corretoras: [mexc, gate, bitget, bingx, xt, hyperliquid]
 # Corretoras do modo Farm (custo de giro baixo, sem buscar lucro). Vazio = modo Farm desligado.
 corretoras_farm: []
 
@@ -41,11 +41,19 @@ margem_slippage_pct: 0.0
 # Metrica de spread usada no RP bruto: medio | maior | media_10_maiores
 metrica_spread: medio
 
-# Taxas taker da sua conta (nivel VIP, descontos), em %. Se nao preencher, vale a taxa da API.
+# Taxas taker da sua conta (nivel VIP, descontos), em %. Se nao preencher, vale a taxa que o ccxt traz.
+# Sem taxa nenhuma (nem aqui nem no ccxt), os pares daquele mercado nao geram sinal (o log avisa).
 # Mercados aceitos: spot e futuro. Exemplo:
 #   taxas:
 #     mexc:
 #       futuro: 0.02
+# De onde vem a taxa de cada corretora quando nao preenchida (ccxt 4.5.89), e a taxa publica padrao
+# (conta sem nivel VIP), para conferir no site:
+#   mexc, gate, bitget: taxa de cada par informada pela API da corretora.
+#   bingx: tabela fixa do ccxt: spot 0.1, futuro 0.05.
+#   xt: futuro: taxa de cada par informada pela API (0.06 no padrao); spot: o ccxt NAO traz (0.2 no padrao;
+#       so importa se o spot da xt for ligado em mercados_por_corretora).
+#   hyperliquid: tabela fixa do ccxt: futuro 0.045 (nivel 0).
 taxas: {}
 
 # Intervalo para atualizar funding e taxas (REST), em segundos.
@@ -56,10 +64,47 @@ recarregar_mercados_s: 3600
 # Passou disso, registra no log e segue (o livro ja foi tirado do scanner).
 timeout_desassinar_s: 5
 
+# Mercados usados de cada corretora (spot e/ou futuro). Corretora que nao aparece aqui usa os dois.
+#   hyperliquid: so futuros (especificacao, secao 2), apesar de o ccxt listar tambem o spot dela.
+#   xt: so futuros porque o ccxt 4.5.89 nao traz bid/ask em nenhum ticker do spot da XT (conferido no
+#       codigo do ccxt): o spot ficaria sem dados. Para tentar mesmo assim, troque por [spot, futuro]; se
+#       nao funcionar, o log avisa "nenhum metodo de ticker traz bid/ask".
+mercados_por_corretora:
+  hyperliquid: [futuro]
+  xt: [futuro]
+# Metodo do ccxt que cada corretora tenta primeiro para os tickers (etapa 1): watch_tickers (todos os
+# pares numa assinatura), watch_bids_asks (so o melhor bid/ask) ou watch_ticker (um par por assinatura).
+# Sem nada, tenta nessa ordem os que a corretora tem; se um nao servir, passa ao seguinte.
+#   hyperliquid: o watch_tickers dela (allMids) so traz o preco medio, sem bid/ask.
+metodo_ticker:
+  hyperliquid: watch_ticker
+# Se um metodo de ticker so entrega tickers sem bid/ask por tantas mensagens seguidas (sem nenhum ticker
+# bom antes), o coletor passa ao proximo metodo e avisa no log.
+mensagens_sem_bid_ask: 10
+
+# Cotacao das moedas fora de USDT (ex.: USDC da Hyperliquid): meio do bid/ask do par spot MOEDA/USDT
+# (ou USDT/MOEDA) da corretora fonte_cotacao. Precisa ser uma corretora ligada e com spot.
+fonte_cotacao: bitget
+# Fonte diferente para alguma moeda. Exemplo (Kraken, fase 3):
+#   fontes_cotacao:
+#     USD: kraken
+fontes_cotacao: {}
+# Cotacao mais longe de 1 do que isto, em %, e tratada como sem cotacao (usa 1:1 e marca aviso_cotacao).
+faixa_cotacao_pct: 10
+
+# Intervalo do funding em horas, por corretora. Vale sobre o que o ccxt informa; sem nada, vale o do ccxt
+# e, se ele nao informar, 8h.
+#   hyperliquid: cobra de hora em hora.
+#   bingx e xt: o ccxt ja traz o intervalo de cada contrato (pode ser diferente entre contratos); nao
+#     preencha, senao o mesmo valor vale para todos os contratos da corretora.
+intervalo_funding_h:
+  hyperliquid: 1
+
 # Conexao que cai tenta de novo sozinha, esperando 1s, 2s, 4s... ate este maximo, em segundos.
 espera_max_reconexao_s: 60
 # Maximo de assinaturas por corretora (livros abertos; e tickers, se a corretora so assina um par
-# por vez). Ficam os pares de maior volume 24h. Vazio = sem limite. Exemplo:
+# por vez, como a bingx e a hyperliquid com watch_ticker). Ficam os pares de maior volume 24h.
+# Vazio = sem limite; se o log disser que a mensagem "parece de limite de assinaturas", preencha. Exemplo:
 #   limites_assinatura:
 #     bingx: 200
 limites_assinatura: {}

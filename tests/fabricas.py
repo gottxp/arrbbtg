@@ -73,6 +73,45 @@ def market_ccxt(
 
 
 # ---------------------------------------------------------------------------
+# Markets das corretoras da fase 2 (Task 15)
+# ---------------------------------------------------------------------------
+
+# Markets no formato que o ccxt 4.5.89 entrega (saida do parse_market de cada corretora, conferida
+# rodando o parse_market do ccxt instalado com os exemplos de resposta das docstrings dele).
+# So os campos que o scanner le, mais o `id` e o `baseName` (este so existe na Hyperliquid).
+
+# ccxt/hyperliquid.py, parse_market: o ccxt poe o codigo da moeda em MAIUSCULA (safe_currency faz
+# upper()), entao o perpetuo "kPEPE" vira base "KPEPE", simbolo "KPEPE/USDC:USDC"; o nome original
+# fica em `baseName`. Todos os perpetuos da Hyperliquid cotam e liquidam em USDC; taker 0,045%.
+HL_KPEPE = {"id": "11", "symbol": "KPEPE/USDC:USDC", "base": "KPEPE", "baseName": "kPEPE", "quote": "USDC",
+            "settle": "USDC", "type": "swap", "spot": False, "swap": True, "future": False, "option": False,
+            "linear": True, "inverse": False, "contractSize": 1.0, "taker": 0.00045, "active": True}
+HL_BTC = {**HL_KPEPE, "id": "0", "symbol": "BTC/USDC:USDC", "base": "BTC", "baseName": "BTC"}
+# ccxt/hyperliquid.py, fetch_spot_markets: a Hyperliquid tambem tem spot. "UBTC" (BTC embrulhado) vira
+# "BTC/USDC" pelo spotCurrencyMapping, e o USDT0 vira "USDT/USDC". baseName = nome original do token.
+HL_SPOT_BTC = {"id": "@142", "symbol": "BTC/USDC", "base": "BTC", "baseName": "UBTC", "quote": "USDC",
+               "settle": None, "type": "spot", "spot": True, "swap": False, "future": False, "option": False,
+               "linear": None, "inverse": None, "contractSize": None, "taker": 0.0007, "active": True}
+HL_SPOT_USDT = {**HL_SPOT_BTC, "id": "@166", "symbol": "USDT/USDC", "base": "USDT", "baseName": "USDT0"}
+
+# ccxt/bingx.py, parse_market: id "1000PEPE-USDT" (swap) e "PEPE-USDT" (spot); taker da tabela fixa do
+# ccxt (spot 0,1%, swap 0,05%).
+BINGX_1000PEPE = {"id": "1000PEPE-USDT", "symbol": "1000PEPE/USDT:USDT", "base": "1000PEPE", "quote": "USDT",
+                  "settle": "USDT", "type": "swap", "spot": False, "swap": True, "future": False, "option": False,
+                  "linear": True, "inverse": False, "contractSize": 1.0, "taker": 0.0005, "active": True}
+BINGX_PEPE_SPOT = {"id": "PEPE-USDT", "symbol": "PEPE/USDT", "base": "PEPE", "quote": "USDT", "settle": None,
+                   "type": "spot", "spot": True, "swap": False, "future": False, "option": False,
+                   "linear": None, "inverse": None, "contractSize": None, "taker": 0.001, "active": True}
+BINGX_BTC = {**BINGX_1000PEPE, "id": "BTC-USDT", "symbol": "BTC/USDT:USDT", "base": "BTC"}
+BINGX_BTC_USDC = {**BINGX_BTC, "id": "BTC-USDC", "symbol": "BTC/USDC:USDC", "quote": "USDC", "settle": "USDC"}
+
+# ccxt/xt.py, parse_market: ids em minuscula ("1000pepe_usdt"), base em maiuscula; o taker do futuro vem
+# da API (takerFee de cada par) e o do spot nao vem (None).
+XT_1000PEPE = {**BINGX_1000PEPE, "id": "1000pepe_usdt", "taker": 0.0006}
+XT_PEPE_SPOT = {**BINGX_PEPE_SPOT, "id": "pepe_usdt", "taker": None}
+
+
+# ---------------------------------------------------------------------------
 # Config, Ponta, Metricas e Candidato de teste (Task 7)
 # ---------------------------------------------------------------------------
 

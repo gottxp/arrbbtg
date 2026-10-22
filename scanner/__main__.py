@@ -6,6 +6,10 @@ motor (candidatos -> filtros -> sinais -> banco). Junto sobe a API do painel (ro
 WebSocket /ws/sinais, que recebe cada evento do motor). A cada minuto o log mostra quantos
 sinais estao ativos. Ctrl+C encerra fechando as conexoes, o painel e o banco.
 
+Cotacoes (Task 15): os precos em USDC (ex.: Hyperliquid) sao convertidos para USDT pela cotacao do
+ticker spot USDC/USDT da fonte_cotacao (DadosLentos.cotacoes); esse par entra sempre nos tickers da
+fonte, mesmo sem formar combinacao (veja _listas_de_tickers).
+
 Robustez (especificacao, secao 8): conexao que cai volta sozinha (coletor.manter_tickers), corretora
 que nao carregou a lista de mercados ao ligar tenta de novo sozinha (_trazer_de_volta), a lista de
 mercados e recarregada a cada `recarregar_mercados_s`, e a cada `intervalo_log_recursos_s` o log
@@ -81,15 +85,41 @@ async def _acompanhar_tickers(coletor: ColetorCcxt, simbolos: list[str]) -> None
                            "reiniciar o scanner", coletor.nome)
 
 
+def _listas_de_tickers(coletores: dict[str, ColetorCcxt],
+                       dados_lentos: DadosLentos | None = None) -> tuple[dict[str, list[str]], dict]:
+    """Os simbolos da etapa 1 de cada corretora e, de cada uma, o simbolo que ocupa cada chave do estado.
+
+    Entram os pares que formam alguma combinacao (simbolos_para_tickers) e, na fonte das cotacoes, o par spot
+    de cada moeda de cotacao fora de USDT usada por esses pares (ex.: USDC/USDT da Bitget, porque a Hyperliquid
+    cota em USDC), mesmo que ele nao forme combinacao nenhuma. Cada coletor fica sabendo quais dos seus
+    simbolos sao de cotacao (usar_para_cotacao). Sem `dados_lentos`, so as combinacoes.
+    Devolve (listas, vencedores): {corretora: [simbolos]} e {corretora: {(mercado, ativo): simbolo}}.
+    """
+    vencedores = {nome: coletor.simbolos_por_chave() for nome, coletor in coletores.items()}
+    listas = simbolos_para_tickers(vencedores)
+    if dados_lentos is not None:
+        moedas: set[str] = set()
+        for nome, simbolos in listas.items():
+            moedas |= coletores[nome].cotacoes_dos_simbolos(simbolos)
+        extras = dados_lentos.escolher_pares_de_cotacao(moedas, {nome: c.markets() for nome, c in coletores.items()})
+        for nome, coletor in coletores.items():
+            coletor.usar_para_cotacao(extras.get(nome, []))
+        for nome, simbolos in extras.items():
+            listas[nome] = sorted(set(listas.get(nome, [])) | set(simbolos))
+    return listas, vencedores
+
+
 class _Tickers:
     """As tarefas da etapa 1 (uma por corretora) e a lista de simbolos que cada uma acompanha.
 
     A recarga da lista de mercados e a corretora que entra depois usam isto para reiniciar so as
     corretoras cuja lista mudou. `trava`: so um ajuste das listas por vez (veja _ajustar_tickers).
+    `cotacao`: o DadosLentos que escolhe os pares de cotacao que entram nas listas (None = nenhum).
     """
 
-    def __init__(self, coletores: dict[str, ColetorCcxt]):
+    def __init__(self, coletores: dict[str, ColetorCcxt], cotacao: DadosLentos | None = None):
         self._coletores = coletores
+        self.cotacao = cotacao
         self.tarefas: dict[str, asyncio.Task] = {}
         self.simbolos: dict[str, list[str]] = {}
         self.trava = asyncio.Lock()
@@ -152,12 +182,13 @@ async def _ajustar_tickers(coletores: dict[str, ColetorCcxt], tickers: _Tickers,
     - o stream de tickers so reinicia nas corretoras cuja lista mudou (ex.: uma corretora nova entrou e
       as outras ganharam pares em comum com ela);
     - par que saiu da lista (a corretora tirou, ficou inativo ou deixou de formar combinacao) sai do
-      estado, ticker e livro: some do scanner sem erro e o sinal dele e encerrado pelo fluxo normal.
+      estado, ticker e livro: some do scanner sem erro e o sinal dele e encerrado pelo fluxo normal;
+    - o par de cotacao da fonte (ex.: USDC/USDT) continua na lista enquanto alguma corretora cotar na moeda
+      dele (veja _listas_de_tickers).
     Um ajuste por vez (`tickers.trava`): a recarga e a corretora que entra nao se atropelam.
     """
     async with tickers.trava:
-        vencedores = {nome: coletor.simbolos_por_chave() for nome, coletor in coletores.items()}
-        novos = simbolos_para_tickers(vencedores)
+        novos, vencedores = _listas_de_tickers(coletores, tickers.cotacao)
         for nome in list(coletores):
             lista = novos.get(nome, [])
             anterior = tickers.simbolos.get(nome, [])
@@ -392,17 +423,21 @@ async def rodar(
     RuntimeError se nenhuma corretora carregar a lista de mercados.
     """
     estado = EstadoMercados(cfg.max_silencio_conexao_s, cfg.max_idade_livro_s, cfg.atraso_max_valido_s)
-    dados_lentos = DadosLentos(cfg.taxas)
+    dados_lentos = DadosLentos(
+        cfg.taxas, intervalos_funding=cfg.intervalo_funding_h, estado=estado, fonte_cotacao=cfg.fonte_cotacao,
+        fontes_cotacao=cfg.fontes_cotacao, faixa_cotacao_pct=cfg.faixa_cotacao_pct, relogio=relogio,
+    )
     exchanges: dict = {}
     coletores: dict[str, ColetorCcxt] = {}
-    tickers = _Tickers(coletores)
+    tickers = _Tickers(coletores, dados_lentos)
     tarefas: list[asyncio.Task] = []
     banco: Banco | None = None
     try:
         for nome in dict.fromkeys(cfg.corretoras):  # sem nomes repetidos, na ordem da config
             exchanges[nome] = criar_exchange(nome)
         banco = Banco(cfg.banco)
-        motor = Motor(cfg, estado, dados_lentos, banco=banco)
+        # As cotacoes (USDC/USDT...) vem dos tickers spot da fonte: o motor converte para USDT com elas.
+        motor = Motor(cfg, estado, dados_lentos, banco=banco, cotacoes=dados_lentos.cotacoes)
         app = criar_app(motor, banco, cfg, relogio=relogio)  # antes de conectar: painel mal configurado para tudo
 
         carregadas = await _carregar_mercados(exchanges)
@@ -415,13 +450,17 @@ async def rodar(
                 timeout_desassinar_s=cfg.timeout_desassinar_s,
                 espera_max_reconexao_s=cfg.espera_max_reconexao_s,
                 limite_assinaturas=cfg.limites_assinatura.get(nome),
+                mercados=cfg.mercados_da_corretora(nome),
+                metodo_ticker=cfg.metodo_ticker.get(nome),
+                mensagens_sem_bid_ask=cfg.mensagens_sem_bid_ask,
             )
 
         for nome in carregadas:
             coletores[nome] = criar_coletor(nome)
 
-        # Etapa 1: tickers so dos pares que formam alguma combinacao (spot x futuro ou futuro x futuro).
-        simbolos = simbolos_para_tickers({nome: c.simbolos_por_chave() for nome, c in coletores.items()})
+        # Etapa 1: tickers so dos pares que formam alguma combinacao (spot x futuro ou futuro x futuro),
+        # mais o par de cotacao de cada moeda fora de USDT na fonte (ex.: USDC/USDT da Bitget).
+        simbolos, _ = _listas_de_tickers(coletores, dados_lentos)
         for nome in coletores:
             if simbolos.get(nome):
                 registro.info("%s: acompanhando %d pares", nome, len(simbolos[nome]))
