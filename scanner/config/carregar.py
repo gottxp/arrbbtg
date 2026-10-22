@@ -56,6 +56,16 @@ class Config:
     # Etapa 2 no modo Farm: no maximo tantas combinacoes abaixo de spread_min_livro_pct por mercado de farm
     # (corretora + spot/futuro), as de maior spread pelos tickers.
     max_livros_farm_por_mercado: int = 50
+    # Historico das metricas pelos tickers (Task 18; especificacao, secao 3, "De onde vem as amostras das metricas").
+    # Ligado: todo par com ticker valido nas duas pontas e sem livro aberto ganha uma amostra pelos tickers (melhor
+    # bid/ask) a cada amostra_ticker_s, so na memoria, na mesma janela das amostras do livro. Desligado: como antes
+    # (metricas so do tempo com livro aberto).
+    historico_tickers: bool = True
+    # Intervalo das amostras pelos tickers de cada par, em segundos (no minimo amostra_s).
+    amostra_ticker_s: float = 120
+    # Maximo de historicos (combinacoes com amostras na memoria). No teto, par novo nao ganha historico pelos
+    # tickers; o par que abre livro sempre ganha, e sai o mais antigo sem livro.
+    max_historicos: int = 80_000
 
     # Taxas taker sobrescritas por (corretora, mercado). Ex.: {("mexc", "futuro"): 0.02}
     taxas: dict = field(default_factory=dict)
@@ -178,6 +188,7 @@ CAMPOS_POSITIVOS = (
     "prazo_primeiro_ticker_s",
     "prazo_primeiro_livro_s",
     "validade_funding_s",
+    "amostra_ticker_s",
 )
 
 # Campos numericos que aceitam qualquer valor (inclusive zero ou negativo).
@@ -402,8 +413,12 @@ def _validar_campo(campo: str, valor):
         if not isinstance(valor, str) or not valor:
             raise ErroConfig("pasta_logs: precisa ser o nome de uma pasta, ex.: logs")
         return valor
+    if campo == "historico_tickers":
+        if not isinstance(valor, bool):
+            raise ErroConfig(f"historico_tickers: use true (ligado) ou false (desligado); valor recebido: {valor!r}")
+        return valor
     if campo in ("dias_logs", "mensagens_sem_bid_ask", "livros_reservados_limite_mercado",
-                 "max_livros_farm_por_mercado", *CAMPOS_INTEIROS_LIGHTER):
+                 "max_livros_farm_por_mercado", "max_historicos", *CAMPOS_INTEIROS_LIGHTER):
         if not _inteiro_positivo(valor):
             raise ErroConfig(f"{campo}: precisa ser um numero inteiro maior que zero (valor recebido: {valor!r})")
         return valor
@@ -469,7 +484,19 @@ def carregar_config(caminho: str) -> Config:
     _conferir_fontes_de_cotacao(config, fonte_escrita="fonte_cotacao" in dados)
     _conferir_reserva_dos_livros(config)
     _conferir_validade_do_funding(config)
+    _conferir_amostra_ticker(config)
     return config
+
+
+def _conferir_amostra_ticker(config: Config) -> None:
+    """A amostra pelos tickers cobre amostra_ticker_s; com menos que amostra_s ela seria mais densa que a do livro.
+
+    O motor nunca poe duas amostras do mesmo par a menos de amostra_s uma da outra, e cada amostra pelo ticker pesa
+    amostra_ticker_s / amostra_s amostras do livro nas medias: abaixo de 1, o peso nao bateria com o tempo coberto.
+    """
+    if config.amostra_ticker_s < config.amostra_s:
+        raise ErroConfig(f"amostra_ticker_s ({config.amostra_ticker_s}) precisa ser maior ou igual a amostra_s "
+                         f"({config.amostra_s}): a amostra pelos tickers e a mais espacada das duas")
 
 
 def _conferir_validade_do_funding(config: Config) -> None:

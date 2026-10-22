@@ -1,15 +1,29 @@
 """Janela de metricas do periodo: A e F medios e maiores, media dos 10 maiores, invertidas e lotes medios.
 
 A = spread de abertura e F = spread de fechamento, ambos em %. Tudo em memoria e sem rede.
-O motor guarda uma JanelaMetricas por combinacao e acrescenta uma amostra (A, F e o lote de cada
-ponta) a cada `amostra_s` segundos. As amostras chegam em ordem crescente de ts.
+O motor guarda uma JanelaMetricas por combinacao. As amostras chegam em ordem crescente de ts e vem de
+duas fontes (especificacao, secao 3, "De onde vem as amostras das metricas"):
+- do LIVRO (`adicionar`), a cada `amostra_s` segundos enquanto o par tem livro aberto: A, F e o lote de
+  cada ponta;
+- pelos TICKERS (`adicionar_pelo_ticker`), a cada `amostra_ticker_s` segundos enquanto o par nao tem livro
+  aberto: so A e F (o ticker, melhor bid/ask, nao tem lote).
+Uma fonte por vez: o motor nunca manda as duas no mesmo horario. Na janela:
+- as medias de A e F valem sobre todas as amostras, cada uma pesando o tempo que ela cobre: uma amostra pelo
+  ticker vale `peso_ticker` amostras do livro (amostra_ticker_s / amostra_s; ex.: 120 s / 5 s = 24). Sem esse
+  peso, a hora com livro aberto (720 amostras de 5 s) pesaria 24 vezes mais que a hora sem livro (30 amostras de
+  120 s) e o F medio voltaria a ser "o F desde que o livro abriu";
+- o maior A e F, a media dos 10 maiores e as invertidas valem sobre todas as amostras, em ordem de horario;
+- o lote medio vem so das amostras do livro.
+Sem amostras pelo ticker, tudo da exatamente o mesmo de antes (a media e a soma dividida pela quantidade).
 
-Com 4 h de periodo e uma amostra a cada 5 s sao 2.880 amostras por combinacao, e o motor acompanha
-milhares de combinacoes. Por isso a janela e INCREMENTAL e COMPACTA:
+Com 4 h de periodo e uma amostra do livro a cada 5 s sao 2.880 amostras por combinacao; pelos tickers, o motor
+acompanha dezenas de milhares de combinacoes. Por isso a janela e INCREMENTAL e COMPACTA:
 - cada amostra nova so mexe no que entrou e no que saiu, sem olhar a janela inteira:
   somas exatas para as medias, a lista curta dos maiores valores (refeita olhando a janela toda
-  so em caso raro, veja _Maiores) e as sequencias de invertidas;
-- os numeros ficam em arrays de 8 bytes por numero (array("d")), e nao em tuplas de floats soltos.
+  so em caso raro, veja _maiores_entrou) e as sequencias de invertidas;
+- os numeros ficam em arrays de 8 bytes por numero (array("d")), e nao em tuplas de floats soltos; a amostra
+  pelo ticker ocupa 3 numeros (ts, A, F) e a do livro 5 (mais os dois lotes);
+- uma tabela vazia nao guarda nenhum array (a janela de um par so com tickers nao paga as colunas do livro).
 O resultado e o mesmo de recalcular do zero (os testes comparam com o calculo direto).
 
 O motor chama `resumo` a cada 500 ms, mas as amostras mudam so a cada 5 s. Por isso o ultimo
@@ -22,16 +36,18 @@ import math
 from array import array
 from bisect import bisect_left, insort
 from dataclasses import dataclass
+from itertools import chain
 
 # Quantos valores entram na metrica "media dos 10 maiores". Faz parte do nome da metrica
 # (media_10_maiores), por isso nao vem da Config.
 MAIORES_N = 10
 
 # Quantos dos maiores valores de A (e de F) ficam guardados. Basta ter os 10 maiores, mas guardar
-# alguns a mais faz a lista quase nunca precisar ser refeita olhando a janela inteira (veja _Maiores).
+# alguns a mais faz a lista quase nunca precisar ser refeita olhando a janela inteira (veja _maiores_entrou).
 MAIORES_GUARDADOS = 50
 
-# De quantas em quantas linhas que sairam a tabela libera o espaco delas (veja _Colunas).
+# De quantas em quantas linhas que sairam a tabela libera o espaco delas (veja _Colunas). Numa tabela pequena
+# (ex.: as 120 amostras pelo ticker de 4 h), libera antes: quando as que sairam passam de 1/8 das que ficaram.
 LIMPAR_A_CADA = 256
 
 # Todo float e uma fracao exata cujo denominador e uma potencia de 2 de no maximo 2**1074.
@@ -59,60 +75,75 @@ class Metricas:
 
 
 class _Colunas:
-    """Linhas de numeros reais guardadas em colunas compactas: um array("d") por coluna, 8 bytes por numero.
+    """Linhas de numeros reais guardadas num array("d") so, 8 bytes por numero, uma linha depois da outra.
 
-    As linhas entram no fim e saem do comeco (uma fila). Tirar do comeco de um array obrigaria a
-    mover todos os outros numeros, entao so avancamos `inicio` (a posicao da primeira linha que
-    ainda esta aqui) e, a cada LIMPAR_A_CADA saidas, apagamos de uma vez o espaco das que sairam.
-    `n` e quantas linhas estao aqui. As colunas sao escolhidas pela posicao (ex.: _TS, _A, _F).
+    Cada linha tem `largura` numeros (ex.: ts, A, F). As linhas entram no fim e saem do comeco (uma fila).
+    Tirar do comeco de um array obrigaria a mover todos os outros numeros, entao so avancamos `inicio` (a
+    posicao da primeira linha que ainda esta aqui) e, a cada LIMPAR_A_CADA saidas (ou antes, numa tabela
+    pequena), apagamos de uma vez o espaco das que sairam. `n` e quantas linhas estao aqui. As colunas sao
+    escolhidas pela posicao (ex.: _TS, _A, _F). O array so existe enquanto ha alguma linha: tabela vazia =
+    `numeros` None (a janela de um par so com tickers nao paga nada pela tabela do livro).
     """
 
-    def __init__(self, quantas_colunas: int):
-        self.colunas = [array("d") for _ in range(quantas_colunas)]
+    __slots__ = ("largura", "numeros", "inicio", "n")
+
+    def __init__(self, largura: int):
+        self.largura = largura
+        self.numeros: array | None = None  # criado na primeira linha
         self.inicio = 0
         self.n = 0
 
     def acrescentar(self, *linha: float) -> None:
-        for coluna, numero in zip(self.colunas, linha):
-            coluna.append(numero)
+        if self.numeros is None:
+            self.numeros = array("d", linha)
+        else:
+            self.numeros.extend(linha)
         self.n += 1
 
     def primeira(self, coluna: int) -> float:
-        """O numero da `coluna` na linha mais antiga."""
-        return self.colunas[coluna][self.inicio]
+        """O numero da `coluna` na linha mais antiga (so com a tabela nao vazia)."""
+        return self.numeros[self.inicio * self.largura + coluna]
 
     def ultima(self, coluna: int) -> float:
-        """O numero da `coluna` na linha mais nova."""
-        return self.colunas[coluna][-1]
+        """O numero da `coluna` na linha mais nova (so com a tabela nao vazia)."""
+        return self.numeros[coluna - self.largura]
 
     def trocar_primeira(self, coluna: int, numero: float) -> None:
-        self.colunas[coluna][self.inicio] = numero
+        self.numeros[self.inicio * self.largura + coluna] = numero
 
     def trocar_ultima(self, coluna: int, numero: float) -> None:
-        self.colunas[coluna][-1] = numero
+        self.numeros[coluna - self.largura] = numero
 
-    def tirar_primeira(self) -> list[float]:
+    def tirar_primeira(self) -> array:
         """Tira a linha mais antiga e devolve os numeros dela, na ordem das colunas."""
-        linha = [coluna[self.inicio] for coluna in self.colunas]
+        comeco = self.inicio * self.largura
+        linha = self.numeros[comeco:comeco + self.largura]
         self.inicio += 1
         self.n -= 1
         if self.n == 0:  # esvaziou: libera tudo
-            self.colunas = [array("d") for _ in self.colunas]
+            self.numeros = None
             self.inicio = 0
-        elif self.inicio >= LIMPAR_A_CADA:  # libera o espaco das linhas que ja sairam
-            for coluna in self.colunas:
-                del coluna[:self.inicio]
+        elif self.inicio >= LIMPAR_A_CADA or 8 * self.inicio >= self.n:  # libera o espaco das que ja sairam
+            del self.numeros[:self.inicio * self.largura]
             self.inicio = 0
         return linha
 
     def coluna(self, coluna: int) -> array:
         """Copia dos numeros da `coluna` que estao aqui, da linha mais antiga a mais nova."""
-        return self.colunas[coluna][self.inicio:]
+        if self.numeros is None:
+            return array("d")
+        return self.numeros[self.inicio * self.largura + coluna::self.largura]
 
 
-# Colunas das amostras e das sequencias de invertida.
+# Colunas das amostras (as do ticker sao so as 3 primeiras) e das sequencias de invertida.
 _TS, _A, _F, _LOTE_LONG, _LOTE_SHORT = range(5)
 _INICIO, _FIM = range(2)
+
+# A tabela vazia de todas as janelas (n = 0, sem array). A janela troca por uma tabela dela na primeira linha e
+# volta para esta quando a tabela esvazia: a janela de um par so com tickers nao guarda as tabelas do livro e das
+# invertidas. Com dezenas de milhares de janelas, cada objeto a menos conta na memoria e no tempo do coletor de lixo
+# do Python (que percorre todos os objetos). Ninguem acrescenta linhas nela (veja JanelaMetricas._acrescentar).
+_TABELA_VAZIA = _Colunas(0)
 
 
 def _numero_real(valor) -> float:
@@ -141,6 +172,18 @@ def _inteiro_exato(numero: float) -> int:
     return numerador << (_BITS_ESCALA - (denominador.bit_length() - 1))  # vezes 2**(1074 - k)
 
 
+def _valor_da_soma(inteiro: int) -> float:
+    """A soma exata (veja _SomaExata) como float. Alem do maior float (~1,8e308) vira infinito, com o sinal da soma.
+
+    Com numeros comuns isso nunca acontece; com numeros absurdos o infinito faz o motor descartar
+    o candidato (numero invalido), em vez de o erro de conta (OverflowError) derrubar o ciclo inteiro.
+    """
+    try:
+        return inteiro / _ESCALA  # divisao de inteiros do Python: arredondamento correto
+    except OverflowError:
+        return math.inf if inteiro > 0 else -math.inf
+
+
 class _SomaExata:
     """Soma de floats que nunca acumula erro, mesmo somando e tirando numeros por dias.
 
@@ -149,7 +192,12 @@ class _SomaExata:
     guardada como inteiro (o Python tem inteiros de qualquer tamanho), entao somar e tirar e
     sempre exato. A soma de uma janela fica igual qualquer que tenha sido o caminho ate ela. So no
     fim (`valor`) ela vira float, arredondada uma vez so (o mesmo que o math.fsum daria).
+    A JanelaMetricas faz exatamente estas contas, mas guarda os inteiros direto, sem um objeto por soma: com
+    dezenas de milhares de janelas (historico pelos tickers), cada objeto a menos conta na memoria e no tempo
+    do coletor de lixo do Python.
     """
+
+    __slots__ = ("_inteiro",)
 
     def __init__(self):
         self._inteiro = 0
@@ -161,57 +209,53 @@ class _SomaExata:
         self._inteiro -= _inteiro_exato(numero)
 
     def valor(self) -> float:
-        """A soma como float. Soma alem do maior float (~1,8e308) vira infinito, com o sinal da soma.
-
-        Com numeros comuns isso nunca acontece; com numeros absurdos o infinito faz o motor descartar
-        o candidato (numero invalido), em vez de o erro de conta (OverflowError) derrubar o ciclo inteiro.
-        """
-        try:
-            return self._inteiro / _ESCALA  # divisao de inteiros do Python: arredondamento correto
-        except OverflowError:
-            return math.inf if self._inteiro > 0 else -math.inf
+        """A soma como float (veja _valor_da_soma)."""
+        return _valor_da_soma(self._inteiro)
 
 
-class _Maiores:
-    """Os maiores valores da janela (no maximo MAIORES_GUARDADOS), do menor para o maior.
+# Os maiores valores da janela, um array("d") para A e outro para F, do menor para o maior (no maximo
+# MAIORES_GUARDADOS). Funcoes, e nao uma classe, para a janela nao ter dois objetos a mais (veja _TABELA_VAZIA).
+# Regra que vale sempre: `valores` sao os len(valores) maiores valores da janela (todos eles,
+# se a janela tiver ate MAIORES_GUARDADOS). O maior e o ultimo; os 10 maiores sao os 10 ultimos.
+# - Valor que entra: vai para a lista se for pelo menos o menor dela (ou se a lista tem a janela
+#   toda); se a lista passar do tamanho, sai o menor.
+# - Valor que sai da janela: se estava na lista, sai dela.
+# - Se a lista ficar com menos de 10 enquanto a janela tem mais valores, ela e refeita olhando a
+#   janela inteira (_maiores_refeitos). Isso so acontece depois de sairem dezenas dos maiores sem nenhum maior
+#   entrar (ex.: valores caindo sem parar): no maximo uma vez a cada ~40 amostras, e quase nunca na pratica.
 
-    Regra que vale sempre: `valores` sao os len(valores) maiores valores da janela (todos eles,
-    se a janela tiver ate MAIORES_GUARDADOS). O maior e o ultimo; os 10 maiores sao os 10 ultimos.
-    - Valor que entra: vai para a lista se for pelo menos o menor dela (ou se a lista tem a janela
-      toda); se a lista passar do tamanho, sai o menor.
-    - Valor que sai da janela: se estava na lista, sai dela.
-    - Se a lista ficar com menos de 10 enquanto a janela tem mais valores, ela e refeita olhando a
-      janela inteira. Isso so acontece depois de sairem dezenas dos maiores sem nenhum maior entrar
-      (ex.: valores caindo sem parar): no maximo uma vez a cada ~40 amostras, e quase nunca na pratica.
+
+def _maiores_entrou(valores: array, valor: float, tamanho_da_janela_antes: int) -> None:
+    """`valor` entrou na janela (que tinha `tamanho_da_janela_antes` valores): atualiza `valores` no lugar."""
+    tem_a_janela_toda = len(valores) == tamanho_da_janela_antes
+    if tem_a_janela_toda or valor >= valores[0]:
+        insort(valores, valor)  # poe no lugar certo, mantendo a ordem
+        if len(valores) > MAIORES_GUARDADOS:
+            del valores[0]  # fica so com os maiores
+
+
+def _maiores_saiu(valores: array, valor: float, tamanho_da_janela_depois: int) -> bool:
+    """`valor` saiu da janela (que ficou com `tamanho_da_janela_depois` valores): atualiza `valores` no lugar.
+
+    Devolve True se a lista ficou curta demais e precisa ser refeita olhando a janela inteira (_maiores_refeitos).
     """
+    tinha_a_janela_toda = len(valores) == tamanho_da_janela_depois + 1
+    # Se nao tinha a janela toda, todo valor acima do menor da lista esta na lista. Valor igual
+    # ao menor: tira uma copia dele da lista (ela continua sendo os maiores da janela).
+    if tinha_a_janela_toda or valor >= valores[0]:
+        del valores[bisect_left(valores, valor)]
+    return len(valores) < MAIORES_N and tamanho_da_janela_depois > len(valores)
 
-    def __init__(self):
-        self.valores: list[float] = []
 
-    def entrou(self, valor: float, tamanho_da_janela_antes: int) -> None:
-        tem_a_janela_toda = len(self.valores) == tamanho_da_janela_antes
-        if tem_a_janela_toda or valor >= self.valores[0]:
-            insort(self.valores, valor)  # poe no lugar certo, mantendo a ordem
-            if len(self.valores) > MAIORES_GUARDADOS:
-                del self.valores[0]  # fica so com os maiores
+def _maiores_refeitos(valores_da_janela) -> array:
+    """A lista nova dos maiores, olhando todos os valores que estao na janela."""
+    return array("d", sorted(heapq.nlargest(MAIORES_GUARDADOS, valores_da_janela)))
 
-    def saiu(self, valor: float, amostras: _Colunas, coluna: int) -> None:
-        """`valor` saiu da janela; `amostras` ja esta sem ele (`coluna` e a coluna desses valores)."""
-        tinha_a_janela_toda = len(self.valores) == amostras.n + 1
-        # Se nao tinha a janela toda, todo valor acima do menor da lista esta na lista. Valor igual
-        # ao menor: tira uma copia dele da lista (ela continua sendo os maiores da janela).
-        if tinha_a_janela_toda or valor >= self.valores[0]:
-            del self.valores[bisect_left(self.valores, valor)]
-        if len(self.valores) < MAIORES_N and amostras.n > len(self.valores):
-            self.valores = sorted(heapq.nlargest(MAIORES_GUARDADOS, amostras.coluna(coluna)))
 
-    def maior(self) -> float:
-        return self.valores[-1]
-
-    def media_dos_10_maiores(self) -> float:
-        """Media dos MAIORES_N maiores (ou de todos, se houver menos). Soma do maior para o menor."""
-        maiores = self.valores[-MAIORES_N:]
-        return sum(reversed(maiores)) / len(maiores)
+def _media_dos_10_maiores(valores: array) -> float:
+    """Media dos MAIORES_N maiores (ou de todos, se houver menos). Soma do maior para o menor."""
+    maiores = valores[-MAIORES_N:]
+    return sum(reversed(maiores)) / len(maiores)
 
 
 # ---------------------------------------------------------------------------
@@ -220,25 +264,40 @@ class _Maiores:
 
 
 class JanelaMetricas:
-    """Guarda as amostras (ts, A, F, lote do long, lote do short) de uma combinacao e resume o periodo.
+    """Guarda as amostras de uma combinacao, das duas fontes, e resume o periodo.
 
-    Invertida: sequencia seguida de amostras com F >= 0. Conta no resumo se durar (ts da ultima
-    menos ts da primeira) pelo menos a duracao minima; a sequencia aberta no fim tambem conta.
+    Do livro: (ts, A, F, lote do long, lote do short). Pelo ticker: (ts, A, F).
+    peso_ticker: quantas amostras do livro uma amostra pelo ticker vale nas medias (o tempo que ela cobre:
+        amostra_ticker_s / amostra_s). Numero real maior que zero; senao ValueError.
+    Invertida: sequencia seguida de amostras com F >= 0 (de qualquer fonte, em ordem de horario). Conta no
+    resumo se durar (ts da ultima menos ts da primeira) pelo menos a duracao minima; a sequencia aberta no fim
+    tambem conta.
     """
 
-    def __init__(self, periodo_s: float):
+    __slots__ = ("periodo_s", "peso_ticker", "_amostras", "_do_ticker", "_soma_a", "_soma_f", "_soma_lote_long",
+                 "_soma_lote_short", "_soma_a_ticker", "_soma_f_ticker", "_maiores_a", "_maiores_f", "_invertidas",
+                 "_ultimo_f", "_cache", "_cache_lotes", "_descartado_ate")
+
+    def __init__(self, periodo_s: float, peso_ticker: float = 1.0):
+        peso = _numero_real(peso_ticker)  # texto, bool, NaN e infinito: ValueError
+        if peso <= 0:
+            raise ValueError(f"peso_ticker precisa ser maior que zero: {peso_ticker!r}")
         self.periodo_s = periodo_s  # tamanho da janela, em segundos
-        # As amostras, da mais antiga a mais nova: colunas _TS, _A, _F, _LOTE_LONG e _LOTE_SHORT.
-        self._amostras = _Colunas(5)
-        # Somas exatas para as medias.
-        self._soma_a, self._soma_f = _SomaExata(), _SomaExata()
-        self._soma_lote_long, self._soma_lote_short = _SomaExata(), _SomaExata()
-        # Os maiores valores de A e de F (maior e media dos 10 maiores).
-        self._maiores_a, self._maiores_f = _Maiores(), _Maiores()
+        self.peso_ticker = peso
+        # As amostras do livro, da mais antiga a mais nova: colunas _TS, _A, _F, _LOTE_LONG e _LOTE_SHORT.
+        self._amostras = _TABELA_VAZIA
+        # As amostras pelos tickers, da mais antiga a mais nova: colunas _TS, _A e _F.
+        self._do_ticker = _TABELA_VAZIA
+        # Somas exatas para as medias (os inteiros de _SomaExata): A e F de cada fonte e os lotes (so do livro).
+        self._soma_a = self._soma_f = self._soma_lote_long = self._soma_lote_short = 0
+        self._soma_a_ticker = self._soma_f_ticker = 0
+        # Os maiores valores de A e de F das duas fontes (maior e media dos 10 maiores).
+        self._maiores_a, self._maiores_f = array("d"), array("d")
         # Sequencias de invertida dentro da janela, da mais antiga a mais nova: ts da primeira
-        # (_INICIO) e da ultima (_FIM) amostra de cada uma. A ultima esta aberta se a ultima
-        # amostra tem F >= 0.
-        self._invertidas = _Colunas(2)
+        # (_INICIO) e da ultima (_FIM) amostra de cada uma. A ultima esta aberta se a amostra mais nova
+        # tem F >= 0.
+        self._invertidas = _TABELA_VAZIA
+        self._ultimo_f = 0.0  # F da amostra mais nova (de qualquer fonte); so vale com a janela nao vazia
         # Ultimo resumo calculado, com a duracao minima usada (None = nada guardado ou a janela mudou).
         self._cache: tuple[float, Metricas] | None = None
         self._cache_lotes: tuple[float, float] | None = None
@@ -247,10 +306,11 @@ class JanelaMetricas:
         self._descartado_ate: float | None = None
 
     def adicionar(self, ts: float, a: float, f: float, lote_long: float = 0.0, lote_short: float = 0.0) -> None:
-        """Guarda uma amostra (sempre com ts maior ou igual ao da anterior) e ja descarta as antigas.
+        """Guarda uma amostra do LIVRO e ja descarta as antigas.
 
-        Valor que nao e numero real (NaN, infinito, texto, bool, None): ValueError, e nada entra
-        (estragariam as medias e a ordem dos maiores).
+        ts: maior ou igual ao da amostra do livro anterior e maior que o da amostra pelo ticker mais nova.
+        Valor que nao e numero real (NaN, infinito, texto, bool, None) ou ts fora de ordem: ValueError, e nada
+        entra (estragariam as medias e a ordem dos maiores).
         """
         try:
             ts, a, f = _numero_real(ts), _numero_real(a), _numero_real(f)
@@ -258,23 +318,43 @@ class JanelaMetricas:
         except ValueError as erro:
             raise ValueError(f"amostra com numero invalido ({erro}): ts={ts!r} a={a!r} f={f!r} "
                              f"lotes={lote_long!r}/{lote_short!r}") from None
-        tamanho_antes = self._amostras.n
-
-        if f >= 0:  # invertida: continua a sequencia aberta ou comeca uma nova
-            if tamanho_antes and self._amostras.ultima(_F) >= 0:
-                self._invertidas.trocar_ultima(_FIM, ts)
-            else:
-                self._invertidas.acrescentar(ts, ts)
-
+        if self._do_ticker.n and ts <= self._do_ticker.ultima(_TS):
+            raise ValueError(f"amostra do livro em ts={ts} nao e mais nova que a amostra pelo ticker de "
+                             f"ts={self._do_ticker.ultima(_TS)}")
+        self._entrou(ts, a, f)
+        if self._amostras is _TABELA_VAZIA:
+            self._amostras = _Colunas(5)
         self._amostras.acrescentar(ts, a, f, lote_long, lote_short)
-        self._soma_a.somar(a)
-        self._soma_f.somar(f)
-        self._soma_lote_long.somar(lote_long)
-        self._soma_lote_short.somar(lote_short)
-        self._maiores_a.entrou(a, tamanho_antes)
-        self._maiores_f.entrou(f, tamanho_antes)
+        self._soma_a += _inteiro_exato(a)
+        self._soma_f += _inteiro_exato(f)
+        self._soma_lote_long += _inteiro_exato(lote_long)
+        self._soma_lote_short += _inteiro_exato(lote_short)
         self._mudou()
         self._descartado_ate = None  # amostra nova: a proxima pergunta confere a fila de novo
+        self._descartar_antigas(ts)
+
+    def adicionar_pelo_ticker(self, ts: float, a: float, f: float) -> None:
+        """Guarda uma amostra PELO TICKER (sem lote) e ja descarta as antigas.
+
+        ts: maior que o da amostra mais nova (de qualquer fonte). Valor que nao e numero real ou ts fora de
+        ordem: ValueError, e nada entra.
+        """
+        try:
+            ts, a, f = _numero_real(ts), _numero_real(a), _numero_real(f)
+        except ValueError as erro:
+            raise ValueError(f"amostra pelo ticker com numero invalido ({erro}): ts={ts!r} a={a!r} "
+                             f"f={f!r}") from None
+        mais_nova = self._ts_mais_novo()
+        if mais_nova is not None and ts <= mais_nova:
+            raise ValueError(f"amostra pelo ticker em ts={ts} nao e mais nova que a de ts={mais_nova}")
+        self._entrou(ts, a, f)
+        if self._do_ticker is _TABELA_VAZIA:
+            self._do_ticker = _Colunas(3)
+        self._do_ticker.acrescentar(ts, a, f)
+        self._soma_a_ticker += _inteiro_exato(a)
+        self._soma_f_ticker += _inteiro_exato(f)
+        self._mudou()
+        self._descartado_ate = None
         self._descartar_antigas(ts)
 
     def resumo(self, agora: float, duracao_min_invertida_s: float) -> Metricas | None:
@@ -283,45 +363,51 @@ class JanelaMetricas:
         O objeto devolvido fica guardado e e devolvido de novo enquanto nada mudar: so leitura.
         """
         self._descartar_antigas(agora)
-        if not self._amostras.n:
+        if not (self._amostras.n or self._do_ticker.n):
             return None
         if self._cache is not None and self._cache[0] == duracao_min_invertida_s:
             return self._cache[1]  # caso comum: a janela e a duracao nao mudaram desde a ultima conta
-        n = self._amostras.n
         metricas = Metricas(
-            abertura_media=self._soma_a.valor() / n,
-            fechamento_medio=self._soma_f.valor() / n,
-            maior_abertura=self._maiores_a.maior(),
-            maior_fechamento=self._maiores_f.maior(),
-            media_10_maiores_abertura=self._maiores_a.media_dos_10_maiores(),
-            media_10_maiores_fechamento=self._maiores_f.media_dos_10_maiores(),
+            abertura_media=self._media(self._soma_a, self._soma_a_ticker),
+            fechamento_medio=self._media(self._soma_f, self._soma_f_ticker),
+            maior_abertura=self._maiores_a[-1],
+            maior_fechamento=self._maiores_f[-1],
+            media_10_maiores_abertura=_media_dos_10_maiores(self._maiores_a),
+            media_10_maiores_fechamento=_media_dos_10_maiores(self._maiores_f),
             invertidas=self._contar_invertidas(duracao_min_invertida_s),
         )
         self._cache = (duracao_min_invertida_s, metricas)
         return metricas
 
     def lotes_medios(self, agora: float) -> tuple[float | None, float | None]:
-        """(lote medio do long, lote medio do short) no periodo que termina em `agora`; (None, None) sem amostras."""
+        """(lote medio do long, lote medio do short) das amostras do LIVRO no periodo que termina em `agora`.
+
+        (None, None) sem amostras do livro (as amostras pelo ticker nao tem lote).
+        """
         self._descartar_antigas(agora)
         if not self._amostras.n:
             return None, None
         if self._cache_lotes is None:
             n = self._amostras.n
-            self._cache_lotes = (self._soma_lote_long.valor() / n, self._soma_lote_short.valor() / n)
+            self._cache_lotes = (_valor_da_soma(self._soma_lote_long) / n, _valor_da_soma(self._soma_lote_short) / n)
         return self._cache_lotes
 
     def vazia(self, agora: float) -> bool:
-        """True se nao sobrou nenhuma amostra dentro do periodo que termina em `agora`."""
+        """True se nao sobrou nenhuma amostra (de nenhuma fonte) dentro do periodo que termina em `agora`."""
         self._descartar_antigas(agora)
-        return not self._amostras.n
+        return not (self._amostras.n or self._do_ticker.n)
 
-    def amostras(self) -> list[tuple[float, float, float, float, float]]:
+    def amostras(self) -> list[tuple[float, float, float, float | None, float | None]]:
         """Copia das amostras guardadas agora, da mais antiga a mais nova: (ts, A, F, lote do long, lote do short).
 
-        O motor usa para juntar as amostras novas da memoria com as janelas recarregadas do banco.
+        As pelo ticker vem com os lotes None. O motor usa para juntar as amostras novas da memoria com as janelas
+        recarregadas do banco.
         """
-        colunas = [self._amostras.coluna(c) for c in (_TS, _A, _F, _LOTE_LONG, _LOTE_SHORT)]
-        return list(zip(*colunas))
+        do_livro = list(zip(*[self._amostras.coluna(c) for c in (_TS, _A, _F, _LOTE_LONG, _LOTE_SHORT)]))
+        do_ticker = [(ts, a, f, None, None) for ts, a, f in zip(*[self._do_ticker.coluna(c) for c in (_TS, _A, _F)])]
+        if not do_ticker:
+            return do_livro
+        return list(heapq.merge(do_livro, do_ticker, key=lambda amostra: amostra[0]))
 
     # --- por dentro -----------------------------------------------------------
 
@@ -329,30 +415,102 @@ class JanelaMetricas:
         self._cache = None
         self._cache_lotes = None
 
+    def _ts_mais_novo(self) -> float | None:
+        """O ts da amostra mais nova (de qualquer fonte), ou None com a janela vazia."""
+        livro = self._amostras.ultima(_TS) if self._amostras.n else None
+        ticker = self._do_ticker.ultima(_TS) if self._do_ticker.n else None
+        if livro is None or ticker is None:
+            return ticker if livro is None else livro
+        return max(livro, ticker)
+
+    def _entrou(self, ts: float, a: float, f: float) -> None:
+        """O que toda amostra nova muda, qualquer que seja a fonte: invertidas e maiores (antes de entrar na tabela)."""
+        tamanho_antes = self._amostras.n + self._do_ticker.n
+        if f >= 0:  # invertida: continua a sequencia aberta ou comeca uma nova
+            if tamanho_antes and self._ultimo_f >= 0:
+                self._invertidas.trocar_ultima(_FIM, ts)
+            else:
+                if self._invertidas is _TABELA_VAZIA:
+                    self._invertidas = _Colunas(2)
+                self._invertidas.acrescentar(ts, ts)
+        self._ultimo_f = f
+        _maiores_entrou(self._maiores_a, a, tamanho_antes)
+        _maiores_entrou(self._maiores_f, f, tamanho_antes)
+
+    def _media(self, soma_livro: int, soma_ticker: int) -> float:
+        """Media das duas fontes, a do ticker pesando `peso_ticker`. Com uma fonte so: soma dividida pela quantidade."""
+        n_livro, n_ticker = self._amostras.n, self._do_ticker.n
+        if not n_ticker:
+            return _valor_da_soma(soma_livro) / n_livro  # so amostras do livro: a conta de sempre
+        if not n_livro:
+            return _valor_da_soma(soma_ticker) / n_ticker
+        peso = self.peso_ticker
+        return (_valor_da_soma(soma_livro) + peso * _valor_da_soma(soma_ticker)) / (n_livro + peso * n_ticker)
+
     def _descartar_antigas(self, agora: float) -> None:
-        """Tira do comeco as amostras com ts < agora - periodo_s, que ficaram fora da janela."""
+        """Tira do comeco as amostras com ts < agora - periodo_s, que ficaram fora da janela, em ordem de horario."""
         if self._descartado_ate is not None and agora <= self._descartado_ate:
             return  # ja descartou ate um `agora` igual ou maior: nada novo pode sair
         limite = agora - self.periodo_s
-        while self._amostras.n and self._amostras.primeira(_TS) < limite:
-            self._tirar_a_mais_antiga()
+        livro, ticker = self._amostras, self._do_ticker
+        if not ticker.n:  # o caso comum (par com livro o periodo todo, ou sem tickers): uma fila so
+            while livro.n and livro.primeira(_TS) < limite:
+                self._tirar_do_livro()
+        else:  # as duas filas: sai sempre a mais antiga das duas (as invertidas dependem da ordem)
+            while True:
+                ts_livro = livro.primeira(_TS) if livro.n else math.inf
+                ts_ticker = ticker.primeira(_TS) if ticker.n else math.inf
+                if min(ts_livro, ts_ticker) >= limite:
+                    break
+                if ts_livro < ts_ticker:
+                    self._tirar_do_livro()
+                else:
+                    self._tirar_do_ticker()
         self._descartado_ate = agora
 
-    def _tirar_a_mais_antiga(self) -> None:
+    def _tirar_do_livro(self) -> None:
         _, a, f, lote_long, lote_short = self._amostras.tirar_primeira()
-        self._soma_a.tirar(a)
-        self._soma_f.tirar(f)
-        self._soma_lote_long.tirar(lote_long)
-        self._soma_lote_short.tirar(lote_short)
-        self._maiores_a.saiu(a, self._amostras, _A)
-        self._maiores_f.saiu(f, self._amostras, _F)
+        if not self._amostras.n:
+            self._amostras = _TABELA_VAZIA
+        self._soma_a -= _inteiro_exato(a)
+        self._soma_f -= _inteiro_exato(f)
+        self._soma_lote_long -= _inteiro_exato(lote_long)
+        self._soma_lote_short -= _inteiro_exato(lote_short)
+        self._saiu(a, f)
+
+    def _tirar_do_ticker(self) -> None:
+        _, a, f = self._do_ticker.tirar_primeira()
+        if not self._do_ticker.n:
+            self._do_ticker = _TABELA_VAZIA
+        self._soma_a_ticker -= _inteiro_exato(a)
+        self._soma_f_ticker -= _inteiro_exato(f)
+        self._saiu(a, f)
+
+    def _saiu(self, a: float, f: float) -> None:
+        """O que toda amostra que sai muda (a amostra ja saiu da tabela dela): maiores e invertidas."""
+        tamanho = self._amostras.n + self._do_ticker.n
+        if _maiores_saiu(self._maiores_a, a, tamanho):
+            self._maiores_a = _maiores_refeitos(chain(self._amostras.coluna(_A), self._do_ticker.coluna(_A)))
+        if _maiores_saiu(self._maiores_f, f, tamanho):
+            self._maiores_f = _maiores_refeitos(chain(self._amostras.coluna(_F), self._do_ticker.coluna(_F)))
         if f >= 0:  # era a primeira amostra da sequencia de invertida mais antiga
-            if self._amostras.n and self._amostras.primeira(_F) >= 0:
+            proxima = self._mais_antiga()
+            if proxima is not None and proxima[1] >= 0:
                 # A sequencia continua: agora comeca na proxima amostra.
-                self._invertidas.trocar_primeira(_INICIO, self._amostras.primeira(_TS))
+                self._invertidas.trocar_primeira(_INICIO, proxima[0])
             else:  # a sequencia saiu inteira
                 self._invertidas.tirar_primeira()
+                if not self._invertidas.n:
+                    self._invertidas = _TABELA_VAZIA
         self._mudou()
+
+    def _mais_antiga(self) -> tuple[float, float] | None:
+        """(ts, F) da amostra mais antiga que ficou na janela (de qualquer fonte), ou None se ficou vazia."""
+        livro = (self._amostras.primeira(_TS), self._amostras.primeira(_F)) if self._amostras.n else None
+        ticker = (self._do_ticker.primeira(_TS), self._do_ticker.primeira(_F)) if self._do_ticker.n else None
+        if livro is None or ticker is None:
+            return ticker if livro is None else livro
+        return livro if livro[0] < ticker[0] else ticker
 
     def _contar_invertidas(self, duracao_min_s: float) -> int:
         """Quantas sequencias de invertida da janela duram pelo menos `duracao_min_s` (conta sequencias)."""

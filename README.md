@@ -88,7 +88,7 @@ Regra para todos os comandos: rode sempre **dentro da pasta do projeto** (a que 
    ```
 
 5. Banco: `C:\scanner-arbitragem\scanner.db` (histórico dos sinais, amostras do gráfico, grupos de filtros, métricas da validação e a última sessão do painel). O scanner apaga sozinho as amostras do gráfico com mais de 7 dias (`retencao_dias`); o histórico dos sinais e as métricas da validação ficam. Para começar do zero: pare o scanner e apague `scanner.db`, `scanner.db-wal` e `scanner.db-shm`.
-6. Ao ligar de novo, o scanner volta na última sessão do painel (modo, filtros e modo comparação), recarrega as amostras do período (4 h) do banco para o F médio e o lote médio não começarem do zero, e fecha os sinais que ficaram abertos se ele tiver caído (com a última vez em que cada um foi visto). Ao parar com `Ctrl+C`, os sinais ativos são encerrados com o horário da parada.
+6. Ao ligar de novo, o scanner volta na última sessão do painel (modo, filtros e modo comparação), recarrega as amostras do livro do período (4 h) do banco para o F médio e o lote médio não começarem do zero (as amostras pelos tickers ficam só na memória e recomeçam do zero), e fecha os sinais que ficaram abertos se ele tiver caído (com a última vez em que cada um foi visto). Ao parar com `Ctrl+C`, os sinais ativos são encerrados com o horário da parada.
 
 ## 3. Instalar e rodar na VPS (Ubuntu)
 
@@ -334,7 +334,7 @@ Faça os marcos nesta ordem. Os comandos são do Windows (PowerShell, na pasta `
 3. Procure as linhas que **não** deveriam aparecer:
 
    ```powershell
-   Select-String -Path "logs\scanner-*.log" -Pattern "nenhum metodo de ticker|parece de limite|mercado inativo|relogio do PC|fora da faixa|sem cotacao|ficam de fora ate a taxa|nunca mandaram ticker|nao mandou nada|intervalo do funding nao veio|fila do banco cheia|sem atualizar|Traceback"
+   Select-String -Path "logs\scanner-*.log" -Pattern "nenhum metodo de ticker|parece de limite|mercado inativo|relogio do PC|fora da faixa|sem cotacao|ficam de fora ate a taxa|nunca mandaram ticker|nao mandou nada|intervalo do funding nao veio|fila do banco cheia|sem atualizar|teto de max_historicos|Traceback"
    ```
 
    | Se aparecer | O que fazer |
@@ -351,6 +351,7 @@ Faça os marcos nesta ordem. Os comandos são do Windows (PowerShell, na pasta `
    | `o livro pedido nao mandou nada em 60s` | anote a corretora e o par. Se acontecer com muitos pares da mesma corretora, ela está recusando assinaturas: preencha `limites_assinatura_mercado` dela e avise |
    | `fila do banco cheia: N amostras descartadas` | o disco não dá conta das amostras: veja `banco N MB` na linha `recursos:` e o espaço livre do disco, e avise |
    | `funding com mais de 900s sem atualizar` | a busca de funding daquela corretora está falhando (procure `nao consegui atualizar funding e taxas`); se durar mais de 1 hora, avise |
+   | `historicos na memoria chegaram ao teto de max_historicos` | alguns pares ficam com as métricas só do tempo com livro. Veja `memoria` na linha `recursos:`: se estiver abaixo de 1/3 da memória do PC, dobre `max_historicos` ([parte 6](#6-mudar-a-configuração)); senão, avise |
    | `Traceback` | copie as linhas em volta e avise |
 
 4. Confira os sinais sem o painel: abra <http://localhost:8000/api/sinais>. Aparece uma lista (pode ser `[]` se não houver oportunidade agora).
@@ -404,10 +405,12 @@ Com o scanner ligado, abra <http://localhost:8000> e confira:
    ```
 
    ```text
-   INFO scanner.principal: recursos: memoria 182.4 MB (atual), CPU 9.1%, sinais ativos 4, historicos 350
+   INFO scanner.principal: recursos: memoria 282.4 MB (atual), CPU 9.1%, sinais ativos 4, historicos 21350
    ```
 
-   Esperado: uma linha a cada 5 minutos, sem buraco; a memória sobe nas primeiras 4 horas e depois fica estável (não cresce o dia todo). `memoria indisponivel`: veja o [aviso F](#aviso-f-memória-no-windows).
+   `historicos N` = pares com amostras do período na memória (pelos tickers e pelo livro); no máximo `max_historicos` (80000, ~400 MB). Cada par sem livro ocupa ~5 KB (4 h de amostras a cada 120 s).
+
+   Esperado: uma linha a cada 5 minutos, sem buraco; a memória e o `historicos N` sobem nas primeiras 4 horas e depois ficam estáveis (não crescem o dia todo). `memoria indisponivel`: veja o [aviso F](#aviso-f-memória-no-windows).
 
 Os outros dois testes da seção 9 (corretora com dado atrasado e par sem liquidez) são conferidos pelos testes automáticos (`tests/test_estado.py` e `tests/test_motor.py`).
 
@@ -649,7 +652,7 @@ Verde = positivo; vermelho = negativo. Linha com faixa amarela à esquerda = fix
   - modo Farm: `Custo a cada $1.000` de volume (vermelho = você gasta; verde = você ganha).
 - **Histórico (4h)**:
   - `N invertidas` no período;
-  - `A` e `F` médios do período;
+  - `A` e `F` médios do período. Contam o período inteiro: o tempo com livro aberto (amostra do livro a cada 5 s) e o tempo sem livro, pelos tickers (melhor bid/ask, amostra a cada 120 s, `amostra_ticker_s`). Cada amostra pesa o tempo que cobre;
   - botão de gráfico: abre o gráfico do par.
 - **Fixar** (alfinete, última coluna): leva o sinal para o topo; fica salvo no grupo.
 
@@ -670,6 +673,7 @@ Verde = positivo; vermelho = negativo. Linha com faixa amarela à esquerda = fix
 - `Período: 4h`: o período dos filtros.
 - Resumo no topo: `Maior spread`, `Média dos 10 maiores`, `Spread médio` e o lote médio de cada ponta.
 - Duas linhas: preço da ponta long (azul) e da short (vermelha).
+- As métricas do período da tabela (A/F médios, maiores, invertidas) incluem o tempo sem livro, pelos tickers (melhor bid/ask); o gráfico só mostra as amostras do livro (o tempo com livro aberto). Por isso o `Spread médio` do gráfico pode ser diferente do A médio da tabela. O lote médio vem só do livro nos dois.
 - Mouse em cima: horário, preço e lote de cada ponta, spread naquele ponto e `Spread médio HH:MM – HH:MM` (daquele ponto até agora).
 - `Esc` ou o X fecha.
 - `Não deu para carregar a biblioteca do gráfico`: o gráfico vem da internet (unpkg.com); o resto do painel funciona. O navegador só aceita o arquivo exato da versão 4.2.3 (conferido pelo hash); se o arquivo do unpkg mudar, o gráfico fica desligado (veja a parte 8).
@@ -683,7 +687,9 @@ Verde = positivo; vermelho = negativo. Linha com faixa amarela à esquerda = fix
 - As colunas `MAX` e a etiqueta `STOCK` ficam vazias na v1.
 - `Funding sincronizado` só confere se as pontas têm o mesmo intervalo de cobrança (não o horário da próxima cobrança).
 - O gráfico do histórico mostra as amostras até uns 10 s atrás: o banco grava as amostras em lotes de 10 s (escreve menos no disco). A tabela ao vivo não tem esse atraso.
-- No modo Farm o scanner só calcula as combinações com uma ponta numa corretora de farm (e as moedas do **Sempre mostrar**). Abaixo do spread mínimo normal (0,3%), cada mercado de farm (ex.: os futuros da Lighter) abre no máximo 50 combinações, as de maior spread (`max_livros_farm_por_mercado`).
+- No modo Farm o scanner só calcula as combinações com uma ponta numa corretora de farm (e as moedas do **Sempre mostrar**). Abaixo do spread mínimo normal (0,3%), cada mercado de farm (ex.: os futuros da Lighter) abre no máximo 50 combinações, as de maior spread (`max_livros_farm_por_mercado`). As métricas do período das outras combinações continuam sendo feitas pelos tickers: ao voltar para o Lucro, elas já estão prontas.
+- As amostras pelos tickers ficam só na memória: ao religar o scanner ou mudar o `Período das métricas`, as métricas voltam com as amostras do livro gravadas no banco e as dos tickers recomeçam do zero (o tempo sem livro volta a contar aos poucos, até completar o período).
+- A memória das métricas cresce com o período: com `Período das métricas` de 24 h, cada par sem livro guarda 6 vezes mais amostras que com 4 h (~20 KB em vez de ~5 KB). Com muitas corretoras, confira `memoria` na linha `recursos:` do log depois de mudar o período.
 
 ---
 
@@ -825,6 +831,9 @@ O padrão vale quando a linha não está no `config.yaml`.
 | `spread_min_livro_farm_pct` | `-0.1` | % | spread mínimo para abrir o livro das combinações de farm, no modo Farm |
 | `validade_funding_s` | `900` | s | funding mais velho que isto fica desconhecido no cálculo |
 | `max_livros_farm_por_mercado` | `50` | combinações | no modo Farm, quantas combinações abaixo de `spread_min_livro_pct` cada mercado de farm abre |
+| `historico_tickers` | `true` | — | métricas do período também com o tempo sem livro, pelos tickers (melhor bid/ask), só na memória; `false` = só o tempo com livro aberto |
+| `amostra_ticker_s` | `120` | s | intervalo das amostras pelos tickers de cada par sem livro (no mínimo `amostra_s`) |
+| `max_historicos` | `80000` | históricos | máximo de pares com amostras na memória (o `historicos N` da linha `recursos:`); no teto, o log avisa uma vez |
 
 ---
 

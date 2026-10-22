@@ -33,6 +33,14 @@ Banco: o motor nunca espera o disco. No scanner, eventos, amostras e a sessao va
 (`escritor`), que grava numa thread propria; sem escritor (testes), grava direto no `banco`. As janelas do
 periodo sao recarregadas das amostras do banco ao ligar e quando o periodo muda (recarregar_do_banco), numa
 thread propria, e juntadas as amostras novas da memoria quando a recarga termina.
+
+Historico pelos tickers (Task 18; especificacao, secao 3, "De onde vem as amostras das metricas"): com
+`historico_tickers` ligado, todo par com ticker valido nas duas pontas (spot x futuro e futuro x futuro, nas duas
+direcoes) ganha uma amostra pelos tickers a cada `amostra_ticker_s`: A e F do melhor bid/ask, com as mesmas
+conversoes do resto do motor (spreads_pelos_tickers). Uma fonte por vez: enquanto o par e candidato (livro aberto
+nas duas pontas), a amostra vem do livro a cada `amostra_s`, como antes. As duas vao para a mesma janela; o lote
+medio vem so do livro. As amostras pelos tickers ficam so na memoria (nem banco, nem grafico, nem recarga). Os
+pares sao visitados em rodizio, um pedaco por ciclo, sem pico; no maximo `max_historicos` historicos.
 """
 
 import heapq
@@ -77,6 +85,9 @@ FATIA_RECARGA_S = 0.01
 PAUSA_RECARGA_S = 0.01
 # Quanto a recarga espera o escritor gravar as amostras que estavam na fila antes de ler o banco (segundos).
 ESPERA_ESCRITOR_RECARGA_S = 10
+# Historico pelos tickers: a limpeza dos historicos de pares que sumiram anda aos poucos (um pedaco por ciclo, no
+# ritmo do rodizio). Com ate tantos historicos, confere todos a cada ciclo, como antes. Detalhe tecnico.
+VARREDURA_MINIMA = 2000
 
 # Qual campo das Metricas e o "F" do RP bruto, para cada opcao de metrica_spread (config ou filtros).
 CAMPO_DO_F = {
@@ -294,17 +305,21 @@ class _CombinacoesPorAtivo:
 
     Para cada ativo: {chave do long: {chave do short: combo}} (com quais shorts cada long forma
     combinacao) e a lista de todas as chaves de short. Chave = (corretora, mercado, ativo).
+    `lista`: as mesmas combinacoes numa lista so, na ordem de `combinacoes` (o rodizio do historico pelos
+    tickers anda nela); sao os mesmos objetos, entao nao ocupa quase nada a mais.
     """
 
     def __init__(self):
         self._mercados: dict | None = None  # os mercados da ultima arrumacao
         self._por_ativo: dict[str, tuple[dict, list]] = {}
+        self.lista: list[tuple] = []
 
     def obter(self, mercados: dict[str, set[tuple[str, str]]]) -> dict[str, tuple[dict, list]]:
         if mercados != self._mercados:
             self._mercados = mercados
             por_ativo: dict[str, tuple[dict, list]] = {}
-            for combo in combinacoes(mercados):
+            lista = combinacoes(mercados)
+            for combo in lista:
                 ativo, corretora_long, mercado_long, corretora_short, mercado_short = combo
                 longs, shorts = por_ativo.setdefault(ativo, ({}, []))
                 chave_short = (corretora_short, mercado_short, ativo)
@@ -312,6 +327,7 @@ class _CombinacoesPorAtivo:
                 if chave_short not in shorts:
                     shorts.append(chave_short)
             self._por_ativo = por_ativo
+            self.lista = lista
         return self._por_ativo
 
 
@@ -351,25 +367,52 @@ class _PrecosDosTickers(NamedTuple):
     simbolos: dict[tuple[str, str, str], str | None]  # simbolo do ccxt, ex.: "BTC/USDT:USDT"
 
 
+def spreads_pelos_tickers(precos: _PrecosDosTickers, chave_long: tuple[str, str, str],
+                          chave_short: tuple[str, str, str]) -> tuple[float, float] | None:
+    """(A, F) da combinacao pelos tickers de agora, em %, ou None se falta algum preco ou a conta nao da numero real.
+
+    precos: os tickers ja em USDT (Motor._precos_dos_tickers: mesma conversao da cotacao e mesmas regras de dado
+    invalido da etapa 2). Mesmas formulas do candidato: abrir = o long compra no ask e o short vende no bid;
+    fechar = o long vende no bid e o short recompra no ask. O ticker e o melhor nivel: nao come o livro.
+    """
+    ask_long, bid_short = precos.asks.get(chave_long), precos.bids.get(chave_short)
+    bid_long, ask_short = precos.bids.get(chave_long), precos.asks.get(chave_short)
+    if ask_long is None or bid_short is None or bid_long is None or ask_short is None:
+        return None
+    a = spread_abertura(ask_long, bid_short)
+    f = spread_fechamento(bid_long, ask_short)
+    return (a, f) if _todos_validos(a, f) else None
+
+
 class _Historico:
     """Amostras do periodo de uma combinacao e o horario da ultima amostra.
 
-    A janela (JanelaMetricas) guarda A, F e o lote de cada ponta de cada amostra, da as metricas
-    e os lotes medios, e tira sozinha as amostras mais velhas que o periodo. As amostras chegam
-    em ordem de horario.
+    A janela (JanelaMetricas) guarda as amostras do livro (A, F e o lote de cada ponta) e as pelos tickers (A e
+    F), da as metricas e os lotes medios, e tira sozinha as amostras mais velhas que o periodo. As amostras
+    chegam em ordem de horario. peso_ticker: quantas amostras do livro uma pelo ticker vale nas medias.
     """
 
-    def __init__(self, periodo_s: float):
-        self.janela = JanelaMetricas(periodo_s)
-        self.ultima_amostra: float | None = None  # horario da ultima amostra (None = nenhuma)
+    __slots__ = ("janela", "ultima_amostra", "ultima_pelo_ticker")
+
+    def __init__(self, periodo_s: float, peso_ticker: float = 1.0):
+        self.janela = JanelaMetricas(periodo_s, peso_ticker)
+        self.ultima_amostra: float | None = None  # horario da ultima amostra, de qualquer fonte (None = nenhuma)
+        self.ultima_pelo_ticker = False  # a ultima amostra veio pelos tickers (o par estava sem livro)
 
     def adicionar(self, ts: float, a: float, f: float, lote_long: float, lote_short: float) -> None:
-        """Guarda uma amostra. A janela recusa NaN e infinito (ValueError): eles estragariam as medias."""
+        """Guarda uma amostra do livro. A janela recusa NaN e infinito (ValueError): eles estragariam as medias."""
         self.janela.adicionar(ts, a, f, lote_long, lote_short)
         self.ultima_amostra = ts
+        self.ultima_pelo_ticker = False
+
+    def adicionar_pelo_ticker(self, ts: float, a: float, f: float) -> None:
+        """Guarda uma amostra pelos tickers (sem lote). Fora de ordem, NaN ou infinito: ValueError."""
+        self.janela.adicionar_pelo_ticker(ts, a, f)
+        self.ultima_amostra = ts
+        self.ultima_pelo_ticker = True
 
     def lotes_medios(self, agora: float) -> tuple[float | None, float | None]:
-        """(lote medio do long, lote medio do short) no periodo, em $; (None, None) sem amostras."""
+        """(lote medio do long, lote medio do short) no periodo, em $, so das amostras do livro; (None, None) sem."""
         return self.janela.lotes_medios(agora)
 
     def vazio(self, agora: float) -> bool:
@@ -382,12 +425,16 @@ class _Recarga:
 
     A thread monta um _Historico novo para cada combinacao com amostras desde `desde`; o motor junta o resultado
     as janelas dele (no laco) quando `pronta` estiver ligado. `cancelar` faz a thread parar na proxima combinacao.
+    O banco so tem amostras do livro: as pelos tickers nunca sao gravadas (ficam so na memoria).
     antes: chamado na thread antes de ler o banco (o motor passa o descarregar do escritor: as amostras que ainda
         esperavam o lote vao para o banco antes, e nenhuma fica de fora da janela recarregada).
+    peso_ticker: o das janelas do motor (as amostras pelos tickers da memoria entram nelas na juncao).
     """
 
-    def __init__(self, banco, desde: float, periodo_s: float, antes: Callable[[], object] | None = None):
+    def __init__(self, banco, desde: float, periodo_s: float, antes: Callable[[], object] | None = None,
+                 peso_ticker: float = 1.0):
         self.periodo_s = periodo_s
+        self.peso_ticker = peso_ticker
         self.historicos: dict[tuple, _Historico] = {}
         self.amostras = 0  # quantas amostras foram carregadas
         self.erro: Exception | None = None
@@ -415,7 +462,7 @@ class _Recarga:
                 chave = chave_do_texto(texto)
                 if chave is None:
                     continue
-                historico = _Historico(self.periodo_s)
+                historico = _Historico(self.periodo_s, self.peso_ticker)
                 for ts, a, f, lote_long, lote_short in linhas:
                     if _todos_validos(ts, a, f, lote_long, lote_short):  # NULL ou NaN no banco: so esta fica de fora
                         historico.adicionar(ts, a, f, lote_long, lote_short)
@@ -485,6 +532,12 @@ class Motor:
         # mudam quando entra ou sai um mercado). Separadas, para uma nao desfazer a outra.
         self._combos_candidatos = _CombinacoesGuardadas()
         self._combos_selecao = _CombinacoesPorAtivo()
+        # Historico pelos tickers: onde o rodizio esta na lista de combinacoes (fracionario: anda um pouco a cada
+        # ciclo) e o `agora` da ultima volta; e a limpeza aos poucos (copia das chaves e a posicao nela).
+        self._rodizio_posicao = 0.0
+        self._rodizio_ultimo: float | None = None
+        self._varredura: list[tuple] = []
+        self._varredura_posicao = 0
 
     # --- API -----------------------------------------------------------------
 
@@ -494,20 +547,22 @@ class Motor:
         Gera sempre os dois tipos: o filtro "tipos de oportunidade" e aplicado depois, em `passa`.
         Cada chamada cria objetos novos. Combinacao sem livro valido nas duas pontas, sem liquidez
         para o tamanho de referencia ou sem taxa taker conhecida nao gera candidato. Tambem
-        acrescenta as amostras do periodo (a primeira quando a combinacao aparece; depois a cada
-        `amostra_s`) e junta as janelas recarregadas do banco, se a recarga terminou.
+        acrescenta as amostras do periodo (do livro, nos candidatos: a primeira quando a combinacao aparece ou
+        volta a ter livro; depois a cada `amostra_s`; e, com historico_tickers, as pelos tickers do pedaco do
+        rodizio, nos pares que nao sao candidatos) e junta as janelas recarregadas do banco, se a recarga terminou.
 
         No modo Farm so as combinacoes com ponta numa corretora de farm e as moedas do "sempre mostrar" sao
         calculadas: as outras nunca viram sinal no Farm (a regra do modo exige uma ponta de farm), e calcular
-        todas nao caberia no ciclo. Enquanto o Farm durar, as metricas do periodo dessas outras param de receber
-        amostras (o historico pelos tickers de todos os pares, da Task 18, resolve isso).
+        todas nao caberia no ciclo. Enquanto o Farm durar, essas outras nao sao candidatas, entao as metricas do
+        periodo delas continuam aquecidas pelos tickers (com historico_tickers; desligado, param de receber amostras).
         """
         modo = self._modo_da_sessao()
         duracao_invertida_s, metrica = self._ajustar_sessao(agora)
         self._juntar_recarga_pronta()
         cotacoes = self._cotacoes_validas()
         # Cada mercado e lido uma vez so; ficam os que tem livro valido agora.
-        lados = self._lados_com_livro(agora, cotacoes)
+        mercados = self.estado.mercados()
+        lados = self._lados_com_livro(agora, cotacoes, mercados)
         so_do_farm = self._filtro_do_farm(modo, {corretora for corretora, _, _ in lados})
         resultado = []
         vistas = set()
@@ -526,7 +581,12 @@ class Motor:
             if candidato is not None:
                 resultado.append(candidato)
                 vistas.add(candidato.chave)
-        self._esquecer_historicos(agora, vistas)
+        if self.cfg.historico_tickers:
+            fracao = self._amostrar_pelos_tickers(agora, vistas, cotacoes, mercados)
+            self._respeitar_teto(vistas)
+            self._esquecer_aos_poucos(agora, vistas, fracao)
+        else:
+            self._esquecer_historicos(agora, vistas)
         return resultado
 
     def ciclo(self, agora: float) -> list[Evento]:
@@ -854,18 +914,31 @@ class Motor:
         return {corretora: self.estado.saude(corretora, agora) for corretora in self.cfg.corretoras}
 
     def quantidade_historicos(self) -> int:
-        """Quantas combinacoes tem amostras do periodo na memoria (vai para a linha de recursos do log)."""
+        """Quantas combinacoes tem amostras do periodo na memoria, pelo livro e pelos tickers (no maximo
+        max_historicos, mais os candidatos que passarem dele). Vai para a linha de recursos do log."""
         return len(self._historicos)
 
     def precarregar_amostra(self, chave: tuple, ts: float, a: float, f: float,
                             lote_long: float, lote_short: float) -> None:
-        """Acrescenta uma amostra ja conhecida ao periodo da `chave`, sem grava-la no banco (ex.: testes).
+        """Acrescenta uma amostra do livro ja conhecida ao periodo da `chave`, sem grava-la no banco (ex.: testes).
 
         As amostras precisam vir em ordem de horario. NaN ou infinito levantam ValueError.
         """
-        historico = self._historicos.get(chave) or _Historico(self._periodo_h * SEGUNDOS_POR_HORA)
+        historico = self._historicos.get(chave) or self._novo_historico()
         historico.adicionar(ts, a, f, lote_long, lote_short)
         self._historicos[chave] = historico
+
+    def _novo_historico(self) -> _Historico:
+        """Historico vazio com o periodo em uso e o peso das amostras pelos tickers."""
+        return _Historico(self._periodo_h * SEGUNDOS_POR_HORA, self._peso_ticker())
+
+    def _peso_ticker(self) -> float:
+        """Quantas amostras do livro uma amostra pelos tickers vale nas medias: o tempo que ela cobre.
+
+        O livro amostra a cada amostra_s e o ticker a cada amostra_ticker_s (ex.: 120 / 5 = 24). Assim uma hora sem
+        livro pesa o mesmo que uma hora com livro, e o F medio e o do periodo inteiro (especificacao, secao 3).
+        """
+        return self.cfg.amostra_ticker_s / self.cfg.amostra_s
 
     # --- Sessao --------------------------------------------------------------
 
@@ -915,7 +988,7 @@ class Motor:
         if escritor is not None:
             def antes():  # na thread da recarga: as amostras que esperavam o lote vao para o banco antes
                 escritor.descarregar(ESPERA_ESCRITOR_RECARGA_S)
-        self._recarga = _Recarga(self.banco, agora - periodo_s, periodo_s, antes)
+        self._recarga = _Recarga(self.banco, agora - periodo_s, periodo_s, antes, self._peso_ticker())
 
     def _juntar_recarga_pronta(self) -> None:
         """Se a recarga terminou: junta as janelas do banco com as amostras novas da memoria (no laco, rapido)."""
@@ -931,9 +1004,13 @@ class Motor:
             return  # o periodo mudou de novo durante a recarga (a nova ja foi pedida)
         for chave, carregado in recarga.historicos.items():
             vivo = self._historicos.get(chave)
-            if vivo is not None:  # as amostras que a memoria tem depois da ultima do banco
+            if vivo is not None:  # as amostras que a memoria tem depois da ultima do banco (do livro e pelos tickers)
                 for ts, a, f, lote_long, lote_short in vivo.janela.amostras():
-                    if ts > carregado.ultima_amostra:
+                    if ts <= carregado.ultima_amostra:
+                        continue  # as do livro ja vieram do banco
+                    if lote_long is None:  # pelos tickers (so na memoria)
+                        carregado.adicionar_pelo_ticker(ts, a, f)
+                    else:
                         carregado.adicionar(ts, a, f, lote_long, lote_short)
             self._historicos[chave] = carregado
         registro.info("janelas do periodo (%gh) recarregadas do banco: %d combinacoes, %d amostras, em %.1f s",
@@ -964,13 +1041,15 @@ class Motor:
 
     # --- Leitura do estado (cada mercado uma vez por ciclo) ------------------
 
-    def _lados_com_livro(self, agora: float, cotacoes: dict[str, float]) -> dict[tuple[str, str, str], _Lado]:
+    def _lados_com_livro(self, agora: float, cotacoes: dict[str, float],
+                         mercados: dict[str, set[tuple[str, str]]] | None = None) -> dict[tuple[str, str, str], _Lado]:
         """{(corretora, mercado, ativo): lado} dos mercados com livro valido agora, ja em USDT.
 
         Mercado sem livro valido (velho, conexao silenciosa ou nunca chegou) fica de fora.
+        mercados: os de estado.mercados(), se quem chama ja os leu neste ciclo (senao le aqui).
         """
         lados = {}
-        for corretora, pares in self.estado.mercados().items():
+        for corretora, pares in (self.estado.mercados() if mercados is None else mercados).items():
             for mercado, ativo in pares:
                 lado = self._ler_lado(corretora, mercado, ativo, agora, cotacoes)
                 if lado is not None:
@@ -1166,11 +1245,16 @@ class Motor:
 
     def _amostrar(self, chave: tuple, agora: float, a: float, f: float, preco_long: float,
                   preco_short: float, lote_long: float, lote_short: float) -> _Historico:
-        """Acrescenta a amostra de agora se a chave acabou de aparecer ou se ja passou `amostra_s`."""
+        """Acrescenta a amostra do livro de agora se a chave acabou de aparecer ou se ja passou `amostra_s`.
+
+        Tambem quando a ultima amostra veio pelos tickers (o livro acabou de abrir): a primeira do livro e na hora,
+        como quando a chave aparece, desde que seja depois dela (uma fonte por vez, em ordem de horario).
+        """
         historico = self._historicos.get(chave)
         if historico is None:
-            historico = self._historicos[chave] = _Historico(self._periodo_h * SEGUNDOS_POR_HORA)
-        if historico.ultima_amostra is None or agora - historico.ultima_amostra >= self.cfg.amostra_s:
+            historico = self._historicos[chave] = self._novo_historico()
+        ultima = historico.ultima_amostra
+        if ultima is None or agora - ultima >= self.cfg.amostra_s or (historico.ultima_pelo_ticker and agora > ultima):
             historico.adicionar(agora, a, f, lote_long, lote_short)
             self._amostras_pendentes.append((chave, agora, a, f, preco_long, preco_short, lote_long, lote_short))
         return historico
@@ -1179,6 +1263,117 @@ class Motor:
         """Apaga o historico de quem nao apareceu agora e ja nao tem amostra no periodo (a memoria nao cresce sem fim)."""
         for chave in [c for c, h in self._historicos.items() if c not in vistas and h.vazio(agora)]:
             del self._historicos[chave]
+
+    # --- Historico pelos tickers (Task 18) ------------------------------------
+
+    def _amostrar_pelos_tickers(self, agora: float, vistas: set, cotacoes: dict[str, float],
+                                mercados: dict[str, set[tuple[str, str]]]) -> float:
+        """Rodizio: as amostras pelos tickers do pedaco de agora. Devolve que fracao da volta o rodizio andou.
+
+        A lista de combinacoes (todas as dos mercados com ticker guardado, como na etapa 2) e percorrida em ordem,
+        no ritmo de uma volta inteira a cada `amostra_ticker_s`: cada ciclo visita so as que cabem no tempo que
+        passou desde o anterior (ex.: 76 mil pares, 120 s e ciclo de 0,5 s = ~320 por ciclo). Assim cada par e
+        visitado uma vez por `amostra_ticker_s`, sem pico. Depois de um laco parado (ex.: PC suspenso), o rodizio
+        anda no maximo `amostra_s` de uma vez: os pares que ficaram para tras sao amostrados na volta seguinte.
+        mercados: os de estado.mercados() deste ciclo (lidos uma vez so em `candidatos`).
+        Em cada par visitado:
+        - candidato agora (`vistas`, livro aberto): pula, a amostra vem do livro;
+        - ticker velho, conexao silenciosa ou preco invalido em alguma ponta: pula (spreads_pelos_tickers);
+        - sem historico e no teto de `max_historicos`: pula (aviso no log uma vez);
+        - amostra (de qualquer fonte) ha menos de `amostra_s`: pula (nunca duas amostras tao perto).
+        """
+        self._combos_selecao.obter(mercados)  # a mesma arrumacao da etapa 2 (so remonta quando os mercados mudam)
+        lista = self._combos_selecao.lista
+        n = len(lista)
+        ultimo, self._rodizio_ultimo = self._rodizio_ultimo, agora
+        passo = self.cfg.ciclo_ms / 1000 if ultimo is None else agora - ultimo
+        passo = min(max(passo, 0.0), self.cfg.amostra_s)  # relogio para tras: nao anda; laco parado: amostra_s
+        fracao = passo / self.cfg.amostra_ticker_s
+        if not n:
+            return fracao
+        inicio = self._rodizio_posicao % n  # a lista pode ter mudado de tamanho desde o ciclo anterior
+        fim = inicio + n * fracao
+        self._rodizio_posicao = fim % n
+        quantos = min(int(fim) - int(inicio), n)
+        if quantos <= 0:
+            return fracao
+        primeiro = int(inicio)
+        pedaco = [lista[(primeiro + i) % n] for i in range(quantos)]
+        # Os precos so dos mercados do pedaco, cada um lido uma vez, com a mesma conversao da etapa 2.
+        precos = self._precos_dos_tickers(_agrupar({chave for combo in pedaco for chave in (
+            (combo[1], combo[2], combo[0]), (combo[3], combo[4], combo[0]))}), agora, cotacoes)
+        for combo in pedaco:
+            chave = chave_de(combo)
+            if chave in vistas:  # (a distancia minima de amostra_s abaixo tambem impede, mas a regra e esta)
+                continue  # tem livro aberto: a amostra vem do livro
+            try:
+                self._amostrar_pelo_ticker(chave, combo, precos, agora)
+            except Exception:  # defeito inesperado nesta combinacao: so ela fica sem a amostra
+                self._avisar_uma_vez(("erro_ticker", combo),
+                                     "%s: erro na amostra pelos tickers; so esta combinacao fica de fora "
+                                     "(aviso uma vez so)", _nome_combo(combo), exc_info=True)
+        return fracao
+
+    def _amostrar_pelo_ticker(self, chave: tuple, combo: tuple, precos: _PrecosDosTickers, agora: float) -> None:
+        """A amostra pelos tickers de uma combinacao visitada pelo rodizio (veja _amostrar_pelos_tickers)."""
+        spreads = spreads_pelos_tickers(precos, (combo[1], combo[2], combo[0]), (combo[3], combo[4], combo[0]))
+        if spreads is None:
+            return
+        historico = self._historicos.get(chave)
+        if historico is None:
+            if len(self._historicos) >= self.cfg.max_historicos:
+                self._avisar_teto()
+                return
+            historico = self._historicos[chave] = self._novo_historico()
+        if historico.ultima_amostra is not None and agora - historico.ultima_amostra < self.cfg.amostra_s:
+            return
+        historico.adicionar_pelo_ticker(agora, *spreads)
+
+    def _respeitar_teto(self, vistas: set) -> None:
+        """Acima de `max_historicos` (so acontece com candidatos novos): saem os mais antigos sem livro.
+
+        "Mais antigo" = a ultima amostra mais velha (ex.: par cujo ticker parou de chegar). Os candidatos de agora
+        (`vistas`) nunca saem: o sinal precisa do historico deles.
+        """
+        excesso = len(self._historicos) - self.cfg.max_historicos
+        if excesso <= 0:
+            return
+        sem_livro = ((h.ultima_amostra if h.ultima_amostra is not None else -math.inf, chave)
+                     for chave, h in self._historicos.items() if chave not in vistas)
+        for _, chave in heapq.nsmallest(excesso, sem_livro):
+            del self._historicos[chave]
+        self._avisar_teto()
+
+    def _avisar_teto(self) -> None:
+        self._avisar_uma_vez(("teto_historicos",),
+                             "historicos na memoria chegaram ao teto de max_historicos (%d): os pares que ainda nao "
+                             "tem historico ficam sem amostras pelos tickers, e o par que abre livro entra no lugar "
+                             "do mais antigo sem livro. Suba max_historicos se a memoria da linha recursos: deixar "
+                             "(aviso uma vez so)", self.cfg.max_historicos)
+
+    def _esquecer_aos_poucos(self, agora: float, vistas: set, fracao: float) -> None:
+        """Como _esquecer_historicos, mas um pedaco por ciclo: com dezenas de milhares de historicos pelos tickers,
+        conferir todos a cada ciclo custaria dezenas de ms.
+
+        Anda no ritmo do rodizio (`fracao` da volta por ciclo) sobre uma copia das chaves, refeita a cada volta: o
+        historico de um par que sumiu sai no maximo ~2 x `amostra_ticker_s` depois de ficar vazio (o que nasceu
+        depois da copia espera a volta seguinte). Com ate VARREDURA_MINIMA historicos, confere todos a cada ciclo,
+        como antes.
+        """
+        total = len(self._historicos)
+        quantos = max(VARREDURA_MINIMA, math.ceil(total * fracao))
+        if quantos >= total:
+            self._esquecer_historicos(agora, vistas)
+            self._varredura, self._varredura_posicao = [], 0
+            return
+        if self._varredura_posicao >= len(self._varredura):  # volta nova: copia das chaves de agora
+            self._varredura, self._varredura_posicao = list(self._historicos), 0
+        fim = self._varredura_posicao + quantos
+        for chave in self._varredura[self._varredura_posicao:fim]:
+            historico = self._historicos.get(chave)
+            if historico is not None and chave not in vistas and historico.vazio(agora):
+                del self._historicos[chave]
+        self._varredura_posicao = fim
 
     def _destino(self):
         """Onde o motor grava: o escritor (fila, no scanner) ou, sem ele, o banco direto (testes). None = nenhum."""

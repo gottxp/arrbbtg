@@ -122,6 +122,26 @@ spread_min_livro_farm_pct: -0.1
 #   As acima de spread_min_livro_pct abrem como no modo Lucro, fora do teto. Unidade: combinacoes (inteiro).
 #   Padrao: 50. Quando mexer: abaixe se uma corretora de farm limitar assinaturas; suba para ver mais farm.
 max_livros_farm_por_mercado: 50
+# Historico das metricas pelos tickers. Ligado (true): todo par com ticker nas duas pontas, enquanto esta sem livro
+#   aberto, ganha uma amostra pelos tickers (melhor bid/ask, convertido para USDT) a cada amostra_ticker_s; os A e F
+#   medios, os maiores e as invertidas do periodo contam tambem o tempo sem livro (o F medio de um spread que acabou
+#   de abrir e o das ultimas 4 h, como no Arbimax). Com livro aberto a amostra vem do livro, como antes; o lote medio
+#   vem so do livro. Essas amostras ficam so na memoria (nao vao ao banco nem ao grafico) e recomecam do zero ao
+#   religar ou ao trocar o periodo. Desligado (false): as metricas so contam o tempo com livro aberto.
+#   Unidade: true ou false. Padrao: true. Quando mexer: desligue so se a memoria da linha "recursos:" do log nao
+#   couber no PC.
+historico_tickers: true
+# De quanto em quanto tempo cada par sem livro aberto ganha uma amostra pelos tickers. Nas medias, cada uma pesa o
+#   tempo que cobre (120 s = 24 amostras do livro de 5 s). Os pares sao visitados em rodizio, um pedaco por ciclo.
+#   Unidade: segundos (no minimo amostra_s). Padrao: 120. Quando mexer: menor = metricas mais finas e mais memoria
+#   (60 s: ~1,5 vez a memoria dos historicos); maior = menos memoria.
+amostra_ticker_s: 120
+# Maximo de historicos: pares com amostras do periodo na memoria, pelos tickers e pelo livro (o "historicos N" da
+#   linha "recursos:" do log). Cada par sem livro ocupa ~5 KB (4 h a cada 120 s). No teto, par novo fica sem
+#   amostras pelos tickers (o log avisa uma vez) e o par que abre livro entra no lugar do mais antigo sem livro.
+#   Unidade: historicos (inteiro). Padrao: 80000 (~400 MB). Quando mexer: abaixe se a memoria pesar; suba se o
+#   aviso de teto aparecer e a memoria deixar.
+max_historicos: 80000
 
 # Taxas taker da sua conta (nivel VIP, descontos), por corretora e mercado (spot e/ou futuro). Unidade: % por
 #   ordem. Padrao: {} (vazio = vale a taxa que vem da corretora). Quando mexer: sempre que a sua taxa real for

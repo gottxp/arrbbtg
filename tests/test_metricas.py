@@ -351,3 +351,190 @@ def test_inteiros_continuam_aceitos():
     j = JanelaMetricas(periodo_s=10)
     j.adicionar(0, 1, -1, 100, 200)
     assert j.lotes_medios(agora=0) == (100.0, 200.0)
+
+
+# ---------------------------------------------------------------------------
+# Task 18: amostras pelos tickers na mesma janela (especificacao, secao 3, "De onde vem as amostras das metricas")
+# - a amostra pelo ticker (melhor bid/ask) nao tem lote: o lote medio vem so das amostras do livro;
+# - as medias valem sobre todas as amostras, cada uma pesando o tempo que ela cobre (a do ticker, feita a cada
+#   amostra_ticker_s, vale `peso_ticker` amostras do livro, feitas a cada amostra_s);
+# - maiores, media dos 10 maiores e invertidas valem sobre todas as amostras, em ordem de horario.
+# ---------------------------------------------------------------------------
+
+def test_amostra_pelo_ticker_entra_nas_medias_com_o_peso_do_tempo_que_cobre():
+    # Ticker a cada 60 s e livro a cada 5 s: cada amostra pelo ticker vale 12 do livro.
+    j = JanelaMetricas(periodo_s=4 * 3600, peso_ticker=12)
+    j.adicionar_pelo_ticker(0, a=0.1, f=-0.2)
+    j.adicionar_pelo_ticker(60, a=0.1, f=-0.2)
+    j.adicionar(65, a=1.0, f=-1.0, lote_long=500.0, lote_short=700.0)
+    j.adicionar(70, a=1.0, f=-1.0, lote_long=500.0, lote_short=700.0)
+    m = j.resumo(agora=70, duracao_min_invertida_s=0)
+    assert m.fechamento_medio == pytest.approx((24 * -0.2 + 2 * -1.0) / 26)
+    assert m.abertura_media == pytest.approx((24 * 0.1 + 2 * 1.0) / 26)
+    assert j.lotes_medios(agora=70) == (pytest.approx(500.0), pytest.approx(700.0))  # so as do livro
+
+
+def test_janela_so_com_amostras_pelo_ticker_tem_metricas_e_nao_tem_lote_medio():
+    j = JanelaMetricas(periodo_s=1000, peso_ticker=12)
+    for ts, f in [(0, -0.1), (60, -0.3), (120, 0.2)]:
+        j.adicionar_pelo_ticker(ts, a=0.5, f=f)
+    m = j.resumo(agora=120, duracao_min_invertida_s=0)
+    assert m.fechamento_medio == pytest.approx(-0.2 / 3)
+    assert (m.maior_fechamento, m.invertidas) == (0.2, 1)
+    assert j.lotes_medios(agora=120) == (None, None)
+    assert not j.vazia(agora=120)
+
+
+def test_maiores_e_invertidas_valem_sobre_as_duas_fontes_em_ordem_de_horario():
+    j = JanelaMetricas(periodo_s=1000, peso_ticker=12)
+    j.adicionar_pelo_ticker(0, a=3.0, f=0.1)   # F >= 0 pelo ticker...
+    j.adicionar(5, a=1.0, f=0.2)               # ...e continua pelo livro: uma invertida so, de 0 a 10 s
+    j.adicionar(10, a=2.0, f=0.0)
+    j.adicionar(15, a=1.5, f=-1.0)
+    j.adicionar_pelo_ticker(75, a=0.5, f=0.3)  # outra invertida, aberta no fim
+    m = j.resumo(agora=75, duracao_min_invertida_s=0)
+    assert (m.maior_abertura, m.maior_fechamento) == (3.0, 0.3)
+    assert m.media_10_maiores_abertura == pytest.approx((3.0 + 2.0 + 1.5 + 1.0 + 0.5) / 5)
+    assert m.invertidas == 2
+    assert j.resumo(agora=75, duracao_min_invertida_s=10).invertidas == 1
+
+
+def test_as_duas_fontes_saem_da_janela_em_ordem_de_horario():
+    j = JanelaMetricas(periodo_s=100, peso_ticker=12)
+    j.adicionar_pelo_ticker(0, a=9.0, f=0.5)
+    j.adicionar(50, a=1.0, f=-1.0, lote_long=100.0, lote_short=100.0)
+    j.adicionar_pelo_ticker(60, a=2.0, f=0.4)
+    j.adicionar(65, a=3.0, f=0.6, lote_long=300.0, lote_short=300.0)
+    assert j.amostras() == [(0.0, 9.0, 0.5, None, None), (50.0, 1.0, -1.0, 100.0, 100.0),
+                            (60.0, 2.0, 0.4, None, None), (65.0, 3.0, 0.6, 300.0, 300.0)]
+    m = j.resumo(agora=155, duracao_min_invertida_s=0)  # sairam as de 0 e 50
+    assert j.amostras() == [(60.0, 2.0, 0.4, None, None), (65.0, 3.0, 0.6, 300.0, 300.0)]
+    assert (m.maior_abertura, m.invertidas) == (3.0, 1)  # a invertida de 60 a 65 continua inteira
+    assert m.abertura_media == pytest.approx((12 * 2.0 + 3.0) / 13)
+    assert j.lotes_medios(agora=155) == (pytest.approx(300.0), pytest.approx(300.0))
+    assert j.lotes_medios(agora=161) == (pytest.approx(300.0), pytest.approx(300.0))  # so a do ticker saiu
+    assert j.resumo(agora=161, duracao_min_invertida_s=0).abertura_media == pytest.approx(3.0)
+    assert j.vazia(agora=166) and j.lotes_medios(agora=166) == (None, None)
+
+
+def test_amostra_fora_de_ordem_entre_as_duas_fontes_e_recusada():
+    j = JanelaMetricas(periodo_s=100, peso_ticker=12)
+    j.adicionar(10, a=1.0, f=-1.0)
+    j.adicionar(10, a=1.0, f=-1.0)  # duas do livro no mesmo horario: aceitas, como antes
+    with pytest.raises(ValueError):
+        j.adicionar_pelo_ticker(10, a=1.0, f=-1.0)  # nunca no mesmo horario (nem antes) da mais nova
+    j.adicionar_pelo_ticker(11, a=1.0, f=-1.0)
+    with pytest.raises(ValueError):
+        j.adicionar(11, a=1.0, f=-1.0)  # o livro tambem nao volta para o horario do ticker
+    with pytest.raises(ValueError):
+        j.adicionar_pelo_ticker(11, a=1.0, f=-1.0)
+    assert len(j.amostras()) == 3  # nada das recusadas entrou
+
+
+@pytest.mark.parametrize("valores", [(math.nan, 0.0), (0.0, math.inf), ("1", 0.0), (True, 0.0), (0.0, None)])
+def test_amostra_pelo_ticker_com_numero_invalido_e_recusada(valores):
+    j = JanelaMetricas(periodo_s=10, peso_ticker=12)
+    with pytest.raises(ValueError):
+        j.adicionar_pelo_ticker(0, *valores)
+    assert j.vazia(agora=0)
+
+
+@pytest.mark.parametrize("peso", [0, -1, math.nan, math.inf, "12", True])
+def test_peso_do_ticker_invalido_e_recusado(peso):
+    with pytest.raises(ValueError):
+        JanelaMetricas(periodo_s=10, peso_ticker=peso)
+
+
+def resumo_ingenuo_duas_fontes(amostras, agora, periodo_s, duracao_min_s, peso):
+    """Como resumo_ingenuo, com amostras (ts, A, F, lote_long, lote_short) das duas fontes (lotes None = ticker).
+
+    Medias ponderadas (ticker = `peso`, livro = 1); maiores, 10 maiores e invertidas sobre todas.
+    """
+    dentro = [x for x in amostras if x[0] >= agora - periodo_s]
+    if not dentro:
+        return None
+    pesos = [peso if x[3] is None else 1.0 for x in dentro]
+    a, f = [x[1] for x in dentro], [x[2] for x in dentro]
+    maiores_a, maiores_f = heapq.nlargest(10, a), heapq.nlargest(10, f)
+    return Metricas(
+        abertura_media=sum(p * v for p, v in zip(pesos, a)) / sum(pesos),
+        fechamento_medio=sum(p * v for p, v in zip(pesos, f)) / sum(pesos),
+        maior_abertura=max(a),
+        maior_fechamento=max(f),
+        media_10_maiores_abertura=sum(maiores_a) / len(maiores_a),
+        media_10_maiores_fechamento=sum(maiores_f) / len(maiores_f),
+        invertidas=invertidas_ingenuas(dentro, duracao_min_s),
+    )
+
+
+def serie_duas_fontes(n: int, semente: int):
+    """n amostras em ordem de horario: trechos sem livro (pelo ticker, a cada ~60 s) e com livro (a cada ~5 s)."""
+    rnd = random.Random(semente)
+    ts, a, f, com_livro = 1000.0, 0.5, -0.2, False
+    for _ in range(n):
+        if rnd.random() < 0.05:
+            com_livro = not com_livro  # o livro abre ou fecha
+        ts += rnd.choice([5.0, 5.0, 4.5, 5.5]) if com_livro else rnd.choice([60.0, 60.0, 59.5, 61.0, 120.0])
+        a += rnd.gauss(0, 0.05)
+        f = rnd.gauss(0, 0.2) if rnd.random() < 0.3 else f + rnd.gauss(0, 0.05)
+        if com_livro:
+            yield ts, a, f, rnd.uniform(100, 5000), rnd.uniform(100, 5000)
+        else:
+            yield ts, a, f, None, None
+
+
+def conferir_duas_fontes(janela, amostras, agora, periodo_s, duracoes, peso):
+    esperado = resumo_ingenuo_duas_fontes(amostras, agora, periodo_s, duracoes[0], peso)
+    novo = janela.resumo(agora=agora, duracao_min_invertida_s=duracoes[0])
+    do_livro = [x for x in amostras if x[3] is not None]
+    if esperado is None:
+        assert novo is None and janela.lotes_medios(agora) == (None, None)
+        return
+    assert (novo.abertura_media, novo.fechamento_medio) == pytest.approx(
+        (esperado.abertura_media, esperado.fechamento_medio), rel=1e-12, abs=1e-12)
+    lotes = janela.lotes_medios(agora)
+    esperados = lotes_ingenuos(do_livro, agora, periodo_s)
+    if esperados == (None, None):
+        assert lotes == (None, None)
+    else:
+        assert lotes == pytest.approx(esperados, rel=1e-12)
+    assert dataclasses.replace(novo, abertura_media=0, fechamento_medio=0) == dataclasses.replace(
+        esperado, abertura_media=0, fechamento_medio=0)
+    dentro = [x for x in amostras if x[0] >= agora - periodo_s]
+    for duracao in duracoes[1:]:
+        assert janela.resumo(agora=agora, duracao_min_invertida_s=duracao).invertidas == invertidas_ingenuas(
+            dentro, duracao)
+    assert janela.amostras() == [tuple(float(v) if v is not None else None for v in x) for x in dentro]
+
+
+@pytest.mark.parametrize("semente", [1, 2, 3])
+def test_incremental_com_as_duas_fontes_igual_ao_calculo_ingenuo(semente):
+    periodo_s, peso = 1800, 12.0  # ~30 amostras pelo ticker ou ~360 do livro: muitas saem durante o teste
+    janela, vistas = JanelaMetricas(periodo_s=periodo_s, peso_ticker=peso), []
+    for i, amostra in enumerate(serie_duas_fontes(2500, semente)):
+        ts, a, f, lote_long, lote_short = amostra
+        if lote_long is None:
+            janela.adicionar_pelo_ticker(ts, a, f)
+        else:
+            janela.adicionar(ts, a, f, lote_long, lote_short)
+        vistas.append(amostra)
+        agora = ts + (i % 3) * 20  # as vezes o resumo e pedido depois da amostra (saem mais)
+        conferir_duas_fontes(janela, vistas, agora, periodo_s, [0, 5, 60, 300], peso)
+        vistas = [x for x in vistas if x[0] >= agora - periodo_s]
+
+
+def test_janela_de_4h_so_pelos_tickers_ocupa_pouca_memoria():
+    # 4 h de amostras pelo ticker a cada 120 s (o padrao de amostra_ticker_s): 120 amostras, sem lote, com A e F
+    # como no mercado (F quase sempre negativo). Com dezenas de milhares de pares acompanhados pelos tickers, cada
+    # janela precisa ser pequena (especificacao, secao 3: ~100 a 400 MB a mais). Medido: ~5,6 KB (a do livro, com
+    # 2.880 amostras de 5 s, ~120 KB).
+    rnd = random.Random(1)
+    tracemalloc.start()
+    try:
+        j = JanelaMetricas(periodo_s=4 * 3600, peso_ticker=24)
+        for i in range(120 * 3):  # 12 h: as primeiras 8 h ja sairam da janela
+            j.adicionar_pelo_ticker(i * 120.0, rnd.gauss(0.1, 0.3), -0.2 + rnd.gauss(0, 0.05))
+        memoria, _ = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert memoria <= 6.5 * 1024
