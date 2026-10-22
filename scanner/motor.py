@@ -33,6 +33,7 @@ import math
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from scanner.calculo import (
     custo_taxas,
@@ -177,6 +178,14 @@ def _todos_validos(*valores) -> bool:
     return True
 
 
+def _preco_valido(preco, fator: float) -> float | None:
+    """preco x fator (o preco em USDT), ou None se o preco ou o resultado nao e numero real maior que zero."""
+    if not _numero_valido(preco):
+        return None  # ex.: None ou texto
+    convertido = preco * fator
+    return convertido if _numero_valido(convertido) and convertido > 0 else None
+
+
 def _nome_combo(combo: tuple) -> str:
     """Texto curto da combinacao para o log, ex.: "BTC gate/spot x bitget/futuro"."""
     ativo, corretora_long, mercado_long, corretora_short, mercado_short = combo
@@ -223,7 +232,7 @@ def _agrupar(chaves) -> dict[str, set[tuple[str, str]]]:
 class _CombinacoesGuardadas:
     """`combinacoes(mercados)` com a ultima lista guardada: so monta de novo quando os mercados mudam.
 
-    De um ciclo para o outro os mercados com dado valido quase nunca mudam, e montar a lista
+    De um ciclo para o outro os mercados recebidos quase nunca mudam, e montar a lista
     (dezenas de milhares de combinacoes) custa bem mais que comparar os mercados.
     Cada item e (combo, chave do long, chave do short), com chave = (corretora, mercado, ativo),
     para quem percorre nao precisar montar as chaves a cada ciclo.
@@ -265,6 +274,19 @@ class _Lado:
     aviso_cotacao: bool
     volume_24h_usd: float | None
     variacao_24h_pct: float | None
+
+
+class _PrecosDosTickers(NamedTuple):
+    """Os tickers de agora na etapa 2, por mercado (corretora, mercado, ativo), com os precos em USDT.
+
+    Um dicionario por campo, cada um com uma entrada para cada mercado. Lado que nao serve fica
+    None: sem ask o mercado nao pode ser o long (que compra no ask); sem bid nao pode ser o short
+    (que vende no bid). Ticker velho (ou conexao silenciosa) ou sem simbolo: os tres ficam None.
+    """
+
+    asks: dict[tuple[str, str, str], float | None]
+    bids: dict[tuple[str, str, str], float | None]
+    simbolos: dict[tuple[str, str, str], str | None]  # simbolo do ccxt, ex.: "BTC/USDT:USDT"
 
 
 class _Historico:
@@ -355,8 +377,9 @@ class Motor:
         # Etapa 2: combo com livro (as de _ultima_vez_acima) -> ((corretora, simbolo) do long, do short).
         self._simbolos_livro: dict[tuple, tuple[tuple[str, str], tuple[str, str]]] = {}
         self._avisados: set = set()  # avisos de log ja dados (cada um aparece uma vez so)
-        # Listas de combinacoes guardadas: uma para os candidatos (mercados com livro valido) e uma
-        # para a etapa 2 (mercados com ticker valido). Separadas, para uma nao desfazer a outra.
+        # Listas de combinacoes guardadas: uma para os candidatos (mercados com livro valido agora) e
+        # uma para a etapa 2 (todos os mercados com ticker guardado, validos ou nao: essa lista so
+        # muda quando entra ou sai um mercado). Separadas, para uma nao desfazer a outra.
         self._combos_candidatos = _CombinacoesGuardadas()
         self._combos_selecao = _CombinacoesGuardadas()
 
@@ -414,12 +437,17 @@ class Motor:
         """
         cotacoes = self._cotacoes_validas()
         minimo = self.cfg.spread_min_livro_pct
-        precos = self._precos_dos_tickers(agora, cotacoes)  # cada mercado lido uma vez so
+        # A lista de combinacoes sai de TODOS os mercados com ticker guardado: ticker que fica velho
+        # e volta (comum) nao obriga a montar a lista de novo. Quem nao tem preco valido agora e
+        # pulado no laco (precos tem uma entrada para cada mercado da lista).
+        mercados = self.estado.mercados()
+        precos = self._precos_dos_tickers(mercados, agora, cotacoes)  # cada mercado lido uma vez so
+        asks, bids = precos.asks, precos.bids
         acima: dict[tuple, float] = {}  # combo -> spread, so as que chegam ao minimo agora
-        for combo, chave_long, chave_short in self._combos_selecao.obter(_agrupar(precos)):
-            ask_long, bid_short = precos[chave_long][0], precos[chave_short][1]
+        for combo, chave_long, chave_short in self._combos_selecao.obter(mercados):
+            ask_long, bid_short = asks[chave_long], bids[chave_short]
             if ask_long is None or bid_short is None:
-                continue
+                continue  # uma das pontas sem preco valido agora
             if minimo > 0 and bid_short <= ask_long:
                 continue  # spread zero ou negativo nunca chega a um minimo positivo: pula a conta (a maioria)
             spread = spread_abertura(ask_long, bid_short)
@@ -432,10 +460,11 @@ class Motor:
         # ticker sumiu, ficam os da ultima vez.
         for combo in escolhidos:
             ativo, corretora_long, mercado_long, corretora_short, mercado_short = combo
-            long = precos.get((corretora_long, mercado_long, ativo))
-            short = precos.get((corretora_short, mercado_short, ativo))
-            if long is not None and short is not None and long[0] is not None and short[1] is not None:
-                self._simbolos_livro[combo] = ((corretora_long, long[2]), (corretora_short, short[2]))
+            chave_long, chave_short = (corretora_long, mercado_long, ativo), (corretora_short, mercado_short, ativo)
+            # .get: o mercado pode ter saido do estado (corretora desconectada) e a combinacao seguir mantida.
+            if asks.get(chave_long) is not None and bids.get(chave_short) is not None:
+                self._simbolos_livro[combo] = ((corretora_long, precos.simbolos[chave_long]),
+                                               (corretora_short, precos.simbolos[chave_short]))
         # Esquece os simbolos de quem saiu de vez (pares_para_livro ja tirou do _ultima_vez_acima).
         for combo in [c for c in self._simbolos_livro if c not in self._ultima_vez_acima]:
             del self._simbolos_livro[combo]
@@ -528,31 +557,29 @@ class Motor:
                     lados[(corretora, mercado, ativo)] = lado
         return lados
 
-    def _precos_dos_tickers(self, agora: float, cotacoes: dict[str, float]) -> dict[tuple[str, str, str], tuple]:
-        """{(corretora, mercado, ativo): (ask, bid, simbolo)} dos tickers validos agora, com ask e bid em USDT.
+    def _precos_dos_tickers(self, mercados: dict[str, set[tuple[str, str]]], agora: float,
+                            cotacoes: dict[str, float]) -> _PrecosDosTickers:
+        """Ask, bid (em USDT) e simbolo do ticker de agora de CADA um dos `mercados` (veja _PrecosDosTickers).
 
-        Fica de fora o mercado sem ticker valido (velho ou conexao silenciosa) ou sem simbolo.
-        ask ou bid que nao e numero real maior que zero vira None: o mercado nao serve de long
-        (sem ask) ou de short (sem bid).
+        ask ou bid que nao e numero real maior que zero (inclusive None ou texto, se um coletor
+        escrever lixo no estado) vira None so daquele lado, e o resto da etapa 2 segue normal.
         """
-        precos = {}
+        asks, bids, simbolos = {}, {}, {}
         fatores: dict[str | None, float] = {}  # moeda de cotacao -> fator: a conta so depende da moeda
-        for corretora, pares in self.estado.mercados().items():
+        for corretora, pares in mercados.items():
             for mercado, ativo in pares:
+                chave = (corretora, mercado, ativo)
                 ticker = self.estado.obter_ticker(corretora, mercado, ativo, agora)
                 if ticker is None or ticker.get("simbolo_original") is None:
+                    asks[chave] = bids[chave] = simbolos[chave] = None  # ticker que nao serve agora
                     continue
                 cotacao = ticker.get("cotacao")
                 if cotacao not in fatores:
                     fatores[cotacao], _ = _fator_usdt(ativo, cotacao, cotacoes)
-                fator = fatores[cotacao]
-                ask, bid = ticker["ask"] * fator, ticker["bid"] * fator
-                precos[(corretora, mercado, ativo)] = (
-                    ask if _numero_valido(ask) and ask > 0 else None,
-                    bid if _numero_valido(bid) and bid > 0 else None,
-                    ticker["simbolo_original"],
-                )
-        return precos
+                asks[chave] = _preco_valido(ticker.get("ask"), fatores[cotacao])
+                bids[chave] = _preco_valido(ticker.get("bid"), fatores[cotacao])
+                simbolos[chave] = ticker["simbolo_original"]
+        return _PrecosDosTickers(asks, bids, simbolos)
 
     # --- Um candidato --------------------------------------------------------
 

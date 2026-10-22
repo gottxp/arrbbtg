@@ -942,6 +942,79 @@ def test_selecao_so_guarda_os_simbolos_das_combinacoes_escolhidas():
     assert list(m._simbolos_livro) == [("BTC", "gate", "spot", "bitget", "futuro")]
 
 
+def contar_montagens(monkeypatch) -> list:
+    """Troca `combinacoes` do motor por uma versao que anota cada chamada (quantas vezes a lista foi montada)."""
+    import scanner.motor as modulo_motor
+
+    chamadas = []
+    original = modulo_motor.combinacoes
+
+    def contando(mercados):
+        chamadas.append(mercados)
+        return original(mercados)
+
+    monkeypatch.setattr(modulo_motor, "combinacoes", contando)
+    return chamadas
+
+
+def test_selecao_nao_remonta_as_combinacoes_quando_um_ticker_fica_velho_ou_volta(monkeypatch):
+    e = EstadoMercados()
+    m = motor_so_tickers(e)
+    ticker(e, "gate", "spot", "BTC", 99.9, 100.0, 10.0)
+    ticker(e, "bitget", "futuro", "BTC", 100.5, 100.6, 10.0)
+    ticker(e, "mexc", "futuro", "BTC", 100.8, 100.9, 10.0)
+    montagens = contar_montagens(monkeypatch)
+    m.selecao_livros(agora=10)
+    assert len(montagens) == 1
+    # A mexc para de mandar ticker de BTC (mas segue viva): 31s depois o ticker dela fica velho.
+    ticker(e, "gate", "spot", "BTC", 99.9, 100.0, 41.0)
+    ticker(e, "bitget", "futuro", "BTC", 100.5, 100.6, 41.0)
+    e.registrar_mensagem("mexc", 41.0)
+    assert m.selecao_livros(agora=41) == {"gate": {"BTC/USDT"}, "bitget": {"BTC/USDT:USDT"},
+                                          "mexc": {"BTC/USDT:USDT"}}  # mexc: mantida por manter_livro_s
+    ticker(e, "mexc", "futuro", "BTC", 100.8, 100.9, 42.0)  # o ticker volta
+    m.selecao_livros(agora=42)
+    assert len(montagens) == 1  # os mercados (com ticker guardado) nao mudaram: a lista nao foi montada de novo
+
+
+def test_selecao_ticker_que_fica_velho_sai_e_volta():
+    e = EstadoMercados()
+    m = Motor(cfg_com(manter_livro_s=5), e, DadosLentosFalso())
+    ticker(e, "gate", "spot", "BTC", 99.9, 100.0, 10.0)
+    ticker(e, "mexc", "futuro", "BTC", 100.8, 100.9, 10.0)  # gate x mexc: 0,8%
+    assert m.selecao_livros(agora=10) == {"gate": {"BTC/USDT"}, "mexc": {"BTC/USDT:USDT"}}
+    # 31s sem ticker da mexc (a corretora segue viva): a combinacao sai depois de manter_livro_s.
+    ticker(e, "gate", "spot", "BTC", 99.9, 100.0, 41.0)
+    e.registrar_mensagem("mexc", 41.0)
+    assert m.selecao_livros(agora=41) == {}
+    ticker(e, "mexc", "futuro", "BTC", 100.8, 100.9, 42.0)
+    e.registrar_mensagem("gate", 42.0)
+    assert m.selecao_livros(agora=42) == {"gate": {"BTC/USDT"}, "mexc": {"BTC/USDT:USDT"}}
+
+
+@pytest.mark.parametrize("bid, ask", [(None, None), ("x", "y"), (None, 10.0), (math.nan, math.inf)])
+def test_selecao_ignora_ticker_com_bid_ou_ask_invalido(bid, ask):
+    # Estado preenchido direto (sem o coletor, que ja descartaria esse ticker).
+    e = EstadoMercados()
+    e.atualizar_ticker("gate", "spot", "ETH", bid, ask, 10.0, simbolo_original="ETH/USDT", cotacao="USDT")
+    ticker(e, "bitget", "futuro", "ETH", 10.5, 10.6, 10.0)
+    ticker(e, "gate", "spot", "BTC", 99.9, 100.0, 10.0)
+    ticker(e, "bitget", "futuro", "BTC", 100.5, 100.6, 10.0)
+    selecao = motor_so_tickers(e).selecao_livros(agora=10)  # nao levanta erro
+    if ask == 10.0:  # so o bid (que o spot nunca usa) e invalido: o spot ainda serve de long (A = 5%)
+        assert selecao == {"gate": {"BTC/USDT", "ETH/USDT"}, "bitget": {"BTC/USDT:USDT", "ETH/USDT:USDT"}}
+    else:  # o ETH da gate fica de fora; o resto segue
+        assert selecao == {"gate": {"BTC/USDT"}, "bitget": {"BTC/USDT:USDT"}}
+
+
+def test_selecao_ponta_short_com_ask_invalido_ainda_vende_pelo_bid():
+    e = EstadoMercados()
+    ticker(e, "gate", "spot", "BTC", 99.9, 100.0, 10.0)
+    e.atualizar_ticker("bitget", "futuro", "BTC", 100.5, None, 10.0, simbolo_original="BTC/USDT:USDT", cotacao="USDT")
+    e.registrar_mensagem("bitget", 10.0)
+    assert motor_so_tickers(e).selecao_livros(agora=10) == {"gate": {"BTC/USDT"}, "bitget": {"BTC/USDT:USDT"}}
+
+
 def test_candidatos_acompanham_livros_que_aparecem_e_somem():
     m = motor_falso(spot=("gate", "BTC", 100.0), futuro=("bitget", "BTC", 101.0))
     assert len(m.candidatos(agora=10)) == 1

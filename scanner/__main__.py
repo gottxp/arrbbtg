@@ -192,7 +192,7 @@ async def rodar(
             for nome in carregadas
         }
 
-        # Etapa 1: tickers so dos pares que formam alguma combinacao spot x futuro.
+        # Etapa 1: tickers so dos pares que formam alguma combinacao (spot x futuro ou futuro x futuro).
         simbolos = simbolos_para_tickers({nome: c.simbolos_por_chave() for nome, c in coletores.items()})
         for nome, coletor in coletores.items():
             if simbolos.get(nome):
