@@ -11,6 +11,7 @@ import logging
 import math
 import re
 from collections import Counter
+from collections.abc import Awaitable, Callable
 
 from scanner.normalizador import mercado_do_market, normalizar, prioridade_cotacao
 
@@ -51,9 +52,12 @@ def _taxas_taker_dos_mercados(markets: dict) -> dict[str, float]:
     Cada par pode ter uma taxa diferente; fica a mais comum do mercado (as excecoes,
     como pares promocionais, nao mandam). Em empate, a maior: errar para cima so
     deixa o sinal mais cauteloso.
+    Market malformado (ex.: nem e um dict) e ignorado sem atrapalhar os outros.
     """
     contagens: dict[str, Counter] = {}
     for market in markets.values():
+        if not isinstance(market, dict):
+            continue
         mercado = mercado_do_market(market)
         taker = market.get("taker")
         if mercado is None or not _numero_valido(taker) or taker < 0:
@@ -116,11 +120,28 @@ class DadosLentos:
         """
         await asyncio.gather(*(self._atualizar_sem_quebrar(c, e) for c, e in exchanges.items()))
 
-    async def rodar(self, exchanges: dict, intervalo_s: float) -> None:
-        """Atualiza para sempre, esperando `intervalo_s` entre uma rodada e outra (ate ser cancelado)."""
-        while True:
-            await self.atualizar(exchanges)
-            await asyncio.sleep(intervalo_s)
+    async def rodar(self, exchanges: dict, intervalo_s: float,
+                    esperar: Callable[[float], Awaitable] = asyncio.sleep) -> None:
+        """Atualiza para sempre (ate ser cancelado), cada corretora no seu proprio ritmo.
+
+        Cada corretora tem o seu laco: atualiza e espera `intervalo_s`. Assim uma corretora lenta
+        (ou travada) nao atrasa a atualizacao das outras. Erro de uma corretora vai para o log e o
+        laco dela tenta de novo na proxima rodada.
+        esperar: funcao que espera N segundos (os testes trocam para nao dormir de verdade).
+        """
+
+        async def laco(corretora: str, exchange) -> None:
+            while True:
+                await self._atualizar_sem_quebrar(corretora, exchange)
+                await esperar(intervalo_s)
+
+        tarefas = [asyncio.create_task(laco(c, e), name=f"dados lentos {c}") for c, e in exchanges.items()]
+        try:
+            await asyncio.gather(*tarefas)
+        finally:
+            for tarefa in tarefas:
+                tarefa.cancel()
+            await asyncio.gather(*tarefas, return_exceptions=True)
 
     async def _atualizar_sem_quebrar(self, corretora: str, exchange) -> None:
         try:
@@ -153,12 +174,15 @@ class DadosLentos:
         escolhidos: dict[str, tuple] = {}
         for simbolo, item in brutos.items():
             market = markets.get(simbolo)
-            funding = _ler_funding(item)
-            if market is None or funding is None or mercado_do_market(market) != "futuro":
+            funding = _ler_funding(item) if isinstance(item, dict) else None
+            if not isinstance(market, dict) or funding is None or mercado_do_market(market) != "futuro":
                 continue
             if not market.get("base") or not market.get("quote"):
                 continue
-            par = normalizar(corretora, market)
+            try:
+                par = normalizar(corretora, market)
+            except (TypeError, ValueError):  # market com dados que o scanner nao entende: so ele fica de fora
+                continue
             # Mais de um futuro pode ter o mesmo ativo (BTC/USDT:USDT e BTC/USDC:USDC): vale a mesma
             # regra do estado (moeda preferida e, em empate, ordem do simbolo), para o funding ser do
             # mesmo contrato cujo preco o motor le.
@@ -171,7 +195,7 @@ class DadosLentos:
         """Para corretoras sem busca em lote: pergunta o funding de cada futuro, um por vez."""
         brutos = {}
         falhas = []
-        simbolos = [s for s, m in markets.items() if mercado_do_market(m) == "futuro"]
+        simbolos = [s for s, m in markets.items() if isinstance(m, dict) and mercado_do_market(m) == "futuro"]
         for simbolo in simbolos:
             try:
                 brutos[simbolo] = await exchange.fetch_funding_rate(simbolo)

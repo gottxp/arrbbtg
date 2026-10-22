@@ -1,5 +1,6 @@
 """Helpers de teste compartilhados (as proximas tarefas acrescentam os seus aqui)."""
 
+import asyncio
 from dataclasses import replace
 
 from scanner.coletores.dados_lentos import TaxaDesconhecida
@@ -287,3 +288,39 @@ def motor_falso(
         chave = chave_de((ativo, c_long, m_long, c_short, m_short))
         motor.precarregar_amostra(chave, agora, a, f_medio, LOTE_PADRAO_USD, LOTE_PADRAO_USD)
     return motor
+
+
+# ---------------------------------------------------------------------------
+# Esperas sem dormir de verdade (Task 14)
+# ---------------------------------------------------------------------------
+
+
+async def esperar_ate(condicao, timeout: float = 2.0) -> None:
+    """Espera (cedendo a vez ao resto do programa) ate a condicao ficar verdadeira; falha se passar do timeout."""
+    limite = asyncio.get_running_loop().time() + timeout
+    while not condicao():
+        if asyncio.get_running_loop().time() > limite:
+            raise AssertionError("a condicao nao ficou verdadeira a tempo")
+        await asyncio.sleep(0.005)
+
+
+class EsperaFalsa:
+    """Troca o asyncio.sleep das esperas (reconexao, intervalos): anota quantos segundos esperaria e volta na hora.
+
+    `esperas` guarda cada pedido, em ordem. So cede a vez (asyncio.sleep(0)), entao o teste nao dorme.
+    bloquear=True: a espera nunca termina (para testar o cancelamento no meio dela).
+    parar_depois: depois de tantas esperas, a proxima levanta CancelledError (encerra um laco infinito).
+    """
+
+    def __init__(self, bloquear: bool = False, parar_depois: int | None = None):
+        self.esperas: list[float] = []
+        self._bloquear = bloquear
+        self._parar_depois = parar_depois
+
+    async def __call__(self, segundos: float) -> None:
+        if self._parar_depois is not None and len(self.esperas) >= self._parar_depois:
+            raise asyncio.CancelledError
+        self.esperas.append(segundos)
+        if self._bloquear:
+            await asyncio.Event().wait()
+        await asyncio.sleep(0)

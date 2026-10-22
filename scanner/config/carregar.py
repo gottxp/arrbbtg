@@ -59,6 +59,21 @@ class Config:
     # Tempo maximo esperando a corretora confirmar o cancelamento da assinatura de um livro.
     timeout_desassinar_s: float = 5
 
+    # Robustez (Task 14).
+    # Conexao que cai tenta de novo esperando 1s, 2s, 4s... ate este maximo, em segundos.
+    espera_max_reconexao_s: float = 60
+    # Maximo de assinaturas por corretora, ex.: {"bingx": 200}. Vazio = sem limite. Vale para os
+    # livros (etapa 2) e para os tickers quando a corretora so assina um par por vez (etapa 1).
+    limites_assinatura: dict = field(default_factory=dict)
+    # Atraso (chegada - horario informado pela corretora) maior que isto, para mais ou para menos,
+    # so acontece com relogio errado: fica fora do atraso medio. Em segundos.
+    atraso_max_valido_s: float = 30
+    # Logs: pasta dos arquivos (um por dia) e quantos dias de arquivos guardar.
+    pasta_logs: str = "logs"
+    dias_logs: int = 30
+    # De quanto em quanto tempo o log registra memoria, CPU e o resumo dos descartes, em segundos.
+    intervalo_log_recursos_s: float = 300
+
     # Painel web.
     painel: dict = field(default_factory=_painel_padrao)
 
@@ -81,6 +96,9 @@ CAMPOS_POSITIVOS = (
     "intervalo_dados_lentos_s",
     "recarregar_mercados_s",
     "timeout_desassinar_s",
+    "espera_max_reconexao_s",
+    "atraso_max_valido_s",
+    "intervalo_log_recursos_s",
 )
 
 # Campos numericos que aceitam qualquer valor (inclusive zero ou negativo).
@@ -128,6 +146,24 @@ def _validar_taxas(valor) -> dict:
     return taxas
 
 
+def _inteiro_positivo(valor) -> bool:
+    """True para numero inteiro maior que zero (bool nao conta)."""
+    return isinstance(valor, int) and not isinstance(valor, bool) and valor > 0
+
+
+def _validar_limites_assinatura(valor) -> dict:
+    """{corretora: maximo de assinaturas}; vazio (ou o campo sem nada) = sem limite."""
+    if valor is None:
+        return {}
+    modelo = "limites_assinatura: use o formato  corretora: 200  (numero inteiro maior que zero)"
+    if not isinstance(valor, dict):
+        raise ErroConfig(modelo)
+    for corretora, limite in valor.items():
+        if not _inteiro_positivo(limite):
+            raise ErroConfig(f"{modelo}; '{corretora}' esta com {limite!r}")
+    return {str(corretora): limite for corretora, limite in valor.items()}
+
+
 def _validar_painel(valor) -> dict:
     """Completa o que faltar no painel com os padroes e confere cada item."""
     if not isinstance(valor, dict):
@@ -169,6 +205,16 @@ def _validar_campo(campo: str, valor):
     if campo == "banco":
         if not isinstance(valor, str) or not valor:
             raise ErroConfig("banco: precisa ser o nome de um arquivo, ex.: scanner.db")
+        return valor
+    if campo == "limites_assinatura":
+        return _validar_limites_assinatura(valor)
+    if campo == "pasta_logs":
+        if not isinstance(valor, str) or not valor:
+            raise ErroConfig("pasta_logs: precisa ser o nome de uma pasta, ex.: logs")
+        return valor
+    if campo == "dias_logs":
+        if not _inteiro_positivo(valor):
+            raise ErroConfig(f"dias_logs: precisa ser um numero inteiro maior que zero (valor recebido: {valor!r})")
         return valor
     # Sobraram os campos numericos.
     if not _e_numero(valor):

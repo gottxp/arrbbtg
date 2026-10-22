@@ -16,6 +16,9 @@ a ordem alfabetica e a ordem do tempo, por isso comparar os textos com < e >= fu
 
 Uma unica conexao por `Banco`, em modo WAL (o motor grava enquanto a API le). A conexao pode ser
 usada por mais de uma thread: um `Lock` faz uma operacao esperar a outra terminar.
+
+Desempenho: o motor grava os eventos e as amostras de cada ciclo em lote (uma transacao por ciclo) e,
+no modo WAL, com `synchronous=NORMAL` (veja `__init__`).
 """
 
 import json
@@ -58,6 +61,20 @@ CREATE TABLE IF NOT EXISTS grupos (
 """
 
 
+# Insere o sinal; se o id ja existe, atualiza tudo menos `detectado_em` (que nunca muda).
+_GRAVAR_SINAL = """
+INSERT INTO sinais (id, modo, par, tipo, detectado_em, encerrado_em, rp_liquido_pct, sinal_json)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (id) DO UPDATE SET
+    modo = excluded.modo,
+    par = excluded.par,
+    tipo = excluded.tipo,
+    encerrado_em = excluded.encerrado_em,
+    rp_liquido_pct = excluded.rp_liquido_pct,
+    sinal_json = excluded.sinal_json
+"""
+
+
 def _json(valor) -> str:
     """Dict -> texto JSON. NaN e infinito sao recusados (ValueError): o JSON da spec nao os aceita."""
     return json.dumps(valor, allow_nan=False)
@@ -75,11 +92,22 @@ class Banco:
     def __init__(self, caminho: str):
         # check_same_thread=False: o motor e a API podem ficar em threads diferentes.
         self._conn = sqlite3.connect(caminho, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row  # linhas acessiveis pelo nome da coluna
-        self._trava = threading.Lock()
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        with self._conn:
-            self._conn.executescript(_ESQUEMA)
+        try:
+            self._conn.row_factory = sqlite3.Row  # linhas acessiveis pelo nome da coluna
+            self._trava = threading.Lock()
+            modo = self._conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            if str(modo).lower() == "wal":
+                # synchronous=NORMAL: no modo WAL o SQLite so espera o disco gravar de verdade (fsync) de vez
+                # em quando, e nao a cada transacao. O arquivo nunca corrompe; numa queda de energia, as
+                # ultimas transacoes (alguns segundos de amostras e eventos) podem se perder, o que e
+                # aceitavel para um historico. Fora do modo WAL (ex.: pasta de rede) fica o padrao (FULL),
+                # porque ai o NORMAL poderia corromper o arquivo numa queda de energia.
+                self._conn.execute("PRAGMA synchronous=NORMAL")
+            with self._conn:
+                self._conn.executescript(_ESQUEMA)
+        except BaseException:
+            self._conn.close()  # deu erro preparando o banco: nao deixa a conexao (e o arquivo) aberta
+            raise
 
     def fechar(self) -> None:
         """Fecha a conexao. Depois disso o `Banco` nao pode mais ser usado."""
@@ -98,33 +126,43 @@ class Banco:
         - "encerrado": fecha o registro com o mesmo id (`encerrado_em` e JSON final). Se nao
           houver registro, insere ja fechado.
         - "atualizado": nao grava nada (so aparece na tabela ao vivo).
+
+        Sinal com JSON invalido (ex.: NaN) levanta ValueError e nada e gravado. O motor usa
+        `gravar_eventos`, que grava os eventos de um ciclo de uma vez.
         """
-        if e.tipo == "atualizado":
-            return
+        recusados = self.gravar_eventos([e])
+        if recusados:
+            raise recusados[0][1]
 
+    def gravar_eventos(self, eventos: list[Evento]) -> list[tuple[Evento, Exception]]:
+        """Grava os eventos de um ciclo numa transacao so (um acesso ao disco por ciclo, e nao um por evento).
+
+        Cada evento segue as regras de `gravar_evento`. Evento cujo sinal nao vira JSON valido (ex.: NaN)
+        ou nao tem os campos obrigatorios fica de fora, sem impedir os outros: a lista devolvida traz cada
+        recusado com o erro, para quem chamou registrar no log. Erro do proprio banco (disco cheio...)
+        levanta a excecao e nada do lote e gravado.
+        """
+        linhas, recusados = [], []
+        for e in eventos:
+            if e.tipo == "atualizado":
+                continue
+            try:
+                linhas.append(self._linha_do_evento(e))  # antes de tocar no banco: JSON invalido nao entra
+            except (ValueError, TypeError, KeyError) as erro:
+                recusados.append((e, erro))
+        if linhas:
+            with self._trava, self._conn:
+                self._conn.executemany(_GRAVAR_SINAL, linhas)
+        return recusados
+
+    @staticmethod
+    def _linha_do_evento(e: Evento) -> tuple:
+        """Os valores da linha da tabela `sinais` para o evento (na ordem de _GRAVAR_SINAL)."""
         sinal = e.sinal
-        texto = _json(sinal)  # antes de tocar no banco: se o JSON for invalido, nada e gravado
+        texto = _json(sinal)
         encerrado_em = sinal.get("encerrado_em") if e.tipo == "encerrado" else None
-
-        with self._trava, self._conn:
-            # Insere; se o id ja existe, atualiza tudo menos `detectado_em` (que nunca muda).
-            self._conn.execute(
-                """
-                INSERT INTO sinais (id, modo, par, tipo, detectado_em, encerrado_em, rp_liquido_pct, sinal_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (id) DO UPDATE SET
-                    modo = excluded.modo,
-                    par = excluded.par,
-                    tipo = excluded.tipo,
-                    encerrado_em = excluded.encerrado_em,
-                    rp_liquido_pct = excluded.rp_liquido_pct,
-                    sinal_json = excluded.sinal_json
-                """,
-                (
-                    sinal["id"], sinal["modo"], sinal["par"], sinal["tipo"], sinal["detectado_em"],
-                    encerrado_em, sinal.get("rp_liquido_pct"), texto,
-                ),
-            )
+        return (sinal["id"], sinal["modo"], sinal["par"], sinal["tipo"], sinal["detectado_em"],
+                encerrado_em, sinal.get("rp_liquido_pct"), texto)
 
     def sinais_do_dia(self, dia: str) -> list[dict]:
         """Os sinais detectados no dia UTC `dia` ("AAAA-MM-DD"), do mais antigo ao mais novo.

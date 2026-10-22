@@ -26,7 +26,8 @@ e para no primeiro que nao chega ao minimo. As metricas do periodo sao increment
 
 Nada aqui acessa a rede: tudo vem do estado (coletores) e dos dados lentos (funding e taxas).
 Regra geral: dado em que nao se pode confiar (velho, sem liquidez, sem taxa, numero invalido)
-nao gera candidato.
+nao gera candidato. Um erro inesperado numa combinacao (ou num ativo, na etapa 2) so tira aquela
+combinacao do ciclo, com um aviso no log (uma vez por combinacao): as outras seguem.
 """
 
 import logging
@@ -406,8 +407,14 @@ class Motor:
         vistas = set()
         # So as combinacoes com livro valido nas duas pontas: as outras nao gerariam candidato.
         for combo, chave_long, chave_short in self._combos_candidatos.obter(_agrupar(lados)):
-            candidato = self._candidato(combo, lados[chave_long], lados[chave_short], agora, modo,
-                                        duracao_invertida_s, metrica)
+            try:
+                candidato = self._candidato(combo, lados[chave_long], lados[chave_short], agora, modo,
+                                            duracao_invertida_s, metrica)
+            except Exception:  # defeito inesperado nesta combinacao: so ela fica de fora
+                self._avisar_uma_vez(("erro_candidato", combo),
+                                     "%s: erro ao calcular o candidato; so esta combinacao fica de fora "
+                                     "(aviso uma vez so)", _nome_combo(combo), exc_info=True)
+                continue
             if candidato is not None:
                 resultado.append(candidato)
                 vistas.add(candidato.chave)
@@ -419,7 +426,15 @@ class Motor:
         candidatos = self.candidatos(agora)
         s = self.sessao
         modo = self._modo_da_sessao()
-        aprovados = [c for c in candidatos if passa(c, s.filtros, modo, self.cfg, s.comparacao)]
+        aprovados = []
+        for c in candidatos:
+            try:
+                if passa(c, s.filtros, modo, self.cfg, s.comparacao):
+                    aprovados.append(c)
+            except Exception:  # defeito inesperado nos filtros deste candidato: so ele fica de fora
+                self._avisar_uma_vez(("erro_filtros", c.chave),
+                                     "%s %s: erro ao aplicar os filtros; so este candidato fica de fora "
+                                     "(aviso uma vez so)", c.par, texto_da_chave(c.chave), exc_info=True)
         eventos = self.gerenciador.processar(aprovados, agora)
         amostras, self._amostras_pendentes = self._amostras_pendentes, []
         if self.banco is not None:
@@ -450,21 +465,13 @@ class Motor:
         asks, bids = precos.asks, precos.bids
         # So as combinacoes que chegam ao minimo agora: as outras nao mudam nada em pares_para_livro.
         acima: dict[tuple, float] = {}  # combo -> spread
-        for longs, shorts in self._combos_selecao.obter(mercados).values():  # um ativo por vez
-            # Os shorts do ativo com bid valido, do maior bid para o menor.
-            vendas = sorted(((bids[chave], chave) for chave in shorts if bids[chave] is not None), reverse=True)
-            for chave_long, combos_do_long in longs.items():
-                ask_long = asks[chave_long]
-                if ask_long is None:
-                    continue  # sem ask valido agora: nao serve de long
-                for bid_short, chave_short in vendas:
-                    combo = combos_do_long.get(chave_short)
-                    if combo is None:
-                        continue  # nao forma combinacao com este long (ex.: futuro x futuro na mesma corretora)
-                    spread = spread_abertura(ask_long, bid_short)
-                    if spread < minimo:
-                        break  # os proximos shorts tem bid menor ou igual: spread menor ou igual
-                    acima[combo] = spread
+        for ativo, (longs, shorts) in self._combos_selecao.obter(mercados).items():  # um ativo por vez
+            try:
+                self._acima_do_minimo(longs, shorts, asks, bids, minimo, acima)
+            except Exception:  # defeito inesperado neste ativo: so ele fica fora da etapa 2 neste ciclo
+                self._avisar_uma_vez(("erro_selecao", ativo),
+                                     "%s: erro na etapa 2 (escolha dos livros); este ativo fica de fora "
+                                     "(aviso uma vez so)", ativo, exc_info=True)
 
         escolhidos = pares_para_livro(acima, minimo, self._ultima_vez_acima, agora, self.cfg.manter_livro_s)
         # Simbolos das escolhidas: os do ticker de agora (mesma condicao do spread acima); se o
@@ -486,12 +493,36 @@ class Motor:
                 selecao.setdefault(corretora, set()).add(simbolo)
         return selecao
 
+    @staticmethod
+    def _acima_do_minimo(longs: dict, shorts: list, asks: dict, bids: dict, minimo: float,
+                         acima: dict[tuple, float]) -> None:
+        """Etapa 2 de um ativo: anota em `acima` as combinacoes com spread de abertura (tickers) >= minimo."""
+        # Os shorts do ativo com bid valido, do maior bid para o menor.
+        vendas = sorted(((bids[chave], chave) for chave in shorts if bids[chave] is not None), reverse=True)
+        for chave_long, combos_do_long in longs.items():
+            ask_long = asks[chave_long]
+            if ask_long is None:
+                continue  # sem ask valido agora: nao serve de long
+            for bid_short, chave_short in vendas:
+                combo = combos_do_long.get(chave_short)
+                if combo is None:
+                    continue  # nao forma combinacao com este long (ex.: futuro x futuro na mesma corretora)
+                spread = spread_abertura(ask_long, bid_short)
+                if spread < minimo:
+                    break  # os proximos shorts tem bid menor ou igual: spread menor ou igual
+                acima[combo] = spread
+
     def status(self, agora: float) -> dict[str, dict]:
-        """Saude de cada corretora da config: {"gate": {"estado": "conectada" | "atrasada"}}."""
-        return {
-            corretora: {"estado": "conectada" if self.estado.conexao_viva(corretora, agora) else "atrasada"}
-            for corretora in self.cfg.corretoras
-        }
+        """Saude de cada corretora da config, para o painel (/api/status).
+
+        Ex.: {"gate": {"estado": "conectada", "atraso_medio_ms": 180.5, "reconexoes": 2}}. estado:
+        conectada | reconectando | atrasada; atraso_medio_ms None se a corretora nao informa o horario.
+        """
+        return {corretora: self.estado.saude(corretora, agora) for corretora in self.cfg.corretoras}
+
+    def quantidade_historicos(self) -> int:
+        """Quantas combinacoes tem amostras do periodo na memoria (vai para a linha de recursos do log)."""
+        return len(self._historicos)
 
     def precarregar_amostra(self, chave: tuple, ts: float, a: float, f: float,
                             lote_long: float, lote_short: float) -> None:
@@ -540,10 +571,10 @@ class Motor:
                              "sessao: %s=%r invalido; usando %r", campo, valor, padrao)
         return padrao
 
-    def _avisar_uma_vez(self, chave, mensagem: str, *argumentos) -> None:
+    def _avisar_uma_vez(self, chave, mensagem: str, *argumentos, exc_info: bool = False) -> None:
         if chave not in self._avisados:
             self._avisados.add(chave)
-            registro.warning(mensagem, *argumentos)
+            registro.warning(mensagem, *argumentos, exc_info=exc_info)
 
     def _cotacoes_validas(self) -> dict[str, float]:
         """As cotacoes do momento que sao numero real maior que zero (as outras contam como "sem cotacao")."""
@@ -748,13 +779,19 @@ class Motor:
             del self._historicos[chave]
 
     def _gravar(self, eventos: list[Evento], amostras: list[tuple]) -> None:
-        """Grava eventos e amostras. Erro no banco vai para o log e nao para o scanner: o painel ao vivo continua."""
-        for evento in eventos:
-            try:
-                self.banco.gravar_evento(evento)
-            except Exception:
-                registro.exception("nao consegui gravar o evento %s do sinal %s no banco",
-                                   evento.tipo, evento.sinal.get("id"))
+        """Grava eventos e amostras do ciclo, cada grupo numa transacao so (um acesso ao disco, e nao um por item).
+
+        Erro no banco vai para o log e nao para o scanner: o painel ao vivo continua. Um evento que o
+        banco recusa (ex.: JSON invalido) vai para o log sem impedir os outros.
+        """
+        try:
+            recusados = self.banco.gravar_eventos(eventos)
+        except Exception:
+            registro.exception("nao consegui gravar %d eventos no banco", len(eventos))
+        else:
+            for evento, erro in recusados:
+                registro.error("nao consegui gravar o evento %s do sinal %s no banco (%s: %s)",
+                               evento.tipo, evento.sinal.get("id"), type(erro).__name__, erro)
         try:
             self.banco.gravar_amostras([(texto_da_chave(chave), *resto) for chave, *resto in amostras])
         except Exception:

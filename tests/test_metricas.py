@@ -307,3 +307,47 @@ def test_janela_cheia_de_4h_ocupa_pouca_memoria():
     finally:
         tracemalloc.stop()
     assert memoria <= 150 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Numeros absurdos (adiados da Task 13 para a 14)
+# ---------------------------------------------------------------------------
+
+
+def test_soma_que_passa_do_maior_float_vira_infinito_sem_erro():
+    from scanner.metricas.janela import _SomaExata
+
+    s = _SomaExata()
+    s.somar(1.7e308)
+    s.somar(1.7e308)
+    assert s.valor() == math.inf
+    s.tirar(1.7e308)
+    assert s.valor() == 1.7e308  # a soma exata continua certa depois
+    negativa = _SomaExata()
+    negativa.somar(-1.7e308)
+    negativa.somar(-1.7e308)
+    assert negativa.valor() == -math.inf
+
+
+def test_janela_com_soma_estourada_devolve_infinito():
+    j = JanelaMetricas(periodo_s=100)
+    j.adicionar(0, 1.7e308, -1.0)
+    j.adicionar(1, 1.7e308, -1.0)
+    assert j.resumo(agora=1, duracao_min_invertida_s=0).abertura_media == math.inf
+
+
+@pytest.mark.parametrize("amostra", [
+    ("0", 1.0, -1.0), (0, "1.5", -1.0), (0, 1.0, "x"), (0, True, -1.0), (0, 1.0, -1.0, False, 1.0),
+    (0, 1.0, -1.0, 1.0, None), (0, 10 ** 400, -1.0),
+])
+def test_numero_que_nao_e_real_e_recusado(amostra):
+    j = JanelaMetricas(periodo_s=10)
+    with pytest.raises(ValueError):
+        j.adicionar(*amostra)
+    assert j.vazia(agora=0)
+
+
+def test_inteiros_continuam_aceitos():
+    j = JanelaMetricas(periodo_s=10)
+    j.adicionar(0, 1, -1, 100, 200)
+    assert j.lotes_medios(agora=0) == (100.0, 200.0)

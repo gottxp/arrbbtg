@@ -3,9 +3,25 @@
 Os coletores escrevem aqui; o motor so le. Quem le nunca recebe dado velho:
 `obter_livro` e `obter_ticker` devolvem None quando a conexao da corretora esta
 silenciosa ou quando o dado ficou parado alem do limite.
+
+Aqui fica tambem a saude de cada corretora, mostrada no painel (`saude`): conectada, reconectando
+ou atrasada, o atraso medio dos dados e quantas vezes ela reconectou.
 """
 
+import logging
+import math
+from collections import deque
+
 from scanner.modelos import Livro
+
+registro = logging.getLogger("scanner.estado")
+
+# Atraso medio de cada corretora = media das amostras do ultimo minuto. As amostras sao somadas em
+# blocos de 10 s (soma e quantidade de cada bloco), entao a memoria nao cresce com o numero de
+# mensagens: guarda no maximo 6 blocos por corretora. Detalhe de exibicao (nao e um limite de negocio).
+JANELA_ATRASO_S = 60
+BLOCO_ATRASO_S = 10
+_BLOCOS_NA_JANELA = JANELA_ATRASO_S // BLOCO_ATRASO_S
 
 
 class EstadoMercados:
@@ -15,17 +31,25 @@ class EstadoMercados:
         tickers serve de heartbeat) antes de ela ser tratada como atrasada.
     max_idade_livro_s: maximo de segundos que um livro (ou ticker) pode ficar parado.
         O WebSocket so manda quando o livro muda, entao parado ainda vale ate aqui.
+    atraso_max_valido_s: atraso (chegada - horario informado pela corretora) acima disto, para
+        mais ou para menos, e relogio errado e fica fora do atraso medio.
 
-    Os dois valores vem da Config (max_silencio_conexao_s e max_idade_livro_s).
+    Os valores vem da Config (max_silencio_conexao_s, max_idade_livro_s e atraso_max_valido_s).
     Chave de tudo: (corretora, mercado, ativo normalizado).
     """
 
-    def __init__(self, max_silencio_s: float = 2, max_idade_livro_s: float = 30):
+    def __init__(self, max_silencio_s: float = 2, max_idade_livro_s: float = 30, atraso_max_valido_s: float = 30):
         self._max_silencio_s = max_silencio_s
         self._max_idade_livro_s = max_idade_livro_s
+        self._atraso_max_valido_s = atraso_max_valido_s
         self._ultima_mensagem: dict[str, float] = {}  # corretora -> horario da ultima mensagem
         self._livros: dict[tuple[str, str, str], Livro] = {}
         self._tickers: dict[tuple[str, str, str], dict] = {}
+        # Saude das corretoras (painel).
+        self._reconectando: set[str] = set()  # caiu e ainda nao voltou
+        self._reconexoes: dict[str, int] = {}  # corretora -> quantas vezes voltou depois de cair
+        self._atrasos: dict[str, deque] = {}  # corretora -> blocos [numero do bloco, soma dos atrasos, quantidade]
+        self._avisados_relogio: set[str] = set()  # corretoras ja avisadas de relogio errado (uma vez cada)
 
     # --- escrita (coletores) -------------------------------------------------
 
@@ -81,16 +105,73 @@ class EstadoMercados:
             del self._livros[chave]
 
     def marcar_desconectada(self, corretora: str) -> None:
-        """A conexao caiu: apaga tudo da corretora.
+        """A conexao caiu: apaga tudo da corretora e o painel passa a mostrar "reconectando".
 
         Apagar tambem os dados (e nao so a conexao) impede que um livro de antes da
         queda volte a valer quando a corretora reconectar, e os livros dela podem ter
-        mudado enquanto estava fora.
+        mudado enquanto estava fora. Sem tickers, a corretora sai de `mercados()` e nenhum
+        candidato usa os precos dela; os sinais que dependiam dela sao encerrados no proximo ciclo.
         """
         self._ultima_mensagem.pop(corretora, None)
+        self._reconectando.add(corretora)
         for dados in (self._livros, self._tickers):
             for chave in [c for c in dados if c[0] == corretora]:
                 del dados[chave]
+
+    def marcar_reconectada(self, corretora: str) -> None:
+        """A conexao voltou (chegou a primeira mensagem boa depois da queda): conta uma reconexao.
+
+        So conta se a corretora estava reconectando; chamar de novo nao conta duas vezes.
+        """
+        if corretora in self._reconectando:
+            self._reconectando.discard(corretora)
+            self._reconexoes[corretora] = self._reconexoes.get(corretora, 0) + 1
+
+    def registrar_atraso(self, corretora: str, atraso_s: float, agora: float) -> None:
+        """Anota um atraso medido (horario de chegada - horario que a corretora informou), em segundos.
+
+        Atraso maior que `atraso_max_valido_s`, para mais ou para menos, so acontece com relogio errado
+        (o do PC ou o da corretora): fica fora da media, com um aviso no log (uma vez por corretora).
+        Diferencas pequenas e negativas (o relogio do PC um pouco atras) entram: tira-las puxaria a media
+        para cima.
+        """
+        if not isinstance(atraso_s, (int, float)) or isinstance(atraso_s, bool) or not math.isfinite(atraso_s):
+            return
+        if abs(atraso_s) > self._atraso_max_valido_s:
+            if corretora not in self._avisados_relogio:
+                self._avisados_relogio.add(corretora)
+                registro.warning("%s: o horario informado pela corretora difere do relogio do PC em %.1fs (mais que "
+                                 "%ss); esse atraso fica fora da media. Confira o relogio do PC (acertar a hora "
+                                 "automaticamente)", corretora, atraso_s, self._atraso_max_valido_s)
+            return
+        bloco = math.floor(agora / BLOCO_ATRASO_S)
+        blocos = self._atrasos.setdefault(corretora, deque())
+        if blocos and bloco <= blocos[-1][0]:  # mesmo bloco (ou relogio que voltou): soma no ultimo
+            blocos[-1][1] += atraso_s
+            blocos[-1][2] += 1
+        else:
+            blocos.append([bloco, atraso_s, 1])
+        self._esquecer_blocos_velhos(blocos, bloco)
+
+    @staticmethod
+    def _esquecer_blocos_velhos(blocos: deque, bloco_atual: int) -> None:
+        """Tira os blocos que ja sairam da janela do atraso medio (mais velhos que JANELA_ATRASO_S)."""
+        while blocos and blocos[0][0] <= bloco_atual - _BLOCOS_NA_JANELA:
+            blocos.popleft()
+
+    def remover_pares_fora(self, corretora: str, chaves: set[tuple[str, str]]) -> int:
+        """Apaga o ticker e o livro dos pares da corretora que NAO estao em `chaves` ({(mercado, ativo)}).
+
+        Usado quando a lista de mercados e recarregada: par que a corretora tirou (ou que deixou de
+        formar combinacao) sai de `mercados()` e o sinal dele e encerrado pelo fluxo normal.
+        Devolve quantos pares sairam.
+        """
+        removidos = set()
+        for dados in (self._tickers, self._livros):
+            for chave in [c for c in dados if c[0] == corretora and (c[1], c[2]) not in chaves]:
+                del dados[chave]
+                removidos.add(chave)
+        return len(removidos)
 
     # --- leitura (motor) -----------------------------------------------------
 
@@ -119,6 +200,35 @@ class EstadoMercados:
         if agora - ticker["recebido_em"] > self._max_idade_livro_s:
             return None
         return ticker
+
+    def atraso_medio_ms(self, corretora: str, agora: float) -> float | None:
+        """Atraso medio dos dados da corretora no ultimo minuto, em ms; None se ela nao informa o horario."""
+        blocos = self._atrasos.get(corretora)
+        if not blocos:
+            return None
+        self._esquecer_blocos_velhos(blocos, math.floor(agora / BLOCO_ATRASO_S))
+        quantidade = sum(b[2] for b in blocos)
+        if not quantidade:
+            return None
+        return round(sum(b[1] for b in blocos) / quantidade * 1000, 1)
+
+    def saude(self, corretora: str, agora: float) -> dict:
+        """Saude da corretora para o painel: {"estado", "atraso_medio_ms", "reconexoes"}.
+
+        estado: "reconectando" (caiu e o coletor esta tentando de novo), "conectada" (mensagem ha no
+        maximo `max_silencio_s`) ou "atrasada" (silenciosa, ou nunca mandou nada).
+        """
+        if corretora in self._reconectando:
+            estado = "reconectando"
+        elif self.conexao_viva(corretora, agora):
+            estado = "conectada"
+        else:
+            estado = "atrasada"
+        return {
+            "estado": estado,
+            "atraso_medio_ms": self.atraso_medio_ms(corretora, agora),
+            "reconexoes": self._reconexoes.get(corretora, 0),
+        }
 
     def ticker_guardado(self, corretora: str, mercado: str, ativo: str) -> dict | None:
         """O ultimo ticker guardado do par, SEM checar idade nem conexao (None se nao existe).

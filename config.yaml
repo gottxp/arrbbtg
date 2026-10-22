@@ -56,6 +56,22 @@ recarregar_mercados_s: 3600
 # Passou disso, registra no log e segue (o livro ja foi tirado do scanner).
 timeout_desassinar_s: 5
 
+# Conexao que cai tenta de novo sozinha, esperando 1s, 2s, 4s... ate este maximo, em segundos.
+espera_max_reconexao_s: 60
+# Maximo de assinaturas por corretora (livros abertos; e tickers, se a corretora so assina um par
+# por vez). Ficam os pares de maior volume 24h. Vazio = sem limite. Exemplo:
+#   limites_assinatura:
+#     bingx: 200
+limites_assinatura: {}
+# Atraso do dado (chegada - horario da corretora) acima disto, para mais ou para menos, e relogio
+# errado e fica fora do atraso medio do painel, em segundos.
+atraso_max_valido_s: 30
+# Pasta dos logs (um arquivo por dia) e quantos dias de arquivos guardar.
+pasta_logs: logs
+dias_logs: 30
+# De quanto em quanto tempo o log registra memoria, CPU e descartes, em segundos.
+intervalo_log_recursos_s: 300
+
 # Painel web. Na VPS, preencha usuario e senha.
 painel:
   host: 127.0.0.1

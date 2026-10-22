@@ -13,7 +13,7 @@ from ccxt.base.errors import NotSupported
 from scanner.coletores.ccxt_coletor import ColetorCcxt, livro_de_ccxt, mercado_do_simbolo
 from scanner.estado.mercados import EstadoMercados
 from scanner.modelos import Livro, Ticker
-from tests.fabricas import market_ccxt
+from tests.fabricas import EsperaFalsa, market_ccxt
 
 
 class ErroDaCorretora(Exception):
@@ -469,13 +469,14 @@ def test_falha_num_simbolo_nao_derruba_os_outros(caplog):
         ("watch_order_book", "BTC/USDT"): [ob(100.0, 100.1), ob(100.2, 100.3), ob(100.4, 100.5)],
     })
     recebidos = []
-    coletor = ColetorCcxt("gate", ex)
+    espera = EsperaFalsa(bloquear=True)  # o ETH fica esperando para tentar de novo (Task 14)
+    coletor = ColetorCcxt("gate", ex, esperar=espera)
 
     async def cenario():
         await coletor.assinar_livros({"BTC/USDT", "ETH/USDT"}, recebidos.append)
         await esperar_ate(lambda: len(recebidos) == 3)           # BTC segue entregando
-        assert "ETH/USDT" not in coletor._tarefas_livro          # ETH foi retirado
-        assert "BTC/USDT" in coletor._tarefas_livro
+        assert espera.esperas == [1]                             # ETH caiu e espera 1 s, sozinho
+        assert set(coletor._tarefas_livro) == {"BTC/USDT", "ETH/USDT"}
         await coletor.fechar()
 
     with caplog.at_level(logging.WARNING, logger="scanner.coletores"):
@@ -484,22 +485,23 @@ def test_falha_num_simbolo_nao_derruba_os_outros(caplog):
     assert any("ETH/USDT" in m and "eth caiu" in m for m in avisos)
 
 
-def test_simbolo_que_caiu_volta_na_proxima_assinatura():
+def test_simbolo_que_caiu_volta_sozinho_depois_da_espera():
+    # Task 14: o coletor tenta de novo sozinho, com espera crescente (sem precisar de outra assinatura).
     ex = ExchangeDuasEtapas(roteiro={
         ("watch_order_book", "ETH/USDT"): [ErroDaCorretora("eth caiu"), ob(10.0, 10.1)],
     })
     recebidos = []
-    coletor = ColetorCcxt("gate", ex)
+    espera = EsperaFalsa()
+    coletor = ColetorCcxt("gate", ex, esperar=espera)
 
     async def cenario():
         await coletor.assinar_livros({"ETH/USDT"}, recebidos.append)
-        await esperar_ate(lambda: "ETH/USDT" not in coletor._tarefas_livro)
-        await coletor.assinar_livros({"ETH/USDT"})
         await esperar_ate(lambda: recebidos)
         await coletor.fechar()
 
     asyncio.run(cenario())
     assert recebidos[0].simbolo_original == "ETH/USDT"
+    assert espera.esperas == [1]
 
 
 def test_assinar_livros_guarda_o_callback_para_as_proximas_chamadas():
@@ -977,11 +979,11 @@ def test_livro_que_parou_com_erro_e_removido_do_estado():
     ex = ExchangeDuasEtapas(roteiro={("watch_order_book", "BTC/USDT"): [ob(100.0, 100.1), ErroDaCorretora("caiu")]})
     estado = EstadoMercados()
     recebidos = []
-    coletor = ColetorCcxt("gate", ex, estado=estado, relogio=relogio_fixo(500.0))
+    coletor = ColetorCcxt("gate", ex, estado=estado, relogio=relogio_fixo(500.0), esperar=EsperaFalsa(bloquear=True))
 
     async def cenario():
         await coletor.assinar_livros({"BTC/USDT"}, recebidos.append)
-        await esperar_ate(lambda: recebidos and "BTC/USDT" not in coletor._tarefas_livro)
+        await esperar_ate(lambda: recebidos and estado.obter_livro("gate", "spot", "BTC", agora=500.0) is None)
         await coletor.fechar()
 
     asyncio.run(cenario())

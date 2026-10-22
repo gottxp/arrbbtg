@@ -688,10 +688,11 @@ def test_ciclo_modo_farm_grava_custo_por_1000():
 
 def test_status_por_corretora():
     m = motor_falso(spot=("gate", "BTC", 100.0), futuro=("bitget", "BTC", 101.0), silencio_futuro_s=3)
+    sem_dados = {"atraso_medio_ms": None, "reconexoes": 0}
     assert m.status(agora=10) == {
-        "mexc": {"estado": "atrasada"},  # nunca mandou mensagem
-        "gate": {"estado": "conectada"},
-        "bitget": {"estado": "atrasada"},
+        "mexc": {"estado": "atrasada", **sem_dados},  # nunca mandou mensagem
+        "gate": {"estado": "conectada", **sem_dados},
+        "bitget": {"estado": "atrasada", **sem_dados},
     }
 
 
@@ -1365,11 +1366,15 @@ def test_main_erro_ao_rodar_mostra_e_devolve_1(tmp_path, capsys, monkeypatch):
 
 
 @pytest.mark.parametrize("nivel, esperado", [("normal", logging.INFO), ("detalhado", logging.DEBUG)])
-def test_configurar_log_nivel_do_scanner(nivel, esperado):
-    logger = logging.getLogger("scanner")
-    antes = logger.level
+def test_configurar_log_nivel_do_scanner(nivel, esperado, tmp_path):
+    import scanner.logs
+
+    logger, raiz = logging.getLogger("scanner"), logging.getLogger()
+    antes = (logger.level, raiz.level)
     try:
-        principal.configurar_log(nivel)
+        principal.configurar_log(cfg_com(nivel_log=nivel, pasta_logs=str(tmp_path)))  # o arquivo vai para a pasta do teste
         assert logger.level == esperado
     finally:
-        logger.setLevel(antes)
+        scanner.logs.desligar_logs()
+        logger.setLevel(antes[0])
+        raiz.setLevel(antes[1])

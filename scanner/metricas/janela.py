@@ -115,6 +115,26 @@ _TS, _A, _F, _LOTE_LONG, _LOTE_SHORT = range(5)
 _INICIO, _FIM = range(2)
 
 
+def _numero_real(valor) -> float:
+    """O valor como float, se for um numero real (int ou float, nao bool, nao NaN nem infinito); senao ValueError.
+
+    Texto ("1.5") e bool (True) sao recusados de proposito: float("1.5") e float(True) funcionariam e
+    esconderiam um defeito de quem chamou.
+    """
+    if type(valor) is float:  # o caso comum: uma checagem so
+        numero = valor
+    elif isinstance(valor, (int, float)) and not isinstance(valor, bool):
+        try:
+            numero = float(valor)
+        except OverflowError:  # inteiro grande demais para virar float
+            raise ValueError(f"numero grande demais: {valor}") from None
+    else:
+        raise ValueError(f"nao e um numero: {valor!r}")
+    if not math.isfinite(numero):
+        raise ValueError(f"numero invalido: {numero}")
+    return numero
+
+
 def _inteiro_exato(numero: float) -> int:
     """O float multiplicado por 2**1074: sempre um inteiro exato (veja _SomaExata)."""
     numerador, denominador = numero.as_integer_ratio()  # numero = numerador / denominador, denominador = 2**k
@@ -141,7 +161,15 @@ class _SomaExata:
         self._inteiro -= _inteiro_exato(numero)
 
     def valor(self) -> float:
-        return self._inteiro / _ESCALA  # divisao de inteiros do Python: arredondamento correto
+        """A soma como float. Soma alem do maior float (~1,8e308) vira infinito, com o sinal da soma.
+
+        Com numeros comuns isso nunca acontece; com numeros absurdos o infinito faz o motor descartar
+        o candidato (numero invalido), em vez de o erro de conta (OverflowError) derrubar o ciclo inteiro.
+        """
+        try:
+            return self._inteiro / _ESCALA  # divisao de inteiros do Python: arredondamento correto
+        except OverflowError:
+            return math.inf if self._inteiro > 0 else -math.inf
 
 
 class _Maiores:
@@ -221,12 +249,15 @@ class JanelaMetricas:
     def adicionar(self, ts: float, a: float, f: float, lote_long: float = 0.0, lote_short: float = 0.0) -> None:
         """Guarda uma amostra (sempre com ts maior ou igual ao da anterior) e ja descarta as antigas.
 
-        NaN ou infinito: ValueError (estragariam as medias e a ordem dos maiores).
+        Valor que nao e numero real (NaN, infinito, texto, bool, None): ValueError, e nada entra
+        (estragariam as medias e a ordem dos maiores).
         """
-        ts, a, f, lote_long, lote_short = float(ts), float(a), float(f), float(lote_long), float(lote_short)
-        isfinite = math.isfinite
-        if not (isfinite(ts) and isfinite(a) and isfinite(f) and isfinite(lote_long) and isfinite(lote_short)):
-            raise ValueError(f"amostra com numero invalido: ts={ts} a={a} f={f} lotes={lote_long}/{lote_short}")
+        try:
+            ts, a, f = _numero_real(ts), _numero_real(a), _numero_real(f)
+            lote_long, lote_short = _numero_real(lote_long), _numero_real(lote_short)
+        except ValueError as erro:
+            raise ValueError(f"amostra com numero invalido ({erro}): ts={ts!r} a={a!r} f={f!r} "
+                             f"lotes={lote_long!r}/{lote_short!r}") from None
         tamanho_antes = self._amostras.n
 
         if f >= 0:  # invertida: continua a sequencia aberta ou comeca uma nova

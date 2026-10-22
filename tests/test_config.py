@@ -172,3 +172,68 @@ def test_timeout_desassinar_padrao_5s_e_precisa_ser_positivo(tmp_path):
     assert carregar_config(escrever(tmp_path, "timeout_desassinar_s: 2.5\n")).timeout_desassinar_s == 2.5
     with pytest.raises(ErroConfig, match="timeout_desassinar_s"):
         carregar_config(escrever(tmp_path, "timeout_desassinar_s: 0\n"))
+
+
+# ---------------------------------------------------------------------------
+# Campos da Task 14 (reconexao, limites, logs e recursos)
+# ---------------------------------------------------------------------------
+
+
+def test_campos_da_robustez_com_os_padroes(tmp_path):
+    c = carregar_config(escrever(tmp_path, ""))
+    assert c.espera_max_reconexao_s == 60
+    assert c.limites_assinatura == {}
+    assert c.pasta_logs == "logs" and c.dias_logs == 30
+    assert c.intervalo_log_recursos_s == 300
+    assert c.atraso_max_valido_s == 30
+
+
+def test_campos_da_robustez_lidos_do_yaml(tmp_path):
+    c = carregar_config(escrever(tmp_path, (
+        "espera_max_reconexao_s: 30\n"
+        "limites_assinatura:\n  bingx: 200\n  mexc: 30\n"
+        "pasta_logs: registros\n"
+        "dias_logs: 7\n"
+        "intervalo_log_recursos_s: 60\n"
+        "atraso_max_valido_s: 10\n"
+    )))
+    assert c.espera_max_reconexao_s == 30
+    assert c.limites_assinatura == {"bingx": 200, "mexc": 30}
+    assert (c.pasta_logs, c.dias_logs, c.intervalo_log_recursos_s, c.atraso_max_valido_s) == ("registros", 7, 60, 10)
+
+
+def test_limites_assinatura_vazio_ou_nulo_e_sem_limite(tmp_path):
+    assert carregar_config(escrever(tmp_path, "limites_assinatura: {}\n")).limites_assinatura == {}
+    assert carregar_config(escrever(tmp_path, "limites_assinatura:\n")).limites_assinatura == {}
+
+
+@pytest.mark.parametrize("campo", ["espera_max_reconexao_s", "intervalo_log_recursos_s", "atraso_max_valido_s",
+                                   "dias_logs"])
+@pytest.mark.parametrize("valor", ["0", "-1"])
+def test_campos_da_robustez_precisam_ser_positivos(tmp_path, campo, valor):
+    with pytest.raises(ErroConfig, match=campo):
+        carregar_config(escrever(tmp_path, f"{campo}: {valor}\n"))
+
+
+@pytest.mark.parametrize("texto, campo", [
+    ("limites_assinatura: 5\n", "limites_assinatura"),
+    ("limites_assinatura: [bingx]\n", "limites_assinatura"),
+    ("limites_assinatura:\n  bingx: 0\n", "limites_assinatura"),
+    ("limites_assinatura:\n  bingx: 2.5\n", "limites_assinatura"),
+    ("limites_assinatura:\n  bingx: true\n", "limites_assinatura"),
+    ("limites_assinatura:\n  bingx: muitos\n", "limites_assinatura"),
+    ("dias_logs: 2.5\n", "dias_logs"),
+    ("dias_logs: true\n", "dias_logs"),
+    ("pasta_logs: ''\n", "pasta_logs"),
+    ("pasta_logs: 5\n", "pasta_logs"),
+])
+def test_campos_da_robustez_com_formato_errado(tmp_path, texto, campo):
+    with pytest.raises(ErroConfig, match=campo):
+        carregar_config(escrever(tmp_path, texto))
+
+
+def test_config_yaml_do_projeto_traz_os_campos_da_robustez():
+    chaves = yaml.safe_load((RAIZ / "config.yaml").read_text(encoding="utf-8")) or {}
+    for campo in ("espera_max_reconexao_s", "limites_assinatura", "pasta_logs", "dias_logs",
+                  "intervalo_log_recursos_s", "atraso_max_valido_s"):
+        assert campo in chaves, campo

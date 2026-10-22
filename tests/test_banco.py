@@ -376,3 +376,42 @@ def test_gravar_amostras_em_lote_numa_transacao(banco):
 def test_gravar_amostras_lista_vazia_nao_faz_nada(banco):
     banco.gravar_amostras([])
     assert banco.amostras("k", desde=0) == []
+
+
+# ---------------------------------------------------------------------------
+# Eventos em lote e sincronizacao do disco (Task 14)
+# ---------------------------------------------------------------------------
+
+
+def test_gravar_eventos_do_ciclo_numa_transacao_so(banco):
+    eventos = [
+        Evento("novo", _sinal(id="a"), registrar_historico=True),
+        Evento("atualizado", _sinal(id="b"), registrar_historico=False),   # nao grava
+        Evento("novo", _sinal(id="c"), registrar_historico=True),
+        Evento("encerrado", _sinal(id="a", encerrado_em="2026-10-20T15:10:00.000Z"), registrar_historico=True),
+    ]
+    comandos = []
+    banco._conn.set_trace_callback(comandos.append)
+    assert banco.gravar_eventos(eventos) == []
+    banco._conn.set_trace_callback(None)
+    assert [c for c in comandos if c in ("BEGIN ", "COMMIT")] == ["BEGIN ", "COMMIT"]  # uma transacao so
+    registros = {s["id"]: s for s in banco.sinais_do_dia("2026-10-20")}
+    assert set(registros) == {"a", "c"}
+    assert registros["a"]["encerrado_em"] == "2026-10-20T15:10:00.000Z" and registros["c"]["encerrado_em"] is None
+
+
+def test_gravar_eventos_recusa_so_o_evento_invalido(banco):
+    ruim = Evento("novo", _sinal(id="ruim", rp_liquido_pct=float("nan")), registrar_historico=True)
+    bom = Evento("novo", _sinal(id="bom"), registrar_historico=True)
+    recusados = banco.gravar_eventos([ruim, bom])
+    assert [e for e, _ in recusados] == [ruim] and isinstance(recusados[0][1], ValueError)
+    assert _ids(banco, "2026-10-20") == ["bom"]
+
+
+def test_gravar_eventos_lista_vazia_nao_faz_nada(banco):
+    assert banco.gravar_eventos([]) == []
+
+
+def test_modo_wal_com_sincronizacao_normal(banco):
+    assert banco._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    assert banco._conn.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL

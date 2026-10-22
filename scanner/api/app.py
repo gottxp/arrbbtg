@@ -308,7 +308,8 @@ def criar_app(
     async def status() -> dict[str, dict]:
         """Por corretora: estado (conectada | reconectando | atrasada), atraso medio em ms e reconexoes.
 
-        O motor ainda so informa o estado; atraso e reconexoes (Task 14) ficam None e 0 ate la.
+        Os dados vem do estado dos mercados (Motor.status -> EstadoMercados.saude). atraso_medio_ms e
+        null quando a corretora nao informa o horario dos dados.
         """
         return {
             corretora: {
